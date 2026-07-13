@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Clean Math Copy browser smoke</title>
+</head>
+<body>
+  <span id="unicode-partial">0.666 × 10⁻²⁵</span>
+
+  <span id="mass-renderer" class="opaque-renderer">
+    <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)">
+      <math><mrow><mi>m</mi><mo>=</mo><mn>0.666</mn><mo>×</mo><msup><mn>10</mn><mrow><mo>−</mo><mn>25</mn></mrow></msup><mtext> </mtext><mi>kg</mi></mrow></math>
+    </span>
+    <span class="visual-layout">m = 0.666×10−25 kg</span>
+  </span>
+
+  <span id="root-renderer" class="opaque-renderer">
+    <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)">
+      <math><mrow><mi>r</mi><mo>∝</mo><msqrt><mfrac><mi>m</mi><mrow><mo>∣</mo><mi>q</mi><mo>∣</mo></mrow></mfrac></msqrt></mrow></math>
+    </span>
+    <span class="visual-layout">r∝∣q∣m​</span>
+  </span>
+
+  <span id="function-renderer" class="opaque-renderer">
+    <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)">
+      <math><mrow><mi mathvariant="normal">sin</mi><mo>⁡</mo><mo>(</mo><mrow><mo fence="true">|</mo><mi>x</mi><mo fence="true">|</mo></mrow><mo>)</mo><mo>+</mo><msup><mi mathvariant="normal">cos</mi><mn>2</mn></msup><mo>⁡</mo><mo>(</mo><mi>y</mi><mo>)</mo></mrow></math>
+    </span>
+    <span class="visual-layout">sin(|x|)+cos²(y)</span>
+  </span>
+
+  <span id="sum-renderer" class="opaque-renderer">
+    <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)">
+      <math><mrow><munderover><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi>n</mi></munderover><msup><mi>i</mi><mn>2</mn></msup></mrow></math>
+    </span>
+    <span class="visual-layout">∑i=1ni²</span>
+  </span>
+
+  <span id="relation-renderer" class="opaque-renderer">
+    <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)">
+      <math><mrow><mi>a</mi><mo fence="false">∣</mo><mi>b</mi></mrow></math>
+    </span>
+    <span class="visual-layout">a∣b</span>
+  </span>
+
+  <span id="ordinary-symbol-prose">Symbols in prose: α vs β.</span>
+  <span id="comparative-prose">Plan A ≠ Plan B</span>
+  <span id="raw-styled">$\mathrm{speed}=2\mathrm{time}$</span>
+
+  <pre id="result">pending</pre>
+  <script src="../clean-math-copy.user.js"></script>
+  <script>
+    (() => {
+      const checks = [];
+      const assertEqual = (name, actual, expected) => {
+        checks.push({ name, pass: actual === expected, actual, expected });
+      };
+      const copyRange = (element, start, end) => {
+        const selection = getSelection();
+        selection.removeAllRanges();
+        const range = document.createRange();
+        const text = element.firstChild;
+        range.setStart(text, start == null ? 0 : start);
+        range.setEnd(text, end == null ? text.nodeValue.length : end);
+        selection.addRange(range);
+        const transfer = new DataTransfer();
+        const event = new ClipboardEvent('copy', {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          clipboardData: transfer
+        });
+        element.dispatchEvent(event);
+        return {
+          prevented: event.defaultPrevented,
+          plain: transfer.getData('text/plain'),
+          html: transfer.getData('text/html'),
+          mathML: transfer.getData('application/mathml+xml')
+        };
+      };
+
+      const unicode = copyRange(document.querySelector('#unicode-partial'));
+      assertEqual('standalone Unicode numeric partial', unicode.plain, '0.666*10^(-25)');
+      assertEqual('standalone Unicode event handled', unicode.prevented, true);
+      assertEqual('standalone Unicode rich symbols', unicode.html.includes('0.666 × 10⁻²⁵'), true);
+
+      const massVisual = document.querySelector('#mass-renderer .visual-layout');
+      const massText = massVisual.textContent;
+      const massStart = massText.indexOf('0.666');
+      const mass = copyRange(massVisual, massStart, massStart + '0.666×10−25'.length);
+      assertEqual('renderer exact partial', mass.plain, '0.666*10^(-25)');
+
+      const rootVisual = document.querySelector('#root-renderer .visual-layout');
+      const root = copyRange(rootVisual);
+      assertEqual('whole structural root', root.plain, 'r ∝ sqrt(m/abs(q))');
+      assertEqual('no trailing whitespace', /\s$/.test(root.plain), false);
+      assertEqual('structural rich HTML', root.html.includes('border-top:1px solid currentColor'), true);
+      assertEqual('sanitized MathML flavor', /^<math[ >]/.test(root.mathML), true);
+
+      const qOffset = rootVisual.textContent.indexOf('q');
+      const q = copyRange(rootVisual, qOffset, qOffset + 1);
+      assertEqual('one-token q selection', q.plain, 'q');
+      assertEqual('no leaked Markdown emphasis', /\*/.test(q.plain), false);
+
+      const renderedFunction = copyRange(document.querySelector('#function-renderer .visual-layout'));
+      assertEqual('rendered functions and power', renderedFunction.plain, 'sin(abs(x))+cos(y)^(2)');
+
+      const renderedSum = copyRange(document.querySelector('#sum-renderer .visual-layout'));
+      assertEqual('rendered bounded sum', renderedSum.plain, 'sum(i^(2),i,1,n)');
+
+      const renderedRelation = copyRange(document.querySelector('#relation-renderer .visual-layout'));
+      assertEqual('relational bar stays relational', renderedRelation.plain, 'a | b');
+
+      const ordinary = copyRange(document.querySelector('#ordinary-symbol-prose'));
+      assertEqual('ordinary symbol prose stays native', ordinary.prevented, false);
+      assertEqual('native path leaves transfer untouched', ordinary.plain, '');
+
+      const comparison = copyRange(document.querySelector('#comparative-prose'));
+      assertEqual('ordinary comparison stays native', comparison.prevented, false);
+      assertEqual('comparison leaves transfer untouched', comparison.plain, '');
+
+      const styled = copyRange(document.querySelector('#raw-styled'));
+      assertEqual('styled raw identifiers stay whole', styled.plain, 'speed=2*time');
+
+      const output = { ok: checks.every((check) => check.pass), checks };
+      document.querySelector('#result').textContent = JSON.stringify(output);
+      const failed = checks.filter((check) => !check.pass).map((check) => check.name);
+      document.title = output.ok ? 'PASS ' + checks.length + '/' + checks.length : 'FAIL ' + failed.join(' | ');
+    })();
+  </script>
+</body>
+</html>
