@@ -25,4 +25,6 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run browser-smoke
+        env:
+          CHROME_BIN: /usr/bin/chromium
       - run: npm audit --audit-level=high

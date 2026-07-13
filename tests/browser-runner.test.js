@@ -11,6 +11,11 @@ test('browser smoke runner keeps CDP local and does not disable browser sandboxi
   assert.match(runner, /--remote-debugging-address=127\.0\.0\.1/);
   assert.doesNotMatch(runner, /--no-sandbox/);
   assert.doesNotMatch(runner, /--allow-file-access-from-files/);
+  assert.doesNotMatch(runner, /--virtual-time-budget/);
+});
+
+test('browser smoke prefers Chromium for unpacked-extension testing', () => {
+  assert.match(runner, /\['chromium', 'chromium-browser', 'google-chrome'/);
 });
 
 test('browser smoke runner observes launch errors and awaits graceful and forced termination', () => {

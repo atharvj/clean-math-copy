@@ -18,7 +18,9 @@ function browserExecutable() {
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) return candidate;
   }
-  for (const command of ['google-chrome', 'brave-browser', 'microsoft-edge', 'chromium', 'chromium-browser']) {
+  // Branded Chrome no longer accepts unpacked-extension flags. Chromium keeps
+  // them available for the isolated-world userscript smoke test.
+  for (const command of ['chromium', 'chromium-browser', 'google-chrome', 'brave-browser', 'microsoft-edge']) {
     const located = spawnSync(process.platform === 'win32' ? 'where' : 'which', [command], { encoding: 'utf8' });
     if (located.status === 0 && located.stdout.trim()) return located.stdout.trim().split(/\r?\n/)[0];
   }
@@ -41,8 +43,9 @@ function delay(milliseconds) {
 }
 
 async function waitForResult(port, processState, isolatedFixture) {
-  const deadline = Date.now() + 15000;
+  const deadline = Date.now() + 45000;
   let lastError = null;
+  let lastTitle = '';
   while (Date.now() < deadline) {
     if (processState.error) {
       throw new Error('Browser failed to start: ' + processState.error.message);
@@ -52,9 +55,14 @@ async function waitForResult(port, processState, isolatedFixture) {
       throw new Error('Browser exited before completing the smoke test (' + status + ').');
     }
     try {
-      const response = await fetch('http://127.0.0.1:' + port + '/json/list');
+      const response = await fetch('http://127.0.0.1:' + port + '/json/list', {
+        signal: AbortSignal.timeout(1000)
+      });
+      if (!response.ok) throw new Error('DevTools endpoint returned HTTP ' + response.status);
       const pages = await response.json();
+      lastError = null;
       const isolated = pages.find((item) => item.url === isolatedFixture);
+      if (isolated) lastTitle = isolated.title || '';
       if (isolated && /^FAIL\b/.test(isolated.title || '')) throw new Error(isolated.title + ' at ' + isolated.url);
       if (isolated && /^PASS\b/.test(isolated.title || '')) return isolated.title;
     } catch (error) {
@@ -63,7 +71,10 @@ async function waitForResult(port, processState, isolatedFixture) {
     }
     await delay(100);
   }
-  throw new Error('Timed out waiting for the browser smoke result' + (lastError ? ': ' + lastError.message : '.'));
+  const detail = lastTitle
+    ? ' (last page title: ' + JSON.stringify(lastTitle) + ')'
+    : (lastError ? ': ' + lastError.message : '.');
+  throw new Error('Timed out waiting for the browser smoke result' + detail);
 }
 
 function startFixtureServer(html, scriptSource) {
@@ -238,7 +249,6 @@ async function main() {
     '--user-data-dir=' + profile,
     '--remote-debugging-address=127.0.0.1',
     '--remote-debugging-port=' + port,
-    '--virtual-time-budget=3000',
     isolatedFixture
   ], {
     detached: process.platform !== 'win32',
