@@ -53,12 +53,14 @@
   <span id="ordinary-symbol-prose">Symbols in prose: α vs β.</span>
   <span id="comparative-prose">Plan A ≠ Plan B</span>
   <span id="ordinary-artifacts">alpha&#8203;&nbsp;beta</span>
+  <p id="flattened-vector">An infinitely long, straight, cylindrical wire of radius 𝑅 has a uniform current density <span><span style="display:block">⃗</span><span style="display:block">𝐽</span><span style="display:block">=𝐽⁢</span><span style="display:block">ˆ</span><span style="display:block">𝑧</span></span> in cylindrical coordinates.</p>
   <span id="raw-styled">$\mathrm{speed}=2\mathrm{time}$</span>
   <span id="rich-script-editor" contenteditable="true">x2 + H2O</span>
   <span id="rich-reverse-editor" contenteditable="true">x2</span>
   <span id="mathml-reverse-editor" contenteditable="true">x2</span>
   <span id="alias-clear-editor" contenteditable="true">x2</span>
   <span id="flat-digit-editor" contenteditable="true">(27.187)2</span>
+  <span id="flattened-site-editor" contenteditable="true">selected vector text</span>
 
   <pre id="result">pending</pre>
   <script>
@@ -85,6 +87,7 @@
           prevented: event.defaultPrevented,
           plain: transfer.getData('text/plain'),
           html: transfer.getData('text/html'),
+          htmlFormat: transfer.getData('HTML Format'),
           mathML: transfer.getData('application/mathml+xml')
         };
       };
@@ -163,6 +166,19 @@
           });
           assertEqual('relay accepts bounded decoded values after JSON escaping', escaped.id, 'escaped');
           relayRequest({ id: 'escaped', op: 'end' });
+
+          relayRequest({ id: 'flattened', op: 'begin' });
+          const flattenedRelay = relayRequest({
+            id: 'flattened',
+            op: 'set',
+            type: 'text/plain',
+            value: 'density \n⃗\n𝐽\n=𝐽⁢\nˆ\n𝑧\n in cylindrical coordinates.',
+            overflow: false
+          });
+          assertEqual('isolated relay repairs a flattened vector', flattenedRelay.text, 'density J⃗ = Jẑ in cylindrical coordinates.');
+          const flattenedFinalize = relayRequest({ id: 'flattened', op: 'finalize' });
+          assertEqual('isolated relay owns the repaired final clipboard', flattenedFinalize.prevent, true);
+          relayRequest({ id: 'flattened', op: 'end' });
           relay.textContent = '';
         }
       }
@@ -215,6 +231,29 @@
       const artifacts = copyRange(document.querySelector('#ordinary-artifacts'));
       assertEqual('ordinary artifact cleanup is handled', artifacts.prevented, true);
       assertEqual('ordinary artifact cleanup text', artifacts.plain, 'alpha beta');
+
+      const flattenedVector = copyContents(document.querySelector('#flattened-vector'));
+      const flattenedVectorExpected = 'An infinitely long, straight, cylindrical wire of radius R has a uniform current density J⃗ = Jẑ in cylindrical coordinates.';
+      assertEqual('stacked renderer vectors and hats are reordered', flattenedVector.plain, flattenedVectorExpected);
+      assertEqual('stacked renderer rich text matches plain text', flattenedVector.html, '<!--StartFragment-->' + flattenedVectorExpected + '<!--EndFragment-->');
+
+      const flattenedSiteEditor = document.querySelector('#flattened-site-editor');
+      const flattenedSiteRaw = 'density \n⃗\n𝐽\n=𝐽⁢\nˆ\n𝑧\n in cylindrical coordinates.';
+      const flattenedSiteExpected = 'density J⃗ = Jẑ in cylindrical coordinates.';
+      const flattenedSiteHTML = '<span>density<br>⃗<br>𝐽<br>=𝐽⁢<br>ˆ<br>𝑧<br>in cylindrical coordinates.</span>';
+      flattenedSiteEditor.addEventListener('copy', (event) => {
+        event.clipboardData.setData('text/plain', flattenedSiteRaw);
+        event.clipboardData.setData('text/html', flattenedSiteHTML);
+        event.clipboardData.setData('HTML Format', flattenedSiteHTML);
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      });
+      const flattenedSite = copyContents(flattenedSiteEditor);
+      const flattenedSafeHTML = '<!--StartFragment-->' + flattenedSiteExpected + '<!--EndFragment-->';
+      assertEqual('stopped site copy repairs flattened plain text', flattenedSite.plain, flattenedSiteExpected);
+      assertEqual('stopped site copy repairs flattened rich text', flattenedSite.html, flattenedSafeHTML);
+      assertEqual('stopped site copy repairs CF_HTML', flattenedSite.htmlFormat.includes(flattenedSiteExpected), true);
+      assertEqual('stopped site copy removes stale rich accent boxes', /<br>⃗|<br>ˆ/u.test(flattenedSite.html + flattenedSite.htmlFormat), false);
 
       const styled = copyRange(document.querySelector('#raw-styled'));
       assertEqual('styled raw identifiers stay whole', styled.plain, 'speed = 2time');

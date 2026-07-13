@@ -108,13 +108,22 @@ function googleDocsSlice(parts, textStyles = []) {
 }
 
 function reportedGoogleDocsEquationSlice() {
-  const power = (base) => ({ command: '\\superscript', args: [base, '2'] });
+  const power = (value) => ({
+    command: '\\superscript',
+    args: [[
+      '(', value,
+      // The current Google Docs clipboard slice includes this zero-content
+      // fence as a layout placeholder immediately before the literal `)`.
+      { command: '\\rbracelr', args: [''] },
+      ')'
+    ], '2']
+  });
   return googleDocsSlice([{
     equation: [
       { command: '\\abs', args: ['B'] },
       '=',
       { command: '\\sqrt', args: [[
-        power('(27.187)'), '+', power('(17.479)'), '+', power('(-28.112)')
+        power('27.187'), '+', power('17.479'), '+', power('-28.112')
       ]] },
       '=42.84 ', { command: '\\mu' }, 'T'
     ]
@@ -954,6 +963,123 @@ test('cleans hard-wrapped inline prose across uneven spans while preserving comp
   assert.equal(payload.text, 'This is a soft wrapped paragraph in שלום with e\u0301 and 👩‍💻.');
   assert.match(payload.html, /<span>This is <\/span><span>a soft<\/span> <span>wrapped<\/span>/);
   assert.match(payload.html, /שלום with e\u0301 and 👩‍💻/);
+});
+
+test('repairs renderer accent boxes that flatten vectors and hats into separate lines', () => {
+  const instance = dom([
+    '<p id="target">An infinitely long, straight, cylindrical wire of radius 𝑅 has a ',
+    'uniform current density <span>',
+    '<span style="display:block">⃗</span>',
+    '<span style="display:block">𝐽</span>',
+    '<span style="display:block">=𝐽⁢</span>',
+    '<span style="display:block">ˆ</span>',
+    '<span style="display:block">𝑧</span>',
+    '</span> in cylindrical coordinates.</p>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  const expected = 'An infinitely long, straight, cylindrical wire of radius R has a ' +
+    'uniform current density J⃗ = Jẑ in cylindrical coordinates.';
+  assert.equal(payload.reason, 'flattened-renderer-math');
+  assert.equal(payload.text, expected);
+  assert.equal(payload.html, '<!--StartFragment-->' + expected + '<!--EndFragment-->');
+  assert.doesNotMatch(payload.text, /[\u2061-\u2064\u{1d400}-\u{1d7ff}]/u);
+});
+
+test('copies the same inline vector sentence from native semantic MathML', () => {
+  const instance = dom([
+    '<p id="target">An infinitely long, straight, cylindrical wire of radius ',
+    '<math><mi>R</mi></math> has a uniform current density ',
+    '<math><mrow>',
+    '<mover accent="true"><mi>J</mi><mo>⃗</mo></mover>',
+    '<mo>=</mo><mi>J</mi><mo>⁢</mo>',
+    '<mover accent="true"><mi>z</mi><mo>ˆ</mo></mover>',
+    '</mrow></math> in cylindrical coordinates.</p>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(
+    payload.text,
+    'An infinitely long, straight, cylindrical wire of radius R has a uniform current density ' +
+      'J⃗ = Jẑ in cylindrical coordinates.'
+  );
+});
+
+test('flattened-renderer repair is conservative and keeps authored arrows, carets, and paragraphs', () => {
+  const unchanged = [
+    'Line one\nLine two',
+    'Use ^\nx as written.',
+    'Go\n→\nNorth',
+    'The modifier ˆ\nis discussed here.'
+  ];
+  for (const value of unchanged) assert.equal(cleanCopy.repairFlattenedRendererText(value), value);
+  assert.equal(
+    cleanCopy.repairFlattenedRendererText('A\nˆ\nz\n\nNext paragraph'),
+    'A ẑ\n\nNext paragraph'
+  );
+  assert.equal(cleanCopy.repairFlattenedRendererText('J\n⃗\n'), 'J⃗');
+  assert.equal(cleanCopy.repairFlattenedRendererText('A⁢\n\n⃗\nJ'), 'A\n\nJ⃗');
+  assert.equal(cleanCopy.repairFlattenedRendererText('密度\n⃗\n𝐽\n坐标。'), '密度 J⃗ 坐标。');
+  assert.equal(cleanCopy.repairFlattenedRendererText('πυκνότητα\n⃗\n𝐽\nσε κυλίνδρους.'), 'πυκνότητα J⃗ σε κυλίνδρους.');
+  assert.equal(cleanCopy.repairFlattenedRendererText('كثافة\n⃗\n𝐽\nفي الإحداثيات.'), 'كثافة J⃗ في الإحداثيات.');
+  assert.equal(
+    cleanCopy.repairFlattenedRendererText('Keep 𝕬𝔹 styled.\nRadius 𝑅, density\n⃗\n𝐽.'),
+    'Keep 𝕬𝔹 styled.\nRadius R, density J⃗.'
+  );
+});
+
+test('flattened-renderer repair preserves unrelated authored breaks and paragraph boundaries', () => {
+  const instance = dom([
+    '<div id="target"><p>First authored<br>line.</p>',
+    '<p>Current density <span>',
+    '<span style="display:block">⃗</span><span style="display:block">𝐽</span>',
+    '<span style="display:block">=𝐽⁢</span>',
+    '<span style="display:block">ˆ</span><span style="display:block">𝑧</span>',
+    '</span> in cylindrical coordinates.</p>',
+    '<p>Last paragraph.</p></div>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, [
+    'First authored',
+    'line.',
+    '',
+    'Current density J⃗ = Jẑ in cylindrical coordinates.',
+    '',
+    'Last paragraph.'
+  ].join('\n'));
+  assert.match(payload.html, /First authored<br>line\.<br><br>Current density J⃗/u);
+  assert.match(payload.html, /coordinates\.<br><br>Last paragraph\./u);
+});
+
+test('flattened-renderer recovery stays linear for a near-limit selection with many accents', () => {
+  const padding = 'x'.repeat(850000) + '.\n';
+  const count = 4096;
+  const input = padding + 'density\n⃗\n𝐽\n'.repeat(count);
+  assert.ok(input.length < 1024 * 1024);
+  const started = Date.now();
+  const repaired = cleanCopy.repairFlattenedRendererText(input);
+  const elapsed = Date.now() - started;
+  assert.equal(repaired, padding + Array(count).fill('density J⃗').join(' '));
+  assert.ok(elapsed < 3000, 'near-limit accent repair took ' + elapsed + 'ms');
 });
 
 test('preserves intentional paragraphs, breaks, headings, lists, tables, and preformatted islands', () => {
@@ -1930,6 +2056,34 @@ test('decodes the reported Google Docs equation from its structural clipboard sl
   );
 });
 
+test('Google Docs suppresses only contextual empty fence placeholders and keeps authored fences', () => {
+  const slice = googleDocsSlice([{ equation: [
+    'literal () [] {} and ',
+    { command: '\\rbracelr', args: [''] },
+    { command: '\\sbracelr', args: [''] },
+    { command: '\\bracelr', args: [''] },
+    ' then ',
+    { command: '\\rbracelr', args: ['x'] },
+    { command: '\\sbracelr', args: ['y'] },
+    { command: '\\bracelr', args: ['z'] },
+    ' placeholders ',
+    '(', 'a', { command: '\\rbracelr', args: [''] }, ')',
+    '{', 'b', { command: '\\sbracelr', args: [''] }, '}',
+    '[', 'c', { command: '\\bracelr', args: [''] }, ']',
+    ' mismatches ',
+    'x', { command: '\\rbracelr', args: [''] }, ')',
+    '(', { command: '\\bracelr', args: [''] }, ')'
+  ] }]);
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'faithful' }).text,
+    'literal () [] {} and (){}[] then (x){y}[z] placeholders (a){b}[c] mismatches x())([])'
+  );
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(reportedGoogleDocsEquationSlice(), { outputMode: 'latex' }).text,
+    '$\\left|B\\right|=\\sqrt{(27.187)^{2}+(17.479)^{2}+(-28.112)^{2}}=42.84~\\mu T$'
+  );
+});
+
 test('uses Google Docs explicit rich HTML as a script fallback when its private slice is unavailable', () => {
   const instance = dom('');
   const markup = [
@@ -2421,6 +2575,147 @@ test('generic semantic markup must agree with the site plain text before rewriti
   });
   target.dispatchEvent(event);
   assert.equal(clipboard.get('text/plain'), 'Room 101');
+});
+
+test('repairs a site-written flattened vector even when the site stops copy propagation', () => {
+  const instance = dom('<div id="target" contenteditable="true">selected text</div>');
+  const target = instance.window.document.querySelector('#target');
+  selectContents(instance.window, target);
+  cleanCopy.install(instance.window.document, instance.window);
+  const clipboard = new Map();
+  const brokenHTML = '<span>density<br>⃗<br>𝐽<br>=𝐽⁢<br>ˆ<br>𝑧<br>in cylindrical coordinates.</span>';
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData(
+      'text/plain',
+      'An infinitely long, straight, cylindrical wire of radius 𝑅 has a uniform current density ' +
+        '\n⃗\n𝐽\n=𝐽⁢\nˆ\n𝑧\n in cylindrical coordinates.'
+    );
+    event.clipboardData.setData('text/html', brokenHTML);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  target.dispatchEvent(event);
+  assert.equal(
+    clipboard.get('text/plain'),
+    'An infinitely long, straight, cylindrical wire of radius R has a uniform current density ' +
+      'J⃗ = Jẑ in cylindrical coordinates.'
+  );
+  assert.equal(
+    clipboard.get('text/html'),
+    '<!--StartFragment-->An infinitely long, straight, cylindrical wire of radius R has a ' +
+      'uniform current density J⃗ = Jẑ in cylindrical coordinates.<!--EndFragment-->'
+  );
+  assert.doesNotMatch(clipboard.get('text/html'), /<br>⃗|<br>ˆ/u);
+});
+
+test('repairs flattened plain and rich clipboard data when DataTransfer methods cannot be wrapped', () => {
+  const instance = dom('<div id="target" contenteditable="true">selected text</div>');
+  const target = instance.window.document.querySelector('#target');
+  selectContents(instance.window, target);
+  cleanCopy.install(instance.window.document, instance.window);
+  const raw = 'density \n⃗\n𝐽\n=𝐽⁢\nˆ\n𝑧\n in cylindrical coordinates.';
+  const brokenHTML = '<span>density<br>⃗<br>𝐽<br>=𝐽⁢<br>ˆ<br>𝑧<br>in cylindrical coordinates.</span>';
+  const values = new Map([['text/plain', raw], ['text/html', brokenHTML]]);
+  const clipboardData = {
+    get types() { return Array.from(values.keys()); },
+    clearData(type) { if (arguments.length) values.delete(type); else values.clear(); },
+    getData(type) { return values.get(type) || ''; }
+  };
+  Object.defineProperty(clipboardData, 'setData', {
+    value(type, value) { values.set(type, value); },
+    configurable: false,
+    writable: false
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', { value: clipboardData });
+  target.dispatchEvent(event);
+  assert.equal(values.get('text/plain'), 'density J⃗ = Jẑ in cylindrical coordinates.');
+  assert.equal(
+    values.get('text/html'),
+    '<!--StartFragment-->density J⃗ = Jẑ in cylindrical coordinates.<!--EndFragment-->'
+  );
+  assert.equal(event.defaultPrevented, true);
+});
+
+test('a non-wrappable flattened rich rewrite rolls back rejected second and third writes', () => {
+  const rawPlain = 'density \n⃗\n𝐽\n=𝐽⁢\nˆ\n𝑧\n in cylindrical coordinates.';
+  const rawHTML = '<span>density<br>⃗<br>𝐽<br>=𝐽⁢<br>ˆ<br>𝑧</span>';
+  const rawHTMLFormat = 'Version:1.0\r\nStartHTML:0000000000\r\nBROKEN';
+  for (const rejectAt of [2, 3]) {
+    const instance = dom('<div id="target" contenteditable="true">selected text</div>');
+    const target = instance.window.document.querySelector('#target');
+    selectContents(instance.window, target);
+    cleanCopy.install(instance.window.document, instance.window);
+    const initial = new Map([
+      ['text/plain', rawPlain],
+      ['text/html', rawHTML],
+      ['HTML Format', rawHTMLFormat]
+    ]);
+    const values = new Map(initial);
+    let repairWrites = 0;
+    let rejected = false;
+    const clipboardData = {
+      get types() { return Array.from(values.keys()); },
+      clearData(type) { if (arguments.length) values.delete(type); else values.clear(); },
+      getData(type) { return values.get(type) || ''; }
+    };
+    Object.defineProperty(clipboardData, 'setData', {
+      value(type, value) {
+        if (!rejected && value !== initial.get(type)) {
+          repairWrites += 1;
+          if (repairWrites === rejectAt) {
+            rejected = true;
+            throw new Error('browser rejected clipboard flavor');
+          }
+        }
+        values.set(type, value);
+      },
+      configurable: false,
+      writable: false
+    });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', { value: clipboardData });
+    target.dispatchEvent(event);
+    assert.deepEqual(values, initial, 'rejected write ' + rejectAt);
+    assert.equal(event.defaultPrevented, false, 'rejected write ' + rejectAt);
+  }
+});
+
+test('a later native plain write rolls back an earlier flattened rich rewrite', () => {
+  const instance = dom('<div id="target" contenteditable="true">selected text</div>');
+  const target = instance.window.document.querySelector('#target');
+  selectContents(instance.window, target);
+  cleanCopy.install(instance.window.document, instance.window);
+  const clipboard = new Map();
+  const nativeHTML = '<span>site-owned final HTML</span>';
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text/plain', 'density \n⃗\n𝐽\n=𝐽⁢\nˆ\n𝑧');
+    event.clipboardData.setData('text/html', nativeHTML);
+    event.clipboardData.setData('text/plain', 'site-owned final text');
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  target.dispatchEvent(event);
+  assert.equal(clipboard.get('text/plain'), 'site-owned final text');
+  assert.equal(clipboard.get('text/html'), nativeHTML);
 });
 
 test('generic rich HTML and MathML stay pending when a site writes semantics before plain text', () => {

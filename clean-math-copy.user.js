@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.1.1
+// @version      2.1.2
 // @description  Faithfully copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
@@ -43,7 +43,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function cleanMathCopyFactory(global) {
   'use strict';
 
-  const VERSION = '2.1.1';
+  const VERSION = '2.1.2';
   const STORAGE_KEY = 'cleanMathCopy.settings.v3';
   const MATHML_NAMESPACE = 'http://www.w3.org/1998/Math/MathML';
   const MAX_CLIPBOARD_MARKUP_LENGTH = 1024 * 1024;
@@ -5569,6 +5569,17 @@
       .replace(/<!--EndFragment-->$/, '');
   }
 
+  function plainTextClipboardHTML(input) {
+    const escaped = cleanClipboardText(input)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+      .replace(/\n/g, '<br>');
+    return '<!--StartFragment-->' + escaped + '<!--EndFragment-->';
+  }
+
   function utf8ByteLength(input) {
     let length = 0;
     for (const character of String(input == null ? '' : input)) {
@@ -5780,6 +5791,86 @@
       .replace(/[\u00ad\u200b\u2060\ufeff]/g, '')
       .replace(/\u00a0/g, ' ');
     return value.normalize ? value.normalize('NFC') : value;
+  }
+
+  function repairFlattenedRendererText(input) {
+    const untouched = String(input == null ? '' : input);
+    const original = cleanClipboardText(untouched);
+    const repairStart = '\ue120';
+    const repairEnd = '\ue121';
+    if (original.includes(repairStart) || original.includes(repairEnd)) return untouched;
+    let repairs = 0;
+    // A few visual math renderers put an accent in its own layout box before
+    // the base glyph. Native selection then exposes visual box order instead
+    // of mathematical order, for example `\n⃗\n𝐽` and `\nˆ\n𝑧`. Restrict this
+    // recovery to an accent-only line next to one identifier: ordinary arrows,
+    // carets, prose line breaks, and authored multi-line text stay untouched.
+    const accent = '[\\u20d6\\u20d7\\u02c6]';
+    const identifier = '[\\p{L}\\p{N}]';
+    const combiningFor = (value) => ({
+      '\u20d6': '\u20d6',
+      '\u20d7': '\u20d7',
+      '\u02c6': '\u0302'
+    })[value] || value;
+    let value = original.replace(new RegExp(
+      '(^|\\n)[ \\t]*(' + accent + ')[ \\t]*\\n[ \\t]*(' + identifier + ')(?=$|[\\s=+\\-\\u2212\\u00d7\\u22c5\\u2061-\\u2064,.;:!?()])',
+      'gu'
+    ), (_match, boundary, mark, base) => {
+      repairs += 1;
+      return boundary + repairStart + base + combiningFor(mark) + repairEnd;
+    });
+    value = value.replace(new RegExp(
+      '(' + identifier + ')[ \\t]*\\n[ \\t]*(' + accent + ')[ \\t]*(?=\\n|$)',
+      'gu'
+    ), (_match, base, mark) => {
+      repairs += 1;
+      return repairStart + base + combiningFor(mark) + repairEnd;
+    });
+    if (!repairs) return untouched;
+
+    // Collapse only the layout break immediately touching the recovered
+    // accent. Do not flatten any other single newline in the selection, and
+    // leave blank-line paragraph boundaries exact.
+    value = value.replace(new RegExp('([ \\t]*)\\n([ \\t]*)' + repairStart, 'gu'),
+      (match, _before, _after, offset, source) => {
+        if (offset > 0 && source[offset - 1] === '\n') return match;
+        // The match begins before its captured horizontal whitespace, so the
+        // preceding significant code unit is available in O(1). Never slice
+        // the growing prefix once per accent: a long selection with many
+        // renderer boxes must remain linear.
+        const previous = offset > 0 ? source[offset - 1] : '';
+        return /[\u2061\u2062]/u.test(previous) ? repairStart : ' ' + repairStart;
+      });
+    value = value.replace(new RegExp(repairEnd + '([ \\t]*)\\n([ \\t]*)([^\\n])', 'gu'),
+      (_match, _before, after, next) => {
+        if (after || /[=\u2260\u2248\u2264\u2265\u221d+\-\u2212]/u.test(next)) {
+          return repairEnd + ' ' + next;
+        }
+        if (/[,.;:!?\)\]\}]/u.test(next)) return repairEnd + next;
+        if (/\p{L}/u.test(next)) return repairEnd + ' ' + next;
+        return repairEnd + next;
+      });
+    value = value.replace(new RegExp(repairEnd + '[ \\t]*\\n[ \\t]*$', 'u'), repairEnd);
+    // Mathematical Alphanumeric Symbols are a renderer font choice here, not
+    // an authored alphabet choice. Return ordinary identifiers just as the
+    // semantic MathML/TeX paths do for implicit italic variables. Scope that
+    // compatibility normalization to the recovered sentence: an unrelated
+    // authored mathematical alphabet elsewhere in the selection is content.
+    value = value.split(/([.!?。！？]+|\n+)/u).map((part) => {
+      if (!part.includes(repairStart) && !part.includes(repairEnd)) return part;
+      return Array.from(part, (character) => /[\u{1d400}-\u{1d7ff}]/u.test(character)
+        ? character.normalize('NFKC')
+        : character).join('');
+    }).join('');
+    value = value.replaceAll(repairStart, '').replaceAll(repairEnd, '');
+    const repaired = value
+      .replace(/[ \t]*\u2061[ \t]*/gu, '')
+      .replace(/[ \t]*\u2062[ \t]*/gu, '')
+      .replace(/[ \t]*\u2063[ \t]*/gu, ', ')
+      .replace(/[ \t]*\u2064[ \t]*/gu, ' + ')
+      .replace(/[ \t]*([=\u2260\u2248\u2264\u2265\u221d])[ \t]*/gu, ' $1 ')
+      .replace(/[ \t]{2,}/g, ' ');
+    return finalizeRewrittenText(repaired.normalize ? repaired.normalize('NFC') : repaired);
   }
 
   function finalizeRewrittenText(input) {
@@ -5997,8 +6088,8 @@
     }
     if (name === 'abs') return exact(1) ? '\\left|' + args[0] + '\\right|' : '';
     if (name === 'rbracelr') return exact(1) ? '\\left(' + args[0] + '\\right)' : '';
-    if (name === 'sbracelr') return exact(1) ? '\\left[' + args[0] + '\\right]' : '';
-    if (name === 'bracelr') return exact(1) ? '\\left\\{' + args[0] + '\\right\\}' : '';
+    if (name === 'sbracelr') return exact(1) ? '\\left\\{' + args[0] + '\\right\\}' : '';
+    if (name === 'bracelr') return exact(1) ? '\\left[' + args[0] + '\\right]' : '';
     const boundedOperators = {
       bigcupab: 'bigcup', bigcapab: 'bigcap', prodab: 'prod', coprodab: 'coprod',
       intab: 'int', ointab: 'oint', sumab: 'sum'
@@ -6021,6 +6112,18 @@
     const parseSequence = (closing, splitArguments, depth) => {
       if (depth > MAX_MATHML_DEPTH) throw new Error('Google Docs equation depth exceeded');
       const args = [''];
+      // Track only literal delimiters from this sequence. Delimiters produced
+      // by nested equation functions belong to that function and cannot close
+      // a raw literal fence in the surrounding sequence.
+      const literalFenceStacks = [[]];
+      const updateLiteralFences = (literal) => {
+        const stack = literalFenceStacks[literalFenceStacks.length - 1];
+        const matchingOpen = { ')': '(', ']': '[', '}': '{' };
+        for (const character of literal) {
+          if (character === '(' || character === '[' || character === '{') stack.push(character);
+          else if (matchingOpen[character] && stack[stack.length - 1] === matchingOpen[character]) stack.pop();
+        }
+      };
       const append = (value) => {
         args[args.length - 1] += value;
         if (args[args.length - 1].length > MAX_MATH_SOURCE_LENGTH) {
@@ -6038,6 +6141,7 @@
         if (character === '\u001d') {
           if (!splitArguments) throw new Error('Unexpected Google Docs equation argument');
           args.push('');
+          literalFenceStacks.push([]);
           position += 1;
           continue;
         }
@@ -6046,6 +6150,21 @@
           if (!command) throw new Error('Missing Google Docs equation command');
           position += 1;
           const functionArgs = parseSequence('\u001b', true, depth + 1);
+          // Docs sometimes serializes the closing edge of a literal fence as
+          // an empty paired-fence function immediately before the real raw
+          // closing character. Suppress only that contextual layout marker.
+          // A standalone/authored empty pair remains visible.
+          const emptyFence = {
+            '\\rbracelr': ['(', ')'],
+            '\\sbracelr': ['{', '}'],
+            '\\bracelr': ['[', ']']
+          }[command];
+          const literalStack = literalFenceStacks[literalFenceStacks.length - 1];
+          if (functionArgs.length === 1 && functionArgs[0] === '' && emptyFence &&
+              literalStack[literalStack.length - 1] === emptyFence[0] &&
+              spacers[position] === emptyFence[1]) {
+            continue;
+          }
           const latex = googleDocsFunctionLatex(command, functionArgs, true);
           if (!latex) throw new Error('Invalid Google Docs equation function');
           append(latex);
@@ -6063,9 +6182,11 @@
         if (/[\u0019-\u001f]/u.test(character)) throw new Error('Unbalanced Google Docs equation');
         let end = position + 1;
         while (end < spacers.length && !/[\u0019-\u001f]/u.test(spacers[end])) end += 1;
-        const literal = googleDocsLiteralLatex(spacers.slice(position, end));
+        const literalSource = spacers.slice(position, end);
+        const literal = googleDocsLiteralLatex(literalSource);
         if (!literal && end > position) throw new Error('Invalid Google Docs equation text');
         append(literal);
+        updateLiteralFences(literalSource);
         budget.steps += end - position - 1;
         if (budget.steps > MAX_GOOGLE_DOCS_PARSE_STEPS) throw new Error('Google Docs equation steps exceeded');
         position = end;
@@ -7292,18 +7413,37 @@
       const serialized = serializeOrdinaryFragment(fragment);
       values.push({ fragment, ...serialized });
     }
+    let repairedRendererLayout = false;
+    for (const value of values) {
+      const repaired = repairFlattenedRendererText(value.text);
+      if (repaired !== value.text) {
+        value.text = repaired;
+        repairedRendererLayout = true;
+      }
+    }
     const text = values.map((value) => value.text).join('\n');
     if (!text.trim() || text === nativeText) return null;
     const confidentlyBetter = values.some((value) =>
       value.evidence.artifacts || value.evidence.collapsibleWhitespace ||
-      value.evidence.hiddenOrAlternate || value.evidence.structure);
+      value.evidence.hiddenOrAlternate || value.evidence.structure) || repairedRendererLayout;
     if (!confidentlyBetter) return null;
     const onlyInvisibleArtifacts = hasCleanableArtifacts(nativeText) && cleanOrdinaryCharacters(nativeText) === text;
+    let html;
+    if (repairedRendererLayout) {
+      const fragment = documentObject.createDocumentFragment();
+      text.split('\n').forEach((line, index) => {
+        if (index) fragment.appendChild(documentObject.createElement('br'));
+        if (line) fragment.appendChild(documentObject.createTextNode(line));
+      });
+      html = sanitizeRichFragment(fragment);
+    } else html = safeOrdinaryRichHTML(values.map((value) => value.fragment), documentObject);
     return {
       text,
-      html: safeOrdinaryRichHTML(values.map((value) => value.fragment), documentObject),
+      html,
       mathML: '',
-      reason: onlyInvisibleArtifacts ? 'invisible-artifacts' : 'ordinary-text-cleanup',
+      reason: repairedRendererLayout
+        ? 'flattened-renderer-math'
+        : (onlyInvisibleArtifacts ? 'invisible-artifacts' : 'ordinary-text-cleanup'),
       mathRanges: 0
     };
   }
@@ -8047,9 +8187,12 @@
       nativePlainSeen: false,
       nativePlainRaw: '',
       nativePlain: '',
+      repairedRendererPlain: '',
       plainType: 'text/plain',
       nativePlainValues: new Map(),
       injectedPlainTypes: new Map(),
+      nativeRichValues: new Map(),
+      injectedRichTypes: new Map(),
       semanticCandidates: new Map(),
       semanticPayload: null,
       semanticPriority: 0,
@@ -8071,6 +8214,8 @@
     state.nativePlainSeen = true;
     state.nativePlainRaw = raw;
     state.nativePlain = cleanClipboardText(raw);
+    const repaired = repairFlattenedRendererText(state.nativePlain);
+    state.repairedRendererPlain = repaired !== state.nativePlain ? finalizeRewrittenText(repaired) : '';
     state.plainType = actualType;
   }
 
@@ -8082,12 +8227,44 @@
     state.nativePlainSeen = Boolean(latest);
     state.nativePlainRaw = latest ? latest.value : '';
     state.nativePlain = latest ? cleanClipboardText(latest.value) : '';
+    const repaired = repairFlattenedRendererText(state.nativePlain);
+    state.repairedRendererPlain = repaired !== state.nativePlain ? finalizeRewrittenText(repaired) : '';
     state.plainType = latest ? latest.type : 'text/plain';
   }
 
   function markSiteInjectedPlain(state, type) {
     const actualType = String(type || 'text/plain');
     state.injectedPlainTypes.set(actualType.toLowerCase(), actualType);
+    state.rewritten = true;
+  }
+
+  function siteRichHTMLType(type) {
+    const normalized = String(type || '').toLowerCase();
+    return normalized === 'text/html' || normalized === 'html format';
+  }
+
+  function recordSiteNativeRich(state, type, value) {
+    const actualType = String(type || 'text/html');
+    const normalizedType = actualType.toLowerCase();
+    state.nativeRichValues.delete(normalizedType);
+    state.nativeRichValues.set(normalizedType, {
+      type: actualType,
+      value: String(value == null ? '' : value)
+    });
+    state.injectedRichTypes.delete(normalizedType);
+    state.rewritten = state.injectedPlainTypes.size > 0 || state.injectedRichTypes.size > 0;
+  }
+
+  function forgetSiteNativeRich(state, type) {
+    const normalizedType = String(type || 'text/html').toLowerCase();
+    state.nativeRichValues.delete(normalizedType);
+    state.injectedRichTypes.delete(normalizedType);
+    state.rewritten = state.injectedPlainTypes.size > 0 || state.injectedRichTypes.size > 0;
+  }
+
+  function markSiteInjectedRich(state, type) {
+    const actualType = String(type || 'text/html');
+    state.injectedRichTypes.set(actualType.toLowerCase(), actualType);
     state.rewritten = true;
   }
 
@@ -8199,8 +8376,32 @@
     }
   }
 
+  function applySiteRendererPlainDirect(clipboardData, state) {
+    if (!clipboardData || !state || !state.originalSetData || !state.repairedRendererPlain) return false;
+    try {
+      const plainTypes = new Set([state.plainType || 'text/plain', 'text/plain']);
+      for (const type of plainTypes) {
+        state.originalSetData.call(clipboardData, type, state.repairedRendererPlain);
+        markSiteInjectedPlain(state, type);
+      }
+      const html = plainTextClipboardHTML(state.repairedRendererPlain);
+      for (const native of state.nativeRichValues.values()) {
+        const value = native.type.toLowerCase() === 'html format'
+          ? clipboardHTMLFormat(html)
+          : html;
+        state.originalSetData.call(clipboardData, native.type, value);
+        markSiteInjectedRich(state, native.type);
+      }
+      return true;
+    } catch (_error) {
+      restoreSiteNativePlain(clipboardData, state);
+      return false;
+    }
+  }
+
   function restoreSiteNativePlain(clipboardData, state) {
-    if (!clipboardData || !state || !state.originalSetData || !state.rewritten) return false;
+    if (!clipboardData || !state || !state.originalSetData ||
+        (!state.injectedPlainTypes.size && !state.injectedRichTypes.size)) return false;
     try {
       for (const [normalizedType, actualType] of state.injectedPlainTypes) {
         const native = state.nativePlainValues.get(normalizedType);
@@ -8210,7 +8411,16 @@
           state.originalClearData.call(clipboardData, actualType);
         }
       }
+      for (const [normalizedType, actualType] of state.injectedRichTypes) {
+        const native = state.nativeRichValues.get(normalizedType);
+        if (native) state.originalSetData.call(clipboardData, native.type, native.value);
+        else {
+          if (!state.originalClearData) return false;
+          state.originalClearData.call(clipboardData, actualType);
+        }
+      }
       state.injectedPlainTypes.clear();
+      state.injectedRichTypes.clear();
       state.rewritten = false;
       return true;
     } catch (_error) {
@@ -8221,6 +8431,7 @@
   function synchronizeSiteClipboard(clipboardData, state) {
     discardMismatchedSiteCandidates(state);
     if (sitePayloadAgreesWithPlain(state)) return applySitePayloadDirect(clipboardData, state);
+    if (state && state.repairedRendererPlain) return applySiteRendererPlainDirect(clipboardData, state);
     restoreSiteNativePlain(clipboardData, state);
     return false;
   }
@@ -8239,12 +8450,13 @@
         recordSiteNativePlain(state, actualType, actualValue);
       }
       const result = original.call(this, actualType, actualValue);
+      if (siteRichHTMLType(normalizedType)) recordSiteNativeRich(state, actualType, actualValue);
       if (plain) {
         // The site's new plain write replaced any earlier rewrite. Re-evaluate
         // candidates without changing defaultPrevented in the middle of the
         // site's own handler; bubble finalization handles cancellation.
         state.injectedPlainTypes.delete(normalizedType);
-        state.rewritten = state.injectedPlainTypes.size > 0;
+        state.rewritten = state.injectedPlainTypes.size > 0 || state.injectedRichTypes.size > 0;
         synchronizeSiteClipboard(clipboardData, state);
         return result;
       }
@@ -8288,9 +8500,12 @@
           recomputeSiteSemanticPayload(state);
           state.nativePlainValues.clear();
           state.injectedPlainTypes.clear();
+          state.nativeRichValues.clear();
+          state.injectedRichTypes.clear();
           state.nativePlainSeen = false;
           state.nativePlainRaw = '';
           state.nativePlain = '';
+          state.repairedRendererPlain = '';
           state.plainType = 'text/plain';
           state.rewritten = false;
           return result;
@@ -8298,11 +8513,12 @@
         if (/^(?:text\/plain|text|unicode)$/i.test(normalizedType)) {
           forgetSiteNativePlain(state, normalizedType);
           state.injectedPlainTypes.delete(normalizedType);
-          state.rewritten = state.injectedPlainTypes.size > 0;
+          state.rewritten = state.injectedPlainTypes.size > 0 || state.injectedRichTypes.size > 0;
           restoreSiteNativePlain(clipboardData, state);
           return result;
         }
         if (siteSemanticClipboardType(normalizedType, googleDocs)) {
+          if (siteRichHTMLType(normalizedType)) forgetSiteNativeRich(state, normalizedType);
           replaceSiteSemanticCandidate(state, normalizedType, null);
           synchronizeSiteClipboard(clipboardData, state);
         }
@@ -8322,6 +8538,10 @@
     if (state.wrapped) {
       discardMismatchedSiteCandidates(state);
       if (!sitePayloadAgreesWithPlain(state)) {
+        if (state.repairedRendererPlain && applySiteRendererPlainDirect(event.clipboardData, state)) {
+          event.preventDefault();
+          return;
+        }
         restoreSiteNativePlain(event.clipboardData, state);
         return;
       }
@@ -8332,9 +8552,14 @@
     const types = clipboardTypes(event.clipboardData);
     const plainType = types.find((type) => /^(?:text\/plain|text|unicode)$/i.test(type)) || 'text/plain';
     state.plainType = plainType;
-    state.nativePlainRaw = clipboardGet(event.clipboardData, plainType);
-    state.nativePlain = cleanClipboardText(state.nativePlainRaw);
-    state.nativePlainSeen = types.some((type) => /^(?:text\/plain|text|unicode)$/i.test(type));
+    const nativePlainSeen = types.some((type) => /^(?:text\/plain|text|unicode)$/i.test(type));
+    if (nativePlainSeen) recordSiteNativePlain(state, plainType, clipboardGet(event.clipboardData, plainType));
+    else {
+      state.nativePlainRaw = '';
+      state.nativePlain = '';
+      state.repairedRendererPlain = '';
+      state.nativePlainSeen = false;
+    }
     state.semanticCandidates.clear();
     recomputeSiteSemanticPayload(state);
     for (const type of types) {
@@ -8351,7 +8576,37 @@
       }
     }
     discardMismatchedSiteCandidates(state);
-    if (!sitePayloadAgreesWithPlain(state)) return;
+    if (!sitePayloadAgreesWithPlain(state)) {
+      if (!state.repairedRendererPlain) return;
+      const nativeValues = new Map();
+      const writtenTypes = [];
+      try {
+        const html = plainTextClipboardHTML(state.repairedRendererPlain);
+        const writes = [{ type: plainType, value: state.repairedRendererPlain }];
+        for (const type of types.filter(siteRichHTMLType)) {
+          writes.push({
+            type,
+            value: type.toLowerCase() === 'html format' ? clipboardHTMLFormat(html) : html
+          });
+        }
+        for (const write of writes) {
+          nativeValues.set(write.type, clipboardGet(event.clipboardData, write.type));
+          event.clipboardData.setData(write.type, write.value);
+          writtenTypes.push(write.type);
+        }
+        state.rewritten = true;
+        event.preventDefault();
+      } catch (_error) {
+        // This path is used only when the DataTransfer methods could not be
+        // wrapped. Restore each flavor that was already accepted so a rich
+        // destination can never see stale HTML beside repaired plain text.
+        for (let index = writtenTypes.length - 1; index >= 0; index -= 1) {
+          const type = writtenTypes[index];
+          try { event.clipboardData.setData(type, nativeValues.get(type) || ''); } catch (_restoreError) { /* best effort */ }
+        }
+      }
+      return;
+    }
     try {
       event.clipboardData.setData(plainType, state.semanticPayload.text);
       state.rewritten = true;
@@ -8470,6 +8725,13 @@
                 reflectApply(nativeSet, data, ['text/plain', response.text]);
                 injectedValues.set('text/plain', response.text);
               }
+            }
+            for (const item of Array.isArray(response.richWrites) ? response.richWrites.slice(0, 2) : []) {
+              if (!item || typeof item.type !== 'string' || typeof item.text !== 'string') continue;
+              const itemKey = normalizedType(item.type);
+              if (injectedValues.get(itemKey) === item.text) continue;
+              reflectApply(nativeSet, data, [item.type, item.text]);
+              injectedValues.set(itemKey, item.text);
             }
           } else if (response.action === 'restore') {
             for (const item of Array.isArray(response.writes) ? response.writes.slice(0, 4) : []) {
@@ -8689,11 +8951,34 @@
         prevent: Boolean(finalize)
       };
     }
+    if (state && state.repairedRendererPlain) {
+      for (const type of new Set([state.plainType || 'text/plain', 'text/plain'])) {
+        markSiteInjectedPlain(state, type);
+      }
+      const html = plainTextClipboardHTML(state.repairedRendererPlain);
+      const richTypes = new Map(state.nativeRichValues);
+      if (!richTypes.has('text/html')) richTypes.set('text/html', { type: 'text/html' });
+      const richWrites = [];
+      for (const native of richTypes.values()) {
+        const text = native.type.toLowerCase() === 'html format'
+          ? clipboardHTMLFormat(html)
+          : html;
+        richWrites.push({ type: native.type, text });
+        markSiteInjectedRich(state, native.type);
+      }
+      return {
+        action: 'write',
+        type: state.plainType || 'text/plain',
+        text: state.repairedRendererPlain,
+        richWrites,
+        prevent: Boolean(finalize)
+      };
+    }
     return pageRelayRestoreResponse(state);
   }
 
   function pageRelayRestoreResponse(state) {
-    if (!state.rewritten || !state.injectedPlainTypes.size) return { action: '', prevent: false };
+    if (!state.injectedPlainTypes.size && !state.injectedRichTypes.size) return { action: '', prevent: false };
     const writes = [];
     const clears = [];
     for (const [normalizedType, actualType] of state.injectedPlainTypes) {
@@ -8701,7 +8986,13 @@
       if (native) writes.push({ type: native.type, text: native.value });
       else clears.push(actualType);
     }
+    for (const [normalizedType, actualType] of state.injectedRichTypes) {
+      const native = state.nativeRichValues.get(normalizedType);
+      if (native) writes.push({ type: native.type, text: native.value });
+      else clears.push(actualType);
+    }
     state.injectedPlainTypes.clear();
+    state.injectedRichTypes.clear();
     state.rewritten = false;
     return { action: 'restore', writes, clears, prevent: false };
   }
@@ -8722,17 +9013,19 @@
         if (plain) {
           forgetSiteNativePlain(state, normalizedType);
           state.injectedPlainTypes.delete(normalizedType);
-          state.rewritten = state.injectedPlainTypes.size > 0;
+          state.rewritten = state.injectedPlainTypes.size > 0 || state.injectedRichTypes.size > 0;
           state.semanticCandidates.clear();
           recomputeSiteSemanticPayload(state);
         } else if (siteSemanticClipboardType(normalizedType, googleDocs)) {
+          if (siteRichHTMLType(normalizedType)) forgetSiteNativeRich(state, normalizedType);
           replaceSiteSemanticCandidate(state, normalizedType, null);
         }
       } else if (plain) {
         recordSiteNativePlain(state, request.type, request.value);
         state.injectedPlainTypes.delete(normalizedType);
-        state.rewritten = state.injectedPlainTypes.size > 0;
+        state.rewritten = state.injectedPlainTypes.size > 0 || state.injectedRichTypes.size > 0;
       } else if (siteSemanticClipboardType(normalizedType, googleDocs)) {
+        if (siteRichHTMLType(normalizedType)) recordSiteNativeRich(state, request.type, request.value);
         const semantic = disableAfterOperation ? null : siteSemanticPayload(
           request.type, request.value, settings, documentObject, googleDocs, state
         );
@@ -8746,9 +9039,12 @@
         recomputeSiteSemanticPayload(state);
         state.nativePlainValues.clear();
         state.injectedPlainTypes.clear();
+        state.nativeRichValues.clear();
+        state.injectedRichTypes.clear();
         state.nativePlainSeen = false;
         state.nativePlainRaw = '';
         state.nativePlain = '';
+        state.repairedRendererPlain = '';
         state.plainType = 'text/plain';
         state.rewritten = false;
         return finish({ action: '', prevent: false });
@@ -8756,10 +9052,11 @@
       if (plain) {
         forgetSiteNativePlain(state, normalizedType);
         state.injectedPlainTypes.delete(normalizedType);
-        state.rewritten = state.injectedPlainTypes.size > 0;
+        state.rewritten = state.injectedPlainTypes.size > 0 || state.injectedRichTypes.size > 0;
         return finish(pageRelayRestoreResponse(state));
       }
       if (siteSemanticClipboardType(normalizedType, googleDocs)) {
+        if (siteRichHTMLType(normalizedType)) forgetSiteNativeRich(state, normalizedType);
         replaceSiteSemanticCandidate(state, normalizedType, null);
       }
       return finish(disableAfterOperation ? pageRelayRestoreResponse(state) : pageRelayResponse(state, false));
@@ -9185,6 +9482,7 @@
     DEFAULT_SETTINGS,
     MATH_ROOT_SELECTOR,
     cleanClipboardText,
+    repairFlattenedRendererText,
     cleanMathCopyPageRelayMain,
     cleanOfficeClipboardText,
     convertDelimitedLatexText,
