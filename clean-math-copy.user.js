@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.0.0
+// @version      2.0.1
 // @description  Faithfully copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
@@ -39,7 +39,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function cleanMathCopyFactory(global) {
   'use strict';
 
-  const VERSION = '2.0.0';
+  const VERSION = '2.0.1';
   const STORAGE_KEY = 'cleanMathCopy.settings.v3';
   const MATHML_NAMESPACE = 'http://www.w3.org/1998/Math/MathML';
   const MAX_CLIPBOARD_MARKUP_LENGTH = 1024 * 1024;
@@ -2765,7 +2765,7 @@
     if (['math', 'mrow', 'mstyle', 'mpadded'].includes(name) && children.length === 1) {
       return serializeMathMLCalculatorNode(children[0]);
     }
-    return calculatorResult(rowText() || calculatorIdentifier(node.textContent || ''), name === 'math' || name === 'mrow' ? 'operand' : 'operand');
+    return calculatorResult(rowText() || calculatorIdentifier(node.textContent || ''), 'operand');
   }
 
   function mathMLToCalculator(mathElement) {
@@ -4836,17 +4836,6 @@
     return element;
   }
 
-  function mathematicalItalicText(input) {
-    return Array.from(String(input), (character) => {
-      const code = character.codePointAt(0);
-      if (code >= 65 && code <= 90) return String.fromCodePoint(0x1d434 + code - 65);
-      if (code >= 97 && code <= 122) return character === 'h'
-        ? '\u210e'
-        : String.fromCodePoint(0x1d44e + code - 97);
-      return character;
-    }).join('');
-  }
-
   function richMathNodeFromMathML(node, documentObject) {
     if (!node) return documentObject.createTextNode('');
     if (node.nodeType === 3) return documentObject.createTextNode(node.nodeValue || '');
@@ -5981,15 +5970,6 @@
       if (payload) return payload;
     }
     return null;
-  }
-
-  function escapeClipboardHTML(input) {
-    return String(input)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/\n/g, '<br>');
   }
 
   function hasCleanableArtifacts(text) {
