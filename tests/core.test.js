@@ -186,6 +186,22 @@ test('faithful mode retains functions, aggregates, cases, matrices, and authored
     cleanCopy.latexToFaithful(String.raw`\begin{bmatrix}a&b\\c&d\end{bmatrix}`),
     '[a, b; c, d]'
   );
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`\begin{aligned}x&=1\\[3mu]y&=2\end{aligned}`),
+    'x = 1; y = 2'
+  );
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`\begin{alignedat}{3}x_1&=1&&=2\\x_2&=3&&=4\end{alignedat}`),
+    'x₁ = 1 = 2; x₂ = 3 = 4'
+  );
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`\begin{aligned}x&=1,\\y&=2.\end{aligned}`),
+    'x = 1, y = 2.'
+  );
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`\frac{b^2-4ac}{4a^2}`),
+    '(b² − 4ac)/(4a²)'
+  );
   assert.equal(cleanCopy.latexToFaithful(String.raw`m_1\,m_2`), 'm₁ m₂');
   assert.equal(cleanCopy.latexToFaithful(String.raw`m_1\cdot m_2`), 'm₁ ⋅ m₂');
   assert.equal(cleanCopy.latexToFaithful(String.raw`m_1*m_2`), 'm₁*m₂');

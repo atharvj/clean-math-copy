@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.1.0
+// @version      2.1.1
 // @description  Faithfully copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
@@ -43,11 +43,13 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function cleanMathCopyFactory(global) {
   'use strict';
 
-  const VERSION = '2.1.0';
+  const VERSION = '2.1.1';
   const STORAGE_KEY = 'cleanMathCopy.settings.v3';
   const MATHML_NAMESPACE = 'http://www.w3.org/1998/Math/MathML';
   const MAX_CLIPBOARD_MARKUP_LENGTH = 1024 * 1024;
   const GOOGLE_DOCS_SLICE_TYPE = 'application/x-vnd.google-docs-document-slice-clip+wrapped';
+  const GOOGLE_DOCS_CLIPBOARD_FRAME_SELECTOR =
+    'iframe.docs-texteventtarget-iframe, iframe[class*="docs-texteventtarget-iframe"]';
   const MAX_GOOGLE_DOCS_STYLE_SLICES = 256;
   const MAX_GOOGLE_DOCS_EQUATIONS = 128;
   const MAX_GOOGLE_DOCS_PARSE_STEPS = 25000;
@@ -572,6 +574,23 @@
         /[\p{L}\p{N}\p{M}₀-₟⁰-⁹′″‴⁗]\s*(?:√|∛|∜)/u.test(text)) needsGrouping = true;
     if (denominator && !settings.atomic &&
         (text.match(/[√∛∜]/gu) || []).length > 1) needsGrouping = true;
+    if (denominator && !settings.atomic && !needsGrouping) {
+      try {
+        const calculatorText = unicodeToCalculator(text);
+        let calculatorDepth = 0;
+        for (const character of calculatorText) {
+          if (character === '(' || character === '[' || character === '{') calculatorDepth += 1;
+          else if (character === ')' || character === ']' || character === '}') {
+            calculatorDepth = Math.max(0, calculatorDepth - 1);
+          } else if (character === '*' && calculatorDepth === 0) {
+            needsGrouping = true;
+            break;
+          }
+        }
+      } catch (_error) {
+        needsGrouping = true;
+      }
+    }
     if (!settings.atomic &&
         /^(?:sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|sinh|cosh|tanh|log|ln|lg|exp|det|dim|gcd|hom|ker|Pr)\S*\s+\S/iu.test(readableText)) {
       needsGrouping = true;
@@ -825,13 +844,28 @@
       if (isCell || isRow) {
         parts.push(current);
         current = '';
-        if (isRow) index += 1;
+        if (isRow) {
+          index += 1;
+          // TeX permits optional vertical spacing after a row break, such as
+          // `\\[3mu]`. It affects layout only and must never leak as text.
+          const spacing = input.slice(index + 1).match(
+            /^\s*\[\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*(?:mu|pt|pc|in|bp|cm|mm|dd|cc|sp|em|ex)\s*\]/i
+          );
+          if (spacing) index += spacing[0].length;
+        }
       } else {
         current += character;
       }
     }
     parts.push(current);
     return parts;
+  }
+
+  function joinReadableEquationRows(rows) {
+    return rows.reduce((output, row) => {
+      if (!output) return row;
+      return output + (/[,:;.]\s*$/u.test(output) ? ' ' : '; ') + row;
+    }, '');
   }
 
   function convertLatexEnvironment(environment, body, options) {
@@ -843,6 +877,10 @@
     let content = body;
     if (env === 'array' && /^\s*\{[^}]*\}/.test(content)) {
       content = content.replace(/^\s*\{[^}]*\}/, '');
+    }
+    if (env === 'alignedat' && /^\s*\{\s*\d{1,3}\s*\}/.test(content)) {
+      // The mandatory alignedat column count controls layout only.
+      content = content.replace(/^\s*\{\s*\d{1,3}\s*\}/, '');
     }
     const rows = splitLatexTopLevel(content, 'row').map((row) =>
       splitLatexTopLevel(row, 'cell').map((cell) => convertCell(cell.trim()))
@@ -862,7 +900,7 @@
       if (calculatorMode) return '[' + rows.map((cells) => '[' + cells.join(',') + ']').join(',') + ']';
       return '[' + rows.map((cells) => cells.join(', ')).join('; ') + ']';
     }
-    return rows.map((cells) => cells.join('  ')).join('; ');
+    return joinReadableEquationRows(rows.map((cells) => cells.join('  ')));
   }
 
   class LatexParser {
@@ -1625,7 +1663,7 @@
       .replace(/\s*;\s*/g, '; ')
       .replace(/([([{⟨⌈⌊])\s+/g, '$1')
       .replace(/([\p{L}\p{N}])\s+\(/gu, '$1(')
-      .replace(/\s+([)\]}⟩⌉⌋,;])/g, '$1')
+      .replace(/\s+([)\]}⟩⌉⌋,.;:!?])/g, '$1')
       .replace(/[ ]{2,}/g, ' ')
       .trim();
     return text.normalize ? text.normalize('NFC') : text;
@@ -1668,7 +1706,7 @@
       .replace(/\s*,\s*/g, ', ')
       .replace(/\s*;\s*/g, '; ')
       .replace(/([([{\u27e8\u2308\u230a])\s+/g, '$1')
-      .replace(/\s+([)\]}\u27e9\u2309\u230b,;])/g, '$1')
+      .replace(/\s+([)\]}\u27e9\u2309\u230b,.;:!?])/g, '$1')
       .replace(/√\s+\(/g, '√(')
       .replace(/(lim(?![\p{Ll}\p{Lu}])(?:_\([^)]*\)|[\u2080-\u209cᵢⱼᵦ-ᵪ]+)?(?:\^\([^)]*\)|[⁰-⁹⁺⁻⁼⁽⁾ⁿⁱ]+)?)(?=[\p{Ll}\p{Lu}\p{Nd}√(|‖])/gu, '$1 ')
       .replace(/((?:∑|∏|∐|∫|∬|∭|∮)(?:_\([^)]*\)|[\u2080-\u209cᵢⱼᵦ-ᵪ]+)?(?:\^\([^)]*\)|[⁰-⁹⁺⁻⁼⁽⁾ⁿⁱ¹²³]+)?)(?=[\p{Ll}\p{Lu}\p{Nd}√(|‖])/gu, '$1 ')
@@ -3093,6 +3131,13 @@
           if (piecewise) {
             flattened.push(piecewise);
           } else if (name === 'mrow') {
+            const single = nestedChildren.length === 1
+              ? serializeMathMLFaithfulNode(nestedChildren[0])
+              : null;
+            if (single && ['operator', 'relation', 'bar', 'postfix', 'open', 'close', 'separator'].includes(single.kind)) {
+              flattened.push(single);
+              continue;
+            }
             // A nested presentation row is often the only surviving evidence
             // of an invisible TeX group. Keep it as a soft scope: the scope
             // resolver adds parentheses only when adjacent factors, scripts,
@@ -3358,14 +3403,17 @@
       const zeroSpaced = columnSpacing.length > 0 && columnSpacing.every((value) =>
         /^0+(?:\.0+)?(?:px|pt|em|ex|%)?$/u.test(value)
       );
-      const alignmentLayout = zeroSpaced && (
+      const pairedAlignmentSpacing = columnSpacing.length > 0 && columnSpacing.every((value, index) =>
+        index % 2 === 1 || /^0+(?:\.0+)?(?:px|pt|em|ex|%)?$/u.test(value)
+      );
+      const alignmentLayout = (zeroSpaced || pairedAlignmentSpacing) && (
         (rowCellCounts.length > 0 && rowCellCounts.every((count) => count === 1) && columnAlign[0] === 'center') ||
         (columnAlign.length >= 2 && columnAlign.every((value, index) => value === (index % 2 ? 'left' : 'right')))
       );
       const rows = children.map((row) => elementChildren(row)
         .map((cell) => serializeMathMLFaithfulNode(cell).text)
         .join(alignmentLayout ? ' ' : ', '));
-      const tableText = rows.join('; ');
+      const tableText = alignmentLayout ? joinReadableEquationRows(rows) : rows.join('; ');
       return faithfulResult(alignmentLayout ? tableText : '[' + tableText + ']', 'operand', { tableText });
     }
     if (name === 'mtr' || name === 'mlabeledtr') {
@@ -4500,7 +4548,8 @@
     if (!mathNamed) return false;
     const nestedRenderer = element.querySelector([
       '.katex', 'mjx-container', '.MathJax_Display', '.MathJax_CHTML', '.MathJax_SVG',
-      '.MathJax', '[role="math"]', '[data-latex]', '[data-tex]', '[data-math-source]'
+      '.MathJax', '.mwe-math-element', '[role="math"]', '[data-latex]',
+      '[data-tex]', '[data-math-source]'
     ].join(','));
     if (nestedRenderer && nestedRenderer !== element) return false;
     return Boolean(
@@ -5046,6 +5095,12 @@
         node.remove();
         continue;
       }
+      if (node.nodeType === 3) {
+        const cleaned = cleanOrdinaryCharacters(node.nodeValue || '');
+        if (cleaned) node.nodeValue = cleaned;
+        else node.remove();
+        continue;
+      }
       stack.push(...Array.from(node.childNodes || []));
     }
     const elements = Array.from(fragment.querySelectorAll ? fragment.querySelectorAll('*') : []);
@@ -5057,7 +5112,9 @@
         continue;
       }
       if (tag === 'img' || tag === 'area') {
-        element.replaceWith(element.ownerDocument.createTextNode(element.getAttribute('alt') || ''));
+        const alt = cleanOrdinaryCharacters(element.getAttribute('alt') || '');
+        if (alt) element.replaceWith(element.ownerDocument.createTextNode(alt));
+        else element.remove();
         continue;
       }
       if (!ORDINARY_RICH_TAGS.has(tag)) {
@@ -5297,12 +5354,12 @@
     };
   }
 
-  function semanticMathAgreesWithVisibleBranch(math, visualBranch) {
-    if (!math || !visualBranch || nodeInside(math, visualBranch)) return true;
+  function semanticMathAgreesWithVisibleText(math, visibleText) {
+    if (!math) return true;
     const presentation = presentationMathNode(math);
     if (!presentation) return true;
     const semantic = semanticVisibleAnchorSignature(presentation.textContent || '');
-    const visible = semanticVisibleAnchorSignature(visualBranch.textContent || '');
+    const visible = semanticVisibleAnchorSignature(visibleText || '');
     if (semantic.overBudget || visible.overBudget) return false;
     // Separate accessibility/presentation trees may flatten fractions and
     // roots in a different order, but they must still describe the same
@@ -5314,6 +5371,32 @@
         semantic.operators !== visible.operators) return false;
     if (semantic.identifiers || semantic.operators || visible.identifiers || visible.operators) return true;
     return Boolean(semantic.glyphs && semantic.glyphs === visible.glyphs);
+  }
+
+  function semanticMathAgreesWithVisibleBranch(math, visualBranch) {
+    if (!math || !visualBranch || nodeInside(math, visualBranch)) return true;
+    return semanticMathAgreesWithVisibleText(math, visualBranch.textContent || '');
+  }
+
+  function wikipediaMathAgreesWithFallback(root, math) {
+    if (!root || !math || !root.matches || !root.matches('.mwe-math-element')) return true;
+    const image = root.querySelector && root.querySelector('img[alt]');
+    if (!image) return true;
+    const rawValue = image.getAttribute('alt') || '';
+    if (!rawValue || rawValue.length > MAX_MATH_SOURCE_LENGTH) return false;
+    const rawAlt = cleanClipboardText(rawValue);
+    const visible = latexToFaithful(rawAlt);
+    if (!visible || visible.includes('\\')) return false;
+    const presentation = presentationMathNode(math);
+    const semantic = presentation ? mathMLToFaithful(presentation) : '';
+    if (!semantic) return false;
+    // Wikipedia's image alt and MathML can express the same layout through
+    // different but equivalent surface forms (Unicode scripts vs ^(...), or
+    // a linear slash vs a fraction). Calculator normalization preserves
+    // operand/operator order and grouping while removing those cosmetic
+    // differences, so stale x/y versus y/x content still fails closed.
+    return faithfulAgreementKey(unicodeToCalculator(visible)) ===
+      faithfulAgreementKey(unicodeToCalculator(semantic));
   }
 
   function semanticMathSelectionPayload(root, range, settings, pageWindow) {
@@ -5334,6 +5417,7 @@
     if (!domTreeWithinBudget(math, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) {
       return { kind: 'unmatched' };
     }
+    if (!wikipediaMathAgreesWithFallback(root, math)) return { kind: 'unmatched' };
     const visualBranch = visibleMathBranchForRange(root, range);
     const selectsWholeVisualBranch = visualBranch && visualBranchRepresentsWholeMath(root, visualBranch) &&
       range.startContainer === visualBranch && range.startOffset === 0 &&
@@ -5405,6 +5489,7 @@
     const sourceMath = getMathElement(root);
     if (!sourceMath && !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return null;
     if (!sourceMath && !sourceOnlyMathAgreesWithVisible(root, pageWindow)) return null;
+    if (sourceMath && !wikipediaMathAgreesWithFallback(root, sourceMath)) return null;
     const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
     if (sourceMath && !safeMath) return null;
     const text = settings.outputMode === 'faithful' && safeMath
@@ -5638,9 +5723,11 @@
     const values = originalRoots.map((root) => {
       const sourceMath = getMathElement(root);
       const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
-      const sourceOnlyAgreement = sourceMath || sourceOnlyMathAgreesWithVisible(root, pageWindow);
+      const sourceAgreement = sourceMath
+        ? wikipediaMathAgreesWithFallback(root, sourceMath)
+        : sourceOnlyMathAgreesWithVisible(root, pageWindow);
       return {
-        text: !sourceOnlyAgreement || (sourceMath && !safeMath)
+        text: !sourceAgreement || (sourceMath && !safeMath)
           ? ''
           : (settings.outputMode === 'faithful' && safeMath
             ? faithfulRenderedMathText(root, safeMath, pageWindow)
@@ -7132,7 +7219,16 @@
       }
       const tag = (node.localName || '').toLowerCase();
       if (ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag) || isVisuallyHiddenElement(node)) return null;
-      if (tag === 'img' || tag === 'area') return documentObject.createTextNode(node.getAttribute('alt') || '');
+      if (tag === 'img' || tag === 'area') {
+        const rawAlt = cleanOrdinaryCharacters(node.getAttribute('alt') || '');
+        if (!rawAlt) return null;
+        let alt = rawAlt;
+        if (inheritedMode === 'pre-line') {
+          alt = rawAlt.split('\n').map((line) => line.replace(/[\t\f ]+/g, ' ')).join('\n');
+          state.lastCollapsibleSpace = / $/.test(alt);
+        } else if (inheritedMode !== 'preserve') alt = cleanNormalRichText(rawAlt);
+        return alt ? documentObject.createTextNode(alt) : null;
+      }
       const mode = ordinaryWhitespaceMode(node, inheritedMode);
       if (tag === 'br' || BLOCK_TAGS.has(tag) || ['li', 'table', 'tr', 'td', 'th', 'ul', 'ol'].includes(tag)) {
         state.lastCollapsibleSpace = false;
@@ -8271,7 +8367,7 @@
   // page listener that calls stopImmediatePropagation(). This tiny page-world
   // relay forwards only clipboard write operations through a private DOM
   // carrier; all parsing and settings remain in the userscript world.
-  function cleanMathCopyPageRelayMain(carrierId, eventName) {
+  function cleanMathCopyPageRelayMain(carrierId, eventName, relayGoogleDocs) {
     'use strict';
     const carrier = document.getElementById(carrierId);
     if (!carrier || carrier.getAttribute('data-clean-math-copy-relay-ready') === '1') return;
@@ -8284,11 +8380,11 @@
     const dispatchEvent = EventTarget.prototype.dispatchEvent;
     const addEventListener = EventTarget.prototype.addEventListener;
     const CustomEventConstructor = CustomEvent;
-    const enqueue = typeof queueMicrotask === 'function'
-      ? queueMicrotask
-      : (callback) => Promise.resolve().then(callback);
+    const scheduleTask = typeof setTimeout === 'function' ? setTimeout : null;
     const valueLimit = 1024 * 1024;
-    const googleDocs = location.hostname === 'docs.google.com' && location.pathname.startsWith('/document/');
+    // Clipboard events from the Google Docs editor fire in an about:blank
+    // iframe, so the child location cannot identify which site owns it.
+    const googleDocs = Boolean(relayGoogleDocs);
     const relayedType = (type) => {
       const normalized = String(type || '').toLowerCase();
       return /^(?:text\/plain|text|unicode)$/i.test(normalized) ||
@@ -8296,6 +8392,7 @@
         (googleDocs && normalized === 'application/x-vnd.google-docs-document-slice-clip+wrapped');
     };
     let serial = 0;
+    const pageCopyEvents = new WeakMap();
 
     const patchMethod = (target, name, replacement) => {
       let previous;
@@ -8328,9 +8425,18 @@
       const data = event && event.clipboardData;
       if (!data || typeof data.setData !== 'function') return;
       const nativeSet = data.setData;
+      const nativeGet = typeof data.getData === 'function' ? data.getData : null;
       const nativeClear = typeof data.clearData === 'function' ? data.clearData : null;
       const eventId = String(++serial) + '-' + String(Date.now());
       let active = true;
+      // Some editors (notably the current Google Docs canvas editor) call a
+      // cached DataTransfer prototype method. That bypasses an own setData
+      // wrapper even though the final MIME values remain readable on the
+      // event. Keep the page's values separate from relay-injected rewrites so
+      // a final snapshot can forward only writes the wrappers did not observe.
+      const nativeValues = new Map();
+      const injectedValues = new Map();
+      const normalizedType = (type) => String(type == null ? '' : type).toLowerCase();
 
       const request = (op, type, value, all) => {
         if (!active || !carrier.isConnected) return null;
@@ -8356,24 +8462,34 @@
           if (!response || response.id !== eventId) return null;
           if (response.action === 'write' && typeof response.text === 'string') {
             const requestedType = response.type || 'text/plain';
-            reflectApply(nativeSet, data, [requestedType, response.text]);
-            if (String(requestedType).toLowerCase() !== 'text/plain') {
-              reflectApply(nativeSet, data, ['text/plain', response.text]);
+            const requestedKey = normalizedType(requestedType);
+            if (injectedValues.get(requestedKey) !== response.text) {
+              reflectApply(nativeSet, data, [requestedType, response.text]);
+              injectedValues.set(requestedKey, response.text);
+              if (requestedKey !== 'text/plain') {
+                reflectApply(nativeSet, data, ['text/plain', response.text]);
+                injectedValues.set('text/plain', response.text);
+              }
             }
           } else if (response.action === 'restore') {
             for (const item of Array.isArray(response.writes) ? response.writes.slice(0, 4) : []) {
               if (item && typeof item.type === 'string' && typeof item.text === 'string') {
                 reflectApply(nativeSet, data, [item.type, item.text]);
+                injectedValues.delete(normalizedType(item.type));
               }
             }
             if (nativeClear) {
               for (const plainType of Array.isArray(response.clears) ? response.clears.slice(0, 4) : []) {
-                if (typeof plainType === 'string') reflectApply(nativeClear, data, [plainType]);
+                if (typeof plainType === 'string') {
+                  reflectApply(nativeClear, data, [plainType]);
+                  injectedValues.delete(normalizedType(plainType));
+                }
               }
             }
           } else if (response.action === 'clear' && nativeClear) {
             for (const plainType of ['text/plain', 'text', 'unicode']) {
               try { reflectApply(nativeClear, data, [plainType]); } catch (_error) { /* try remaining aliases */ }
+              injectedValues.delete(plainType);
             }
           }
           if (response.prevent) event.preventDefault();
@@ -8385,6 +8501,25 @@
       };
 
       request('begin', '', '', false);
+      const recordNativeSet = (actualType, actualValue) => {
+        if (!relayedType(actualType)) return;
+        const key = normalizedType(actualType);
+        nativeValues.set(key, { type: actualType, value: actualValue });
+        injectedValues.delete(key);
+        request('set', actualType, actualValue, false);
+      };
+      const recordNativeClear = (actualType, all) => {
+        if (all) {
+          nativeValues.clear();
+          injectedValues.clear();
+          request('clear', actualType, '', true);
+        } else if (relayedType(actualType)) {
+          const key = normalizedType(actualType);
+          nativeValues.delete(key);
+          injectedValues.delete(key);
+          request('clear', actualType, '', false);
+        }
+      };
       const wrappedSet = function cleanMathCopyRelayedSetData(type, value) {
         // WebIDL DOMString conversion occurs before the native call. Reuse the
         // exact coerced strings so a stateful toString cannot desynchronize the
@@ -8392,7 +8527,7 @@
         const actualType = '' + type;
         const actualValue = '' + value;
         const result = reflectApply(nativeSet, this, [actualType, actualValue]);
-        if (relayedType(actualType)) request('set', actualType, actualValue, false);
+        recordNativeSet(actualType, actualValue);
         return result;
       };
       const wrappedClear = function cleanMathCopyRelayedClearData(type) {
@@ -8401,7 +8536,7 @@
         const result = all
           ? reflectApply(nativeClear, this, [])
           : reflectApply(nativeClear, this, [actualType]);
-        if (all || relayedType(actualType)) request('clear', actualType, '', all);
+        recordNativeClear(actualType, all);
         return result;
       };
       const setRecord = patchMethod(data, 'setData', wrappedSet);
@@ -8419,16 +8554,70 @@
         carrier.textContent = '';
         return;
       }
-
+      const harvestFinalClipboard = () => {
+        if (!nativeGet) return;
+        let rawTypes;
+        try {
+          rawTypes = data.types;
+          if (!rawTypes) return;
+          rawTypes = Array.from(rawTypes);
+        } catch (_error) {
+          return;
+        }
+        const completeTypeList = rawTypes.length <= 256;
+        rawTypes = rawTypes.slice(0, 256);
+        // Read every value before forwarding any of them: a relay response can
+        // rewrite text/plain, which must not contaminate this native snapshot.
+        const snapshot = [];
+        const present = new Set();
+        for (const rawType of rawTypes) {
+          const actualType = String(rawType == null ? '' : rawType).slice(0, 256);
+          if (!relayedType(actualType)) continue;
+          if (snapshot.length >= 32) break;
+          const key = normalizedType(actualType);
+          present.add(key);
+          try {
+            snapshot.push({
+              key,
+              type: actualType,
+              value: String(reflectApply(nativeGet, data, [actualType]))
+            });
+          } catch (_error) {
+            // Keep an earlier wrapper-observed value when this MIME flavor is
+            // listed but the browser refuses to expose it through getData.
+          }
+        }
+        for (const item of snapshot) {
+          if (injectedValues.get(item.key) === item.value) continue;
+          const previous = nativeValues.get(item.key);
+          if (previous && previous.type === item.type && previous.value === item.value) continue;
+          nativeValues.set(item.key, { type: item.type, value: item.value });
+          injectedValues.delete(item.key);
+          request('set', item.type, item.value, false);
+        }
+        // A cached clearData call bypasses the wrappers just like a cached
+        // setData call. Remove any previously forwarded flavor now absent from
+        // the authoritative final snapshot.
+        if (completeTypeList && snapshot.length < 32) {
+          for (const [key, previous] of Array.from(nativeValues)) {
+            if (present.has(key)) continue;
+            nativeValues.delete(key);
+            injectedValues.delete(key);
+            request('clear', previous.type, '', false);
+          }
+        }
+      };
       const nativeStop = typeof event.stopPropagation === 'function' ? event.stopPropagation : null;
       const nativeStopImmediate = typeof event.stopImmediatePropagation === 'function'
         ? event.stopImmediatePropagation
         : null;
       const wrappedStop = function cleanMathCopyRelayedStopPropagation() {
+        harvestFinalClipboard();
         request('finalize', '', '', false);
         return reflectApply(nativeStop, event, []);
       };
       const wrappedStopImmediate = function cleanMathCopyRelayedStopImmediatePropagation() {
+        harvestFinalClipboard();
         request('finalize', '', '', false);
         return reflectApply(nativeStopImmediate, event, []);
       };
@@ -8437,20 +8626,40 @@
         ? patchMethod(event, 'stopImmediatePropagation', wrappedStopImmediate)
         : null;
 
-      enqueue(() => {
+      const cleanupCopy = () => {
         if (!active) return;
-        request('finalize', '', '', false);
         request('end', '', '', false);
         active = false;
+        pageCopyEvents.delete(event);
         try { carrier.textContent = ''; } catch (_error) { /* ignore */ }
         restoreMethod(stopImmediateRecord);
         restoreMethod(stopRecord);
         restoreMethod(clearRecord);
         restoreMethod(setRecord);
-      });
+      };
+      const finishCopy = () => {
+        if (!active) return;
+        harvestFinalClipboard();
+        request('finalize', '', '', false);
+        cleanupCopy();
+      };
+      pageCopyEvents.set(event, finishCopy);
+      if (scheduleTask) {
+        // A task runs after the full dispatch, unlike a microtask queued from
+        // window capture (Chromium can checkpoint that before target
+        // listeners). It is cleanup-only because DataTransfer has expired by
+        // then; the page-world bubble listener performs the final harvest.
+        reflectApply(scheduleTask, window, [cleanupCopy, 0]);
+      }
+    };
+
+    const onCopyBubble = (event) => {
+      const finishCopy = pageCopyEvents.get(event);
+      if (finishCopy) finishCopy();
     };
 
     reflectApply(addEventListener, window, ['copy', onCopy, true]);
+    reflectApply(addEventListener, window, ['copy', onCopyBubble, false]);
     carrier.setAttribute('data-clean-math-copy-relay-ready', '1');
   }
 
@@ -8637,18 +8846,19 @@
     };
     carrier.addEventListener(eventName, onRequest, false);
     const source = '(function(){try{(' + cleanMathCopyPageRelayMain.toString() + ')(' +
-      JSON.stringify(carrierId) + ',' + JSON.stringify(eventName) +
+      JSON.stringify(carrierId) + ',' + JSON.stringify(eventName) + ',' + JSON.stringify(Boolean(googleDocs)) +
       ');}catch(error){}})();';
     let injected = null;
+    const injectionParent = documentObject.head || documentObject.documentElement;
     try {
       if (typeof GM_addElement === 'function') {
-        injected = GM_addElement('script', { textContent: source });
+        injected = GM_addElement(injectionParent, 'script', { textContent: source });
       } else if (global.GM && typeof global.GM.addElement === 'function') {
-        injected = global.GM.addElement('script', { textContent: source });
+        injected = global.GM.addElement(injectionParent, 'script', { textContent: source });
       } else {
         injected = documentObject.createElement('script');
         injected.textContent = source;
-        (documentObject.head || documentObject.documentElement).appendChild(injected);
+        injectionParent.appendChild(injected);
       }
     } catch (_error) {
       injected = null;
@@ -8660,11 +8870,103 @@
     return false;
   }
 
-  function install(documentObject, userscriptGlobal) {
-    if (!documentObject || documentObject.__cleanMathCopyInstalled) return;
+  function googleDocsClipboardFrameHost(documentObject) {
+    const view = documentObject && documentObject.defaultView;
+    try {
+      const frame = view && view.frameElement;
+      const parent = view && view.parent;
+      return frame && parent && parent !== view && isGoogleDocsPage(parent)
+        ? parent
+        : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function observeGoogleDocsClipboardFrames(documentObject, attachDocument) {
+    if (!documentObject || typeof attachDocument !== 'function') return null;
+    const observedFrames = new WeakSet();
+    const attachFrame = (frame) => {
+      if (!frame || !frame.matches || !frame.matches(GOOGLE_DOCS_CLIPBOARD_FRAME_SELECTOR)) return;
+      if (!observedFrames.has(frame)) {
+        observedFrames.add(frame);
+        frame.addEventListener('load', () => attachFrame(frame), true);
+      }
+      try {
+        const childDocument = frame.contentDocument;
+        const childWindow = frame.contentWindow;
+        if (childDocument && childWindow && childDocument !== documentObject) {
+          attachDocument(childDocument, childWindow);
+        }
+      } catch (_error) {
+        // A future same-origin load or replacement can still be attached.
+      }
+    };
+    const inspect = (node) => {
+      if (!node || node.nodeType !== 1) return;
+      attachFrame(node);
+      if (!node.querySelectorAll) return;
+      for (const frame of node.querySelectorAll(GOOGLE_DOCS_CLIPBOARD_FRAME_SELECTOR)) attachFrame(frame);
+    };
+    if (documentObject.documentElement) inspect(documentObject.documentElement);
+    const view = documentObject.defaultView;
+    const Observer = view && view.MutationObserver || global.MutationObserver;
+    if (typeof Observer !== 'function') return null;
+    try {
+      const observer = new Observer((records) => {
+        for (const record of records) {
+          if (record.type === 'attributes') attachFrame(record.target);
+          else for (const node of Array.from(record.addedNodes || [])) inspect(node);
+        }
+      });
+      observer.observe(documentObject, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class', 'src']
+      });
+      return observer;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function install(documentObject, userscriptGlobal, installOptions) {
+    let options = installOptions && typeof installOptions === 'object' ? installOptions : {};
+    if (!documentObject) return;
+    const inheritedGoogleDocsHost = options.pageWindow
+      ? null
+      : googleDocsClipboardFrameHost(documentObject);
+    if (inheritedGoogleDocsHost) {
+      // Managers can inject into inherited about:blank documents before Docs
+      // assigns the texteventtarget class. Own that child immediately with the
+      // parent editor context; a generic about:blank install would set the
+      // marker first and permanently hide the equation clipboard flavors.
+      options = {
+        ...options,
+        pageWindow: inheritedGoogleDocsHost,
+        // A child can win the race before the top controller exists. Read the
+        // manager's shared setting at copy time so later menu changes still
+        // apply to that already-installed frame.
+        settingsProvider: typeof options.settingsProvider === 'function'
+          ? options.settingsProvider
+          : loadSettings,
+        registerMenus: false,
+        observeGoogleDocsFrames: false
+      };
+    }
+    if (documentObject.__cleanMathCopyInstalled) return;
     Object.defineProperty(documentObject, '__cleanMathCopyInstalled', { value: true, configurable: true });
-    const pageWindow = getPageWindow(userscriptGlobal || global);
-    let settings = loadSettings();
+    const inheritedSettingsProvider = typeof options.settingsProvider === 'function'
+      ? options.settingsProvider
+      : null;
+    const pageWindow = options.pageWindow || getPageWindow(userscriptGlobal || global);
+    let settings = inheritedSettingsProvider
+      ? normalizeSettings(inheritedSettingsProvider())
+      : loadSettings();
+    const currentSettings = () => inheritedSettingsProvider
+      ? normalizeSettings(inheritedSettingsProvider())
+      : settings;
     let settingsGeneration = 0;
     const handledEvents = new WeakSet();
     const officeCopyStates = new WeakMap();
@@ -8674,16 +8976,16 @@
     let officeGeneration = 0;
     let manualClipboardGeneration = 0;
 
-    installPageClipboardRelay(
+    const pageRelayInstalled = installPageClipboardRelay(
       documentObject,
       userscriptGlobal || global,
       pageWindow,
-      () => settings,
+      currentSettings,
       googleDocsPage
     );
 
     try {
-      if (global.GM && typeof global.GM.getValue === 'function') {
+      if (!inheritedSettingsProvider && global.GM && typeof global.GM.getValue === 'function') {
         const loadGeneration = settingsGeneration;
         Promise.resolve(global.GM.getValue(STORAGE_KEY, DEFAULT_SETTINGS)).then((stored) => {
           // A menu command can run while an asynchronous manager read is
@@ -8699,6 +9001,7 @@
     const handleCopy = (event) => {
       if (!event || handledEvents.has(event)) return;
       handledEvents.add(event);
+      const eventSettings = currentSettings();
       // Any newer keyboard/context-menu copy invalidates an in-flight manual
       // Clipboard API retry just as another manual command would.
       const replayAfterPendingWrite = hasPendingClipboardWrite();
@@ -8721,12 +9024,13 @@
           generation,
           originalSetData: null,
           originalClearData: null,
+          settings: eventSettings,
           isCurrent: () => activeOfficeState === officeState && officeGeneration === generation
         };
         activeOfficeState = officeState;
         officeCopyStates.set(event, officeState);
-        interceptOfficeClipboardWrites(event, officeState, settings, documentObject);
-        officeState.recovery = armOfficeClipboardStagingRecovery(documentObject, settings, pageWindow, officeState);
+        interceptOfficeClipboardWrites(event, officeState, eventSettings, documentObject);
+        officeState.recovery = armOfficeClipboardStagingRecovery(documentObject, eventSettings, pageWindow, officeState);
       }
       const selection = documentObject.getSelection ? documentObject.getSelection() : null;
       // Google Docs draws and selects document content through its own editor
@@ -8736,11 +9040,12 @@
       // inside the editor where the DOM is a flattened accessibility view.
       const payload = isGoogleDocsEditorPage(documentObject, pageWindow)
         ? null
-        : getCopyPayload(documentObject, selection, settings, pageWindow, event.target);
-      if (!officeState && !payload) {
+        : getCopyPayload(documentObject, selection, eventSettings, pageWindow, event.target);
+      if (!officeState && !payload && !(googleDocsPage && pageRelayInstalled)) {
         siteState = createSiteCopyState();
+        siteState.settings = eventSettings;
         siteCopyStates.set(event, siteState);
-        interceptSiteClipboardWrites(event, siteState, settings, documentObject, googleDocsPage);
+        interceptSiteClipboardWrites(event, siteState, eventSettings, documentObject, googleDocsPage);
       }
       if (replayAfterPendingWrite) {
         const selectedNativeText = selectedNativeClipboardText(selection, event.target);
@@ -8798,13 +9103,13 @@
     const handleOfficeCopyBubble = (event) => {
       const state = officeCopyStates.get(event);
       if (!state) return;
-      postprocessOfficeCopyEvent(event, settings, documentObject, state);
+      postprocessOfficeCopyEvent(event, state.settings || currentSettings(), documentObject, state);
     };
 
     const handleSiteCopyBubble = (event) => {
       const state = siteCopyStates.get(event);
       if (!state) return;
-      postprocessSiteCopyEvent(event, settings, documentObject, state, googleDocsPage);
+      postprocessSiteCopyEvent(event, state.settings || currentSettings(), documentObject, state, googleDocsPage);
     };
 
     const view = documentObject.defaultView || userscriptGlobal;
@@ -8813,12 +9118,23 @@
     if (view && view.addEventListener) view.addEventListener('copy', handleOfficeCopyBubble, false);
     if (view && view.addEventListener) view.addEventListener('copy', handleSiteCopyBubble, false);
 
+    if (googleDocsPage && options.observeGoogleDocsFrames !== false) {
+      observeGoogleDocsClipboardFrames(documentObject, (childDocument, childWindow) => {
+        install(childDocument, childWindow, {
+          pageWindow,
+          settingsProvider: currentSettings,
+          registerMenus: false,
+          observeGoogleDocsFrames: false
+        });
+      });
+    }
+
     const registerMenuCommand = typeof GM_registerMenuCommand === 'function'
       ? GM_registerMenuCommand
       : (global.GM && typeof global.GM.registerMenuCommand === 'function'
         ? global.GM.registerMenuCommand.bind(global.GM)
         : null);
-    if (registerMenuCommand) {
+    if (registerMenuCommand && options.registerMenus !== false) {
       const updateSettings = (nextSettings) => {
         settingsGeneration += 1;
         settings = saveSettings(nextSettings);
@@ -8861,7 +9177,7 @@
       });
     }
 
-    return { handleCopy, get settings() { return { ...settings }; } };
+    return { handleCopy, get settings() { return { ...currentSettings() }; } };
   }
 
   return Object.freeze({

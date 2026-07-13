@@ -33,6 +33,19 @@ function katex(markup, source, display = false) {
   return display ? '<div class="katex-display">' + expression + '</div>' : expression;
 }
 
+function wikipediaMath(markup, source, display = false) {
+  return [
+    '<span class="mwe-math-element mwe-math-element-', display ? 'block' : 'inline', '">',
+    '<span class="mwe-math-mathml-', display ? 'display' : 'inline', ' mwe-math-mathml-a11y" style="display:none">',
+    '<math', display ? ' display="block"' : '', '><semantics>', markup,
+    '<annotation encoding="application/x-tex">{\\displaystyle ', source, '}</annotation>',
+    '</semantics></math></span>',
+    '<img class="mwe-math-fallback-image-', display ? 'display' : 'inline', '" aria-hidden="true" ',
+    'alt="{\\displaystyle ', source, '}">',
+    '</span>'
+  ].join('');
+}
+
 function rendererWithSeparateAccessibilityTree(markup, visualText) {
   return [
     '<span class="opaque-renderer">',
@@ -1205,6 +1218,35 @@ test('ordinary rich cleanup drops executable markup and untrusted attributes', (
   assert.doesNotMatch(payload.html, /svg|iframe|onclick|onmouseover|javascript|style=|PAYLOAD|custom-widget/i);
 });
 
+test('image alt text cannot reintroduce invisible artifacts into rich clipboard HTML', () => {
+  const leakedArtifact = /&(?:nbsp|shy);|[\u00a0\u00ad\u200b\u2060\ufeff]/iu;
+  const alt = 'A\u00a0B\u200bC\u2060D\u00adE\ufeff';
+  const ordinary = dom('<p id="target">Before\u200b <img alt="' + alt + '"> after</p>');
+  const ordinaryTarget = ordinary.window.document.querySelector('#target');
+  const ordinaryPayload = cleanCopy.getCopyPayload(
+    ordinary.window.document,
+    selectContents(ordinary.window, ordinaryTarget),
+    cleanCopy.DEFAULT_SETTINGS,
+    ordinary.window,
+    ordinaryTarget
+  );
+  assert.equal(ordinaryPayload.text, 'Before A BCDE after');
+  assert.doesNotMatch(ordinaryPayload.html, leakedArtifact);
+
+  const mixed = dom('<p id="target"><img alt="' + alt + '"> ' +
+    katex('<mrow><mi>x</mi><mo>=</mo><mn>1</mn></mrow>', 'x=1') + '</p>');
+  const mixedTarget = mixed.window.document.querySelector('#target');
+  const mixedPayload = cleanCopy.getCopyPayload(
+    mixed.window.document,
+    selectContents(mixed.window, mixedTarget),
+    cleanCopy.DEFAULT_SETTINGS,
+    mixed.window,
+    mixedTarget
+  );
+  assert.equal(mixedPayload.text, 'A BCDE x = 1');
+  assert.doesNotMatch(mixedPayload.html, leakedArtifact);
+});
+
 test('ordinary cleanup leaves over-budget ranges entirely native without cloning', () => {
   for (const shape of ['deep', 'wide', 'attribute']) {
     const instance = dom('<div id="target"></div>');
@@ -1366,6 +1408,127 @@ test('a generic formula ancestor never swallows prose around a nested renderer',
     target
   );
   assert.equal(payload.text, 'Intro x = 1 outro and unrelated text.');
+});
+
+test('a generic formula wrapper keeps hidden MathML semantics for its direct visual text', () => {
+  const instance = dom('<span class="formula" id="target">' +
+    '<math style="display:none"><msup><mi>x</mi><mn>2</mn></msup></math>x2</span>');
+  const target = instance.window.document.querySelector('#target');
+  const visualText = target.lastChild;
+  const range = instance.window.document.createRange();
+  range.selectNodeContents(visualText);
+  const selection = instance.window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    visualText
+  );
+  assert.equal(payload.text, 'x²');
+});
+
+test('Wikipedia formula page classes never swallow its real MathML renderers', () => {
+  const plusMinus = wikipediaMath('<mrow><mo>±</mo></mrow>', '\\pm');
+  const instance = dom([
+    '<main class="page-Quadratic_formula rootpage-Quadratic_formula">',
+    '<p id="target">where the <a href="https://en.wikipedia.org/wiki/Plus-minus_sign">plus–minus symbol</a> "',
+    '<span class="nowrap">\u2060', plusMinus, '\u2060</span>" indicates that the equation has two roots.',
+    '<sup class="reference"><a href="#cite_note-1">[1]</a></sup> Written separately, these are:</p>',
+    '</main>'
+  ].join(''), 'https://en.wikipedia.org/wiki/Quadratic_formula');
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(
+    payload.text,
+    'where the plus–minus symbol "±" indicates that the equation has two roots.[1] Written separately, these are:'
+  );
+  assert.doesNotMatch(payload.html, /displaystyle|\\pm|href=|\u2060|\u200b|\]\(https?:/u);
+  assert.equal(cleanCopy.rootsForRange(instance.window.getSelection().getRangeAt(0))[0].classList.contains('mwe-math-element'), true);
+});
+
+test('Wikipedia prose plus display equation copies one clean readable selection', () => {
+  const inline = wikipediaMath([
+    '<mrow><mi>a</mi><msup><mi>x</mi><mn>2</mn></msup><mo>+</mo><mi>b</mi><mi>x</mi>',
+    '<mo>+</mo><mi>c</mi><mo>=</mo><mn>0</mn></mrow>'
+  ].join(''), '\\textstyle ax^{2}+bx+c=0');
+  const display = wikipediaMath([
+    '<mrow><mi>x</mi><mo>=</mo><mfrac><mrow><mo>−</mo><mi>b</mi><mo>±</mo><msqrt>',
+    '<msup><mi>b</mi><mn>2</mn></msup><mo>−</mo><mn>4</mn><mi>a</mi><mi>c</mi>',
+    '</msqrt></mrow><mrow><mn>2</mn><mi>a</mi></mrow></mfrac><mo>,</mo></mrow>'
+  ].join(''), 'x={\\frac {-b\\pm {\\sqrt {b^{2}-4ac}}}{2a}},', true);
+  const instance = dom([
+    '<main id="target" class="page-Quadratic_formula rootpage-Quadratic_formula">',
+    '<p>Given a general quadratic equation of the form <span class="nowrap">\u2060', inline,
+    '\u2060</span>, the values can be found using the quadratic formula,</p><p>', display, '</p></main>'
+  ].join(''), 'https://en.wikipedia.org/wiki/Quadratic_formula');
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(
+    payload.text,
+    'Given a general quadratic equation of the form ax² + bx + c = 0, the values can be found using the quadratic formula,\n\nx = (−b ± √(b² − 4ac))/(2a),'
+  );
+  assert.doesNotMatch(payload.text + payload.html, /displaystyle|\\textstyle|\\frac|\u2060/u);
+});
+
+test('Wikipedia hidden MathML must agree with its visible fallback in mixed prose', () => {
+  const formula = wikipediaMath(
+    '<mrow><mi>x</mi><mo>=</mo><mn>1</mn></mrow>',
+    'x=1'
+  );
+  const instance = dom('<p id="target">Before ' + formula + ' after.</p>', 'https://en.wikipedia.org/wiki/Equation');
+  const target = instance.window.document.querySelector('#target');
+  const selection = selectContents(instance.window, target);
+  const matching = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(matching.text, 'Before x = 1 after.');
+
+  target.querySelector('img[alt]').setAttribute('alt', '{\\displaystyle y=2}');
+  const mismatching = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(mismatching, null);
+});
+
+test('Wikipedia equivalent slash and MathML grouping remain readable', () => {
+  const formula = wikipediaMath(
+    '<mrow><mi>c</mi><mrow><mo>/</mo></mrow><mi>a</mi></mrow>',
+    'c/a'
+  );
+  const instance = dom('<p id="target">Therefore ' + formula + ' is the product.</p>',
+    'https://en.wikipedia.org/wiki/Quadratic_formula');
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, 'Therefore c/a is the product.');
 });
 
 test('mixed math cleanup ignores forged placeholders and unwraps unknown rich elements', () => {
@@ -1934,6 +2097,211 @@ test('repairs Google Docs equation clipboard text even when Docs stops propagati
   assert.equal(clipboard.get('text/html'), rich);
   assert.equal(clipboard.get('application/x-vnd.google-docs-document-slice-clip+wrapped'), slice);
   assert.equal(event.defaultPrevented, true);
+});
+
+test('repairs copy events inside Google Docs hidden text-event iframe', async () => {
+  const flat = '|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT';
+  const slice = reportedGoogleDocsEquationSlice();
+  const instance = dom('<div class="kix-appview-editor"></div>', 'https://docs.google.com/document/d/test/edit');
+  cleanCopy.install(instance.window.document, instance.window);
+
+  const frame = instance.window.document.createElement('iframe');
+  frame.className = 'docs-texteventtarget-iframe docs-offscreen-z-index';
+  instance.window.document.body.appendChild(frame);
+  const childDocument = frame.contentDocument;
+  const childWindow = frame.contentWindow;
+  childDocument.body.innerHTML = '<div id="target" contenteditable="true">' + flat + '</div>';
+  const target = childDocument.querySelector('#target');
+  const clipboard = new Map();
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text/plain', flat);
+    event.clipboardData.setData('application/x-vnd.google-docs-document-slice-clip+wrapped', slice);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  });
+
+  await new Promise((resolve) => instance.window.setTimeout(resolve, 0));
+  selectContents(childWindow, target);
+  const event = new childWindow.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  target.dispatchEvent(event);
+  assert.equal(
+    clipboard.get('text/plain'),
+    '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
+  );
+  assert.equal(clipboard.get('application/x-vnd.google-docs-document-slice-clip+wrapped'), slice);
+  assert.equal(event.defaultPrevented, true);
+
+  const replacement = instance.window.document.createElement('iframe');
+  instance.window.document.body.appendChild(replacement);
+  replacement.className = 'docs-texteventtarget-iframe docs-texteventtarget-iframe-negative-top';
+  const replacementDocument = replacement.contentDocument;
+  const replacementWindow = replacement.contentWindow;
+  replacementDocument.body.innerHTML = '<div id="replacement" contenteditable="true">' + flat + '</div>';
+  const replacementTarget = replacementDocument.querySelector('#replacement');
+  const replacementClipboard = new Map();
+  replacementTarget.addEventListener('copy', (copyEvent) => {
+    copyEvent.clipboardData.setData('text/plain', flat);
+    copyEvent.clipboardData.setData('application/x-vnd.google-docs-document-slice-clip+wrapped', slice);
+    copyEvent.preventDefault();
+    copyEvent.stopImmediatePropagation();
+  });
+  await new Promise((resolve) => instance.window.setTimeout(resolve, 0));
+  selectContents(replacementWindow, replacementTarget);
+  const replacementEvent = new replacementWindow.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(replacementEvent, 'clipboardData', {
+    value: {
+      get types() { return Array.from(replacementClipboard.keys()); },
+      clearData(type) { if (arguments.length) replacementClipboard.delete(type); else replacementClipboard.clear(); },
+      setData(type, value) { replacementClipboard.set(type, value); },
+      getData(type) { return replacementClipboard.get(type) || ''; }
+    }
+  });
+  replacementTarget.dispatchEvent(replacementEvent);
+  assert.equal(
+    replacementClipboard.get('text/plain'),
+    '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
+  );
+});
+
+test('Google Docs owns an inherited child before its clipboard class is assigned', () => {
+  const flat = '|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT';
+  const slice = reportedGoogleDocsEquationSlice();
+  const instance = dom('<div class="kix-appview-editor"></div>', 'https://docs.google.com/document/d/test/edit');
+  const frame = instance.window.document.createElement('iframe');
+  instance.window.document.body.appendChild(frame);
+  frame.contentDocument.body.innerHTML = '<div id="target" contenteditable="true">' + flat + '</div>';
+
+  let storedSettings = { ...cleanCopy.DEFAULT_SETTINGS };
+  const previousGetValue = Object.getOwnPropertyDescriptor(globalThis, 'GM_getValue');
+  Object.defineProperty(globalThis, 'GM_getValue', {
+    configurable: true,
+    writable: true,
+    value() { return storedSettings; }
+  });
+  let childController;
+  try {
+    childController = cleanCopy.install(frame.contentDocument, frame.contentWindow);
+    assert.equal(frame.contentDocument.__cleanMathCopyInstalled, true);
+    storedSettings = { ...storedSettings, outputMode: 'ascii' };
+    assert.equal(childController.settings.outputMode, 'ascii');
+    storedSettings = { ...storedSettings, outputMode: 'faithful' };
+  } finally {
+    if (previousGetValue) Object.defineProperty(globalThis, 'GM_getValue', previousGetValue);
+    else delete globalThis.GM_getValue;
+  }
+
+  frame.className = 'docs-texteventtarget-iframe docs-texteventtarget-iframe-negative-top';
+  cleanCopy.install(instance.window.document, instance.window);
+  assert.equal(frame.contentDocument.__cleanMathCopyInstalled, true);
+
+  const clipboard = new Map();
+  const target = frame.contentDocument.querySelector('#target');
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text/plain', flat);
+    event.clipboardData.setData('application/x-vnd.google-docs-document-slice-clip+wrapped', slice);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  });
+  const event = new frame.contentWindow.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  target.dispatchEvent(event);
+  assert.equal(
+    clipboard.get('text/plain'),
+    '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
+  );
+});
+
+test('isolated relay harvests cached Google Docs writes from its about:blank clipboard iframe', () => {
+  const flat = '|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT';
+  const slice = reportedGoogleDocsEquationSlice();
+  const instance = new JSDOM(
+    '<!doctype html><html><body><div class="kix-appview-editor"></div></body></html>',
+    { url: 'https://docs.google.com/document/d/test/edit', runScripts: 'dangerously' }
+  );
+  const frame = instance.window.document.createElement('iframe');
+  frame.className = 'docs-texteventtarget-iframe docs-texteventtarget-iframe-negative-top';
+  instance.window.document.body.appendChild(frame);
+  const childDocument = frame.contentDocument;
+  const childWindow = frame.contentWindow;
+  childDocument.body.innerHTML = '<div id="target" contenteditable="true">' + flat + '</div>';
+
+  const previousInfo = Object.getOwnPropertyDescriptor(globalThis, 'GM_info');
+  const previousAddElement = Object.getOwnPropertyDescriptor(globalThis, 'GM_addElement');
+  Object.defineProperty(globalThis, 'GM_info', {
+    value: { injectInto: 'content' }, configurable: true, writable: true
+  });
+  Object.defineProperty(globalThis, 'GM_addElement', {
+    configurable: true,
+    writable: true,
+    value(parent, tagName, attributes) {
+      const ownerDocument = parent.ownerDocument;
+      const element = ownerDocument.createElement(tagName);
+      for (const [name, value] of Object.entries(attributes || {})) {
+        if (name !== 'textContent') element.setAttribute(name, String(value));
+      }
+      parent.appendChild(element);
+      if (attributes && attributes.textContent) ownerDocument.defaultView.eval(String(attributes.textContent));
+      return element;
+    }
+  });
+
+  try {
+    cleanCopy.install(instance.window.document, instance.window);
+    assert.equal(childDocument.__cleanMathCopyInstalled, true);
+    assert.equal(childWindow.location.href, 'about:blank');
+    assert.ok(childDocument.querySelector('[data-clean-math-copy-relay-ready="1"]'));
+
+    const clipboard = new Map();
+    const clipboardPrototype = {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    };
+    // Google Docs calls a cached/prototype DataTransfer method, bypassing the
+    // relay's temporary own-property wrappers. The final MIME snapshot must
+    // still reach the isolated semantic parser.
+    const cachedSetData = clipboardPrototype.setData;
+    const target = childDocument.querySelector('#target');
+    target.addEventListener('copy', (event) => {
+      Reflect.apply(cachedSetData, event.clipboardData, ['text/plain', flat]);
+      Reflect.apply(cachedSetData, event.clipboardData, [
+        'application/x-vnd.google-docs-document-slice-clip+wrapped',
+        slice
+      ]);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    });
+    const event = new childWindow.Event('copy', { bubbles: true, cancelable: true, composed: true });
+    Object.defineProperty(event, 'clipboardData', { value: Object.create(clipboardPrototype) });
+    target.dispatchEvent(event);
+    assert.equal(
+      clipboard.get('text/plain'),
+      '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
+    );
+    assert.equal(clipboard.get('application/x-vnd.google-docs-document-slice-clip+wrapped'), slice);
+    assert.equal(event.defaultPrevented, true);
+  } finally {
+    if (previousInfo) Object.defineProperty(globalThis, 'GM_info', previousInfo);
+    else delete globalThis.GM_info;
+    if (previousAddElement) Object.defineProperty(globalThis, 'GM_addElement', previousAddElement);
+    else delete globalThis.GM_addElement;
+  }
 });
 
 test('Google Docs semantics survive reverse clipboard writes and an intervening clear', () => {
