@@ -1,6 +1,6 @@
 # Clean Math Copy
 
-Clean Math Copy is a self-contained userscript that copies rendered web equations as accurate, readable text and cleans accidental spacing or line breaks from ordinary copied text. It supports KaTeX, MathJax, MathML, Microsoft Word for the web, raw LaTeX, and exact partial selections.
+Clean Math Copy is a self-contained userscript that copies rendered web equations as accurate, readable text and cleans accidental spacing or line breaks from ordinary copied text. It supports Google Docs, KaTeX, MathJax, MathML, Microsoft Word for the web, raw LaTeX, and exact partial selections.
 
 ## Examples
 
@@ -12,7 +12,7 @@ The default mode keeps visible mathematical symbols and adds grouping only when 
 
 ## Install or update
 
-1. Install Tampermonkey, Violentmonkey, Greasemonkey, or another compatible userscript manager.
+1. Install Tampermonkey or Violentmonkey.
 2. Open the [raw userscript](https://raw.githubusercontent.com/atharvj/clean-math-copy/main/clean-math-copy.user.js) and confirm installation.
 3. Reload pages that were already open.
 

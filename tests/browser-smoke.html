@@ -54,9 +54,18 @@
   <span id="comparative-prose">Plan A ≠ Plan B</span>
   <span id="ordinary-artifacts">alpha&#8203;&nbsp;beta</span>
   <span id="raw-styled">$\mathrm{speed}=2\mathrm{time}$</span>
+  <span id="rich-script-editor" contenteditable="true">x2 + H2O</span>
+  <span id="rich-reverse-editor" contenteditable="true">x2</span>
+  <span id="mathml-reverse-editor" contenteditable="true">x2</span>
+  <span id="alias-clear-editor" contenteditable="true">x2</span>
+  <span id="flat-digit-editor" contenteditable="true">(27.187)2</span>
 
   <pre id="result">pending</pre>
-  <script src="../clean-math-copy.user.js"></script>
+  <script>
+    if (!new URLSearchParams(location.search).has('isolated')) {
+      document.write('<script src="../clean-math-copy.user.js"><\/script>');
+    }
+  </script>
   <script>
     (() => {
       const checks = [];
@@ -97,6 +106,66 @@
         selection.addRange(range);
         return dispatchCopy(element);
       };
+
+      if (new URLSearchParams(location.search).has('isolated')) {
+        const relay = document.querySelector('[data-clean-math-copy-relay-ready="1"]');
+        assertEqual(
+          'isolated page relay installed',
+          Boolean(relay),
+          true
+        );
+        if (relay) {
+          const relayEvent = relay.id + '-request';
+          const relayRequest = (request) => {
+            relay.textContent = JSON.stringify(request);
+            relay.dispatchEvent(new CustomEvent(relayEvent));
+            return JSON.parse(relay.textContent || '{}');
+          };
+          assertEqual('isolated relay begin', relayRequest({ id: 'probe', op: 'begin' }).id, 'probe');
+          relayRequest({ id: 'probe', op: 'set', type: 'text/plain', value: 'x2', overflow: false });
+          const response = relayRequest({
+            id: 'probe',
+            op: 'set',
+            type: 'text/html',
+            value: '<span>x<sup>2</sup></span>',
+            overflow: false
+          });
+          assertEqual('isolated relay semantic response', response.text, 'x²');
+          relayRequest({ id: 'probe', op: 'end' });
+
+          relayRequest({ id: 'budget', op: 'begin' });
+          relayRequest({ id: 'budget', op: 'set', type: 'text/plain', value: 'old2', overflow: false });
+          relayRequest({
+            id: 'budget',
+            op: 'set',
+            type: 'text/html',
+            value: '<span>old<sup>2</sup></span>',
+            overflow: false
+          });
+          for (let index = 0; index < 62; index += 1) relayRequest({ id: 'budget', op: 'finalize' });
+          const overBudget = relayRequest({
+            id: 'budget',
+            op: 'set',
+            type: 'text/plain',
+            value: 'new',
+            overflow: false
+          });
+          assertEqual('relay budget never resurrects old plain text', overBudget.action || '', '');
+          relayRequest({ id: 'budget', op: 'end' });
+
+          relayRequest({ id: 'escaped', op: 'begin' });
+          const escaped = relayRequest({
+            id: 'escaped',
+            op: 'set',
+            type: 'application/octet-stream',
+            value: '\\'.repeat(600000),
+            overflow: false
+          });
+          assertEqual('relay accepts bounded decoded values after JSON escaping', escaped.id, 'escaped');
+          relayRequest({ id: 'escaped', op: 'end' });
+          relay.textContent = '';
+        }
+      }
 
       const unicode = copyRange(document.querySelector('#unicode-partial'));
       assertEqual('already-faithful Unicode stays native', unicode.prevented, false);
@@ -150,10 +219,99 @@
       const styled = copyRange(document.querySelector('#raw-styled'));
       assertEqual('styled raw identifiers stay whole', styled.plain, 'speed = 2time');
 
+      const richScriptEditor = document.querySelector('#rich-script-editor');
+      const googleRich = [
+        '<b id="docs-internal-guid-browser">x',
+        '<span style="font-size:0.6em;vertical-align:super">2</span> + H',
+        '<span style="vertical-align:sub">2</span>O</b>'
+      ].join('');
+      richScriptEditor.addEventListener('copy', (event) => {
+        event.clipboardData.setData('text/plain', 'x2 + H2O');
+        event.clipboardData.setData('text/html', googleRich);
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      });
+      const richScripts = copyContents(richScriptEditor);
+      assertEqual('site rich clipboard restores scripts', richScripts.plain, 'x² + H₂O');
+      assertEqual('site rich clipboard HTML stays native', richScripts.html, googleRich);
+
+      const richReverseEditor = document.querySelector('#rich-reverse-editor');
+      const reverseRich = '<span>x<sup>2</sup></span>';
+      richReverseEditor.addEventListener('copy', (event) => {
+        for (let index = 0; index < 70; index += 1) {
+          event.clipboardData.setData('application/x-clean-copy-noise-' + index, 'ignored');
+        }
+        event.clipboardData.setData('text/html', reverseRich);
+        event.clipboardData.setData('text/plain', 'x2');
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      });
+      const reverseScripts = copyContents(richReverseEditor);
+      assertEqual('semantic HTML can precede plain text', reverseScripts.plain, 'x²');
+      assertEqual('reverse-order semantic HTML stays native', reverseScripts.html, reverseRich);
+
+      const mathMLReverseEditor = document.querySelector('#mathml-reverse-editor');
+      const reverseMathML = '<math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>x</mi><mn>2</mn></msup></math>';
+      mathMLReverseEditor.addEventListener('copy', (event) => {
+        event.clipboardData.setData('application/mathml+xml', reverseMathML);
+        event.clipboardData.setData('text/plain', 'x2');
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      });
+      const reverseMath = copyContents(mathMLReverseEditor);
+      assertEqual('semantic MathML can precede plain text', reverseMath.plain, 'x²');
+      assertEqual('reverse-order MathML stays native', reverseMath.mathML, reverseMathML);
+
+      const aliasClearEditor = document.querySelector('#alias-clear-editor');
+      aliasClearEditor.addEventListener('copy', (event) => {
+        event.clipboardData.setData('text', 'x2');
+        event.clipboardData.setData('text/html', reverseRich);
+        event.clipboardData.clearData('text');
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      });
+      const aliasClear = copyContents(aliasClearEditor);
+      assertEqual('cleared text alias leaves no injected plain text', aliasClear.plain, '');
+      assertEqual('alias clear keeps site HTML', aliasClear.html, reverseRich);
+
+      const flatDigitEditor = document.querySelector('#flat-digit-editor');
+      flatDigitEditor.addEventListener('copy', (event) => {
+        event.clipboardData.setData('text/plain', '(27.187)2');
+        event.preventDefault();
+      });
+      const flatDigit = copyContents(flatDigitEditor);
+      assertEqual('flat adjacent digit is never guessed', flatDigit.plain, '(27.187)2');
+
       const output = { ok: checks.every((check) => check.pass), checks };
       document.querySelector('#result').textContent = JSON.stringify(output);
-      const failed = checks.filter((check) => !check.pass).map((check) => check.name);
-      document.title = output.ok ? 'PASS ' + checks.length + '/' + checks.length : 'FAIL ' + failed.join(' | ');
+      const failed = checks.filter((check) => !check.pass).map((check) =>
+        check.name + ' [actual=' + JSON.stringify(check.actual) + ', expected=' + JSON.stringify(check.expected) + ']'
+      );
+      const ownTitle = output.ok ? 'PASS ' + checks.length + '/' + checks.length : 'FAIL ' + failed.join(' | ');
+      if (!new URLSearchParams(location.search).has('isolated')) {
+        document.title = ownTitle;
+        return;
+      }
+      if (!output.ok) {
+        document.title = ownTitle;
+        return;
+      }
+      document.title = 'WAIT page-world browser smoke';
+      const frame = document.createElement('iframe');
+      frame.hidden = true;
+      frame.src = '/browser-smoke.html?page-world=1';
+      frame.addEventListener('load', () => {
+        const pageTitle = frame.contentDocument.title;
+        if (!/^PASS\b/.test(pageTitle)) {
+          document.title = /^FAIL\b/.test(pageTitle)
+            ? pageTitle
+            : 'FAIL page-world fixture did not finish [' + JSON.stringify(pageTitle) + ']';
+          return;
+        }
+        const pageCount = Number((pageTitle.match(/^PASS\s+(\d+)\//) || [])[1] || 0);
+        document.title = 'PASS ' + (checks.length + pageCount) + '/' + (checks.length + pageCount);
+      });
+      document.body.appendChild(frame);
     })();
   </script>
 </body>

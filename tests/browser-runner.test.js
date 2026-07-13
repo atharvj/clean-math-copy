@@ -20,3 +20,10 @@ test('browser smoke runner observes launch errors and awaits graceful and forced
   assert.match(runner, /SIGKILL/);
   assert.match(runner, /await waitForChildExit/);
 });
+
+test('browser smoke exercises both page and isolated userscript worlds', () => {
+  assert.match(runner, /world: 'MAIN'/);
+  assert.match(runner, /world: 'ISOLATED'/);
+  assert.match(runner, /--disable-extensions-except=/);
+  assert.match(runner, /page-world and isolated-world copy\/DataTransfer smoke/);
+});

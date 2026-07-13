@@ -52,6 +52,62 @@ function positionedWordToken(left, top, size, text) {
   ].join('');
 }
 
+function googleDocsSlice(parts, textStyles = []) {
+  let spacers = '';
+  const equationStyles = [];
+  const writeNode = (node) => {
+    if (typeof node === 'string') {
+      spacers += node;
+      return;
+    }
+    if (node && Array.isArray(node.equation)) {
+      spacers += '\u001a';
+      node.equation.forEach(writeNode);
+      spacers += '\u001e';
+      return;
+    }
+    if (!node || typeof node.command !== 'string') throw new Error('invalid Google Docs test node');
+    const hasArguments = Array.isArray(node.args);
+    const marker = hasArguments ? '\u0019' : '\u001f';
+    const index = spacers.length;
+    spacers += marker;
+    equationStyles[index] = { eqfs_c: node.command };
+    if (!hasArguments) return;
+    node.args.forEach((argument, argumentIndex) => {
+      if (argumentIndex) spacers += '\u001d';
+      (Array.isArray(argument) ? argument : [argument]).forEach(writeNode);
+    });
+    spacers += '\u001b';
+  };
+  parts.forEach(writeNode);
+  const styles = [];
+  for (const [index, alignment] of textStyles) styles[index] = { ts_va: alignment };
+  const data = {
+    resolved: {
+      dsl_spacers: spacers,
+      dsl_styleslices: [
+        { stsl_type: 'equation_function', stsl_styles: equationStyles },
+        { stsl_type: 'text', stsl_styles: styles }
+      ]
+    }
+  };
+  return JSON.stringify({ data: JSON.stringify(data) });
+}
+
+function reportedGoogleDocsEquationSlice() {
+  const power = (base) => ({ command: '\\superscript', args: [base, '2'] });
+  return googleDocsSlice([{
+    equation: [
+      { command: '\\abs', args: ['B'] },
+      '=',
+      { command: '\\sqrt', args: [[
+        power('(27.187)'), '+', power('(17.479)'), '+', power('(-28.112)')
+      ]] },
+      '=42.84 ', { command: '\\mu' }, 'T'
+    ]
+  }]);
+}
+
 test('copies KaTeX exactly once and uses its MathML structure', () => {
   const instance = dom('<p id="target">Einstein wrote ' + katex(
     '<mrow><mi>E</mi><mo>=</mo><mi>m</mi><msup><mi>c</mi><mn>2</mn></msup></mrow>',
@@ -1693,6 +1749,536 @@ test('empty LaTeX conversions never clear, write, or suppress the native clipboa
   assert.equal(cleared, 0);
   assert.equal(writes, 0);
   assert.equal(event.defaultPrevented, false);
+});
+
+test('decodes the reported Google Docs equation from its structural clipboard slice', () => {
+  const slice = reportedGoogleDocsEquationSlice();
+  const faithful = cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'faithful' });
+  assert.equal(
+    faithful.text,
+    '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
+  );
+  assert.equal(faithful.reason, 'google-docs-semantic-clipboard');
+  assert.equal(faithful.mathRanges, 1);
+  assert.equal(/[\s\u200b\u2060]$/.test(faithful.text), false);
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'calculator' }).text,
+    'abs(B)=sqrt((27.187)^(2)+(17.479)^(2)+(-28.112)^(2))=42.84*mu*T'
+  );
+});
+
+test('uses Google Docs explicit rich HTML as a script fallback when its private slice is unavailable', () => {
+  const instance = dom('');
+  const markup = [
+    '<meta charset="utf-8"><b id="docs-internal-guid-fallback">',
+    '|B|=√((27.187)<span style="font-size:0.6em;vertical-align:super">2</span>',
+    '+(17.479)<span style="vertical-align: super">2</span>',
+    '+(-28.112)<sup>2</sup>) = 42.84 μT</b>'
+  ].join('');
+  const payload = cleanCopy.richScriptClipboardPayloadFromMarkup(
+    markup,
+    { outputMode: 'faithful' },
+    instance.window.document
+  );
+  assert.equal(
+    payload.text,
+    '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
+  );
+  assert.equal(payload.sourceText, '|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT');
+});
+
+test('explicit rich HTML preserves nested superscripts and subscripts without flattening', () => {
+  const instance = dom('');
+  assert.equal(
+    cleanCopy.richScriptClipboardPayloadFromMarkup(
+      'x<sup>2<sup>3</sup></sup>',
+      { outputMode: 'faithful' },
+      instance.window.document
+    ).text,
+    'x^(2^3)'
+  );
+  assert.equal(
+    cleanCopy.richScriptClipboardPayloadFromMarkup(
+      'x<sup>a<sub>i</sub></sup>',
+      { outputMode: 'faithful' },
+      instance.window.document
+    ).text,
+    'x^(a_i)'
+  );
+  const cases = [
+    ['x<sup>2<sub>i</sub></sup>', 'x^(2_i)', 'x^(2_(i))', 'x^{2_{i}}'],
+    ['x<sub>i<sup>2</sup></sub>', 'x_(i^2)', 'x_(i^(2))', 'x_{i^{2}}'],
+    ['x<sub>i<sub>j</sub></sub>', 'x_(i_j)', 'x_(i_(j))', 'x_{i_{j}}']
+  ];
+  for (const [markup, faithful, calculator, latex] of cases) {
+    assert.equal(
+      cleanCopy.richScriptClipboardPayloadFromMarkup(markup, { outputMode: 'faithful' }, instance.window.document).text,
+      faithful
+    );
+    assert.equal(
+      cleanCopy.richScriptClipboardPayloadFromMarkup(markup, { outputMode: 'calculator' }, instance.window.document).text,
+      calculator
+    );
+    assert.equal(
+      cleanCopy.richScriptClipboardPayloadFromMarkup(markup, { outputMode: 'latex' }, instance.window.document).text,
+      latex
+    );
+  }
+  assert.equal(
+    cleanCopy.richScriptClipboardPayloadFromMarkup(
+      'x<sub>i</sub><sup>2</sup>',
+      { outputMode: 'faithful' },
+      instance.window.document
+    ).text,
+    'xᵢ²'
+  );
+});
+
+test('uses explicit Google Docs text styles for scripts without guessing adjacent digits', () => {
+  const styled = googleDocsSlice(['x2 + H2O'], [
+    [0, 'nor'], [1, 'sup'], [2, 'nor'], [6, 'sub'], [7, 'nor']
+  ]);
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(styled, { outputMode: 'faithful' }).text,
+    'x² + H₂O'
+  );
+  assert.equal(cleanCopy.googleDocsSlicePayload(googleDocsSlice(['x2 + H2O']), { outputMode: 'faithful' }), null);
+  assert.equal(cleanCopy.googleDocsSlicePayload('{not json', { outputMode: 'faithful' }), null);
+});
+
+test('Google Docs equation text and operator names preserve authored spaces', () => {
+  const slice = googleDocsSlice([{ equation: [
+    { command: '\\text', args: ['hello world'] },
+    ' + ',
+    { command: '\\operatorname', args: ['standard error'] },
+    '(x)'
+  ] }]);
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'faithful' }).text,
+    'hello world + standard error(x)'
+  );
+});
+
+test('Google Docs parser preserves mixed order and fails closed on malformed or hostile slices', () => {
+  const mixed = googleDocsSlice([
+    'Before ',
+    { equation: [{ command: '\\superscript', args: ['x', '2'] }] },
+    '\nAfter ',
+    { equation: [{ command: '\\sqrt', args: ['y'] }] }
+  ]);
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(mixed, { outputMode: 'faithful' }).text,
+    'Before x²\nAfter √y'
+  );
+  assert.equal(cleanCopy.googleDocsSlicePayload(googleDocsSlice(['27.187']), { outputMode: 'faithful' }), null);
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(
+      googleDocsSlice([{ equation: [{ command: '\\unknowncommand' }] }]),
+      { outputMode: 'faithful' }
+    ),
+    null
+  );
+  let nested = 'x';
+  for (let index = 0; index < 130; index += 1) nested = { command: '\\sqrt', args: [nested] };
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(googleDocsSlice([{ equation: [nested] }]), { outputMode: 'faithful' }),
+    null
+  );
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(googleDocsSlice(['x'.repeat(50001)]), { outputMode: 'faithful' }),
+    null
+  );
+  const missingCommand = JSON.parse(reportedGoogleDocsEquationSlice());
+  const missingData = JSON.parse(missingCommand.data);
+  const equationStyles = missingData.resolved.dsl_styleslices.find((slice) => slice.stsl_type === 'equation_function');
+  equationStyles.stsl_styles = [];
+  missingCommand.data = JSON.stringify(missingData);
+  assert.equal(cleanCopy.googleDocsSlicePayload(JSON.stringify(missingCommand), { outputMode: 'faithful' }), null);
+});
+
+test('repairs Google Docs equation clipboard text even when Docs stops propagation', () => {
+  const flat = '|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT';
+  const rich = [
+    '<meta charset="utf-8"><b id="docs-internal-guid-test" style="font-weight:normal">',
+    '|B|=√((27.187)<span style="font-size:0.6em;vertical-align:super;">2</span>',
+    '+(17.479)<span style="vertical-align: super">2</span>',
+    '+(-28.112)<sup>2</sup>) = 42.84 μT</b>'
+  ].join('');
+  const slice = reportedGoogleDocsEquationSlice();
+  const instance = dom('<div id="target" contenteditable="true">' + flat + '</div>', 'https://docs.google.com/document/d/test/edit');
+  const target = instance.window.document.querySelector('#target');
+  selectContents(instance.window, target);
+  cleanCopy.install(instance.window.document, instance.window);
+  const clipboard = new Map();
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text/plain', flat);
+    event.clipboardData.setData('text/html', rich);
+    event.clipboardData.setData('application/x-vnd.google-docs-document-slice-clip+wrapped', slice);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (type) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  target.dispatchEvent(event);
+  assert.equal(
+    clipboard.get('text/plain'),
+    '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
+  );
+  assert.equal(clipboard.get('text/html'), rich);
+  assert.equal(clipboard.get('application/x-vnd.google-docs-document-slice-clip+wrapped'), slice);
+  assert.equal(event.defaultPrevented, true);
+});
+
+test('Google Docs semantics survive reverse clipboard writes and an intervening clear', () => {
+  const flat = '|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT';
+  const slice = reportedGoogleDocsEquationSlice();
+  const instance = dom('<div id="target" contenteditable="true">' + flat + '</div>', 'https://docs.google.com/document/u/0/d/test/edit');
+  const target = instance.window.document.querySelector('#target');
+  selectContents(instance.window, target);
+  cleanCopy.install(instance.window.document, instance.window);
+  const clipboard = new Map();
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData('application/x-vnd.google-docs-document-slice-clip+wrapped', slice);
+    event.clipboardData.clearData('text/plain');
+    event.clipboardData.setData('text/plain', flat);
+    event.preventDefault();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (type) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  target.dispatchEvent(event);
+  assert.equal(
+    clipboard.get('text/plain'),
+    '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
+  );
+  assert.equal(clipboard.get('application/x-vnd.google-docs-document-slice-clip+wrapped'), slice);
+});
+
+test('invalidated Google Docs and rich-HTML flavors never leave stale rewritten math', () => {
+  const customType = 'application/x-vnd.google-docs-document-slice-clip+wrapped';
+  const run = (operations) => {
+    const instance = dom('<div id="target" contenteditable="true">x2</div>', 'https://docs.google.com/document/d/test/edit');
+    const target = instance.window.document.querySelector('#target');
+    selectContents(instance.window, target);
+    cleanCopy.install(instance.window.document, instance.window);
+    const clipboard = new Map();
+    target.addEventListener('copy', (event) => {
+      operations(event.clipboardData);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', {
+      value: {
+        get types() { return Array.from(clipboard.keys()); },
+        clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+        setData(type, value) { clipboard.set(type, value); },
+        getData(type) { return clipboard.get(type) || ''; }
+      }
+    });
+    target.dispatchEvent(event);
+    return clipboard;
+  };
+  const slice = googleDocsSlice([{ equation: [{ command: '\\superscript', args: ['x', '2'] }] }]);
+
+  const malformedOverwrite = run((data) => {
+    data.setData('text/plain', 'x2');
+    data.setData(customType, slice);
+    data.setData(customType, '{malformed');
+  });
+  assert.equal(malformedOverwrite.get('text/plain'), 'x2');
+  assert.equal(malformedOverwrite.get(customType), '{malformed');
+
+  const clearedFlavor = run((data) => {
+    data.setData('text/plain', 'x2');
+    data.setData(customType, slice);
+    data.clearData(customType);
+  });
+  assert.equal(clearedFlavor.get('text/plain'), 'x2');
+  assert.equal(clearedFlavor.has(customType), false);
+
+  const clearedAll = run((data) => {
+    data.setData(customType, slice);
+    data.clearData();
+    data.setData('text/plain', 'Room 101');
+  });
+  assert.equal(clearedAll.get('text/plain'), 'Room 101');
+  assert.equal(clearedAll.has(customType), false);
+
+  const replacedHTML = run((data) => {
+    data.setData('text/plain', 'x2');
+    data.setData('text/html', '<span>x<sup>2</sup></span>');
+    data.setData('text/html', '<span>x2</span>');
+  });
+  assert.equal(replacedHTML.get('text/plain'), 'x2');
+  assert.equal(replacedHTML.get('text/html'), '<span>x2</span>');
+});
+
+test('generic semantic markup must agree with the site plain text before rewriting', () => {
+  const instance = dom('<div id="target" contenteditable="true">Room 101</div>');
+  const target = instance.window.document.querySelector('#target');
+  selectContents(instance.window, target);
+  cleanCopy.install(instance.window.document, instance.window);
+  const clipboard = new Map();
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text/plain', 'Room 101');
+    event.clipboardData.setData(
+      'application/mathml+xml',
+      '<math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>x</mi><mn>2</mn></msup></math>'
+    );
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (type) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  target.dispatchEvent(event);
+  assert.equal(clipboard.get('text/plain'), 'Room 101');
+});
+
+test('generic rich HTML and MathML stay pending when a site writes semantics before plain text', () => {
+  const cases = [
+    ['text/html', '<span>x<sup>2</sup></span>'],
+    ['application/mathml+xml', '<math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>x</mi><mn>2</mn></msup></math>']
+  ];
+  for (const [semanticType, semanticValue] of cases) {
+    const instance = dom('<div id="target" contenteditable="true">x2</div>');
+    const target = instance.window.document.querySelector('#target');
+    selectContents(instance.window, target);
+    cleanCopy.install(instance.window.document, instance.window);
+    const clipboard = new Map();
+    target.addEventListener('copy', (event) => {
+      event.clipboardData.setData(semanticType, semanticValue);
+      event.clipboardData.setData('text/plain', 'x2');
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', {
+      value: {
+        get types() { return Array.from(clipboard.keys()); },
+        clearData(type) { if (type) clipboard.delete(type); else clipboard.clear(); },
+        setData(type, value) { clipboard.set(type, value); },
+        getData(type) { return clipboard.get(type) || ''; }
+      }
+    });
+    target.dispatchEvent(event);
+    assert.equal(clipboard.get('text/plain'), 'x²');
+    assert.equal(clipboard.get(semanticType), semanticValue);
+  }
+});
+
+test('clearing a plain-text alias removes every representation injected by a rewrite', () => {
+  for (const alias of ['text', 'unicode']) {
+    const instance = dom('<div id="target" contenteditable="true">x2</div>');
+    const target = instance.window.document.querySelector('#target');
+    selectContents(instance.window, target);
+    cleanCopy.install(instance.window.document, instance.window);
+    const clipboard = new Map();
+    target.addEventListener('copy', (event) => {
+      event.clipboardData.setData(alias, 'x2');
+      event.clipboardData.setData('text/html', '<span>x<sup>2</sup></span>');
+      event.clipboardData.clearData(alias);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', {
+      value: {
+        get types() { return Array.from(clipboard.keys()); },
+        clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+        setData(type, value) { clipboard.set(type, value); },
+        getData(type) { return clipboard.get(type) || ''; }
+      }
+    });
+    target.dispatchEvent(event);
+    assert.equal(clipboard.has(alias), false);
+    assert.equal(clipboard.has('text/plain'), false);
+    assert.equal(clipboard.get('text/html'), '<span>x<sup>2</sup></span>');
+  }
+});
+
+test('a rejected bubble rewrite never cancels the native copy', () => {
+  const instance = dom('<div id="target" contenteditable="true">x2</div>');
+  const target = instance.window.document.querySelector('#target');
+  selectContents(instance.window, target);
+  cleanCopy.install(instance.window.document, instance.window);
+  const values = new Map([
+    ['text/plain', 'x2'],
+    ['application/mathml+xml', '<math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>x</mi><mn>2</mn></msup></math>']
+  ]);
+  const clipboardData = {
+    get types() { return Array.from(values.keys()); },
+    clearData() {},
+    getData(type) { return values.get(type) || ''; }
+  };
+  Object.defineProperty(clipboardData, 'setData', {
+    value() { throw new Error('browser rejected write'); },
+    configurable: false,
+    writable: false
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', { value: clipboardData });
+  target.dispatchEvent(event);
+  assert.equal(event.defaultPrevented, false);
+  assert.equal(values.get('text/plain'), 'x2');
+});
+
+test('a partially rejected multi-alias rewrite rolls back every successful alias', () => {
+  const instance = dom('<div id="target" contenteditable="true">x2</div>');
+  const target = instance.window.document.querySelector('#target');
+  selectContents(instance.window, target);
+  cleanCopy.install(instance.window.document, instance.window);
+  const values = new Map();
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text', 'x2');
+    event.clipboardData.setData('text/html', '<span>x<sup>2</sup></span>');
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(values.keys()); },
+      clearData(type) { if (type) values.delete(type); else values.clear(); },
+      setData(type, value) {
+        if (type === 'text/plain' && value === 'x²') throw new Error('canonical alias rejected');
+        values.set(type, value);
+      },
+      getData(type) { return values.get(type) || ''; }
+    }
+  });
+  target.dispatchEvent(event);
+  assert.equal(values.get('text'), 'x2');
+  assert.equal(values.has('text/plain'), false);
+  assert.equal(values.get('text/html'), '<span>x<sup>2</sup></span>');
+});
+
+test('page relay aborts cleanly when clearData cannot be observed', () => {
+  const instance = new JSDOM('<!doctype html><html><body><span id="carrier"></span><div id="target">x2</div></body></html>', {
+    url: 'https://example.test/',
+    runScripts: 'dangerously'
+  });
+  instance.window.eval(
+    '(' + cleanCopy.cleanMathCopyPageRelayMain.toString() + ')(' +
+    JSON.stringify('carrier') + ',' + JSON.stringify('relay-request') + ');'
+  );
+  const values = new Map();
+  const prototype = {
+    setData(type, value) { values.set(type, value); },
+    getData(type) { return values.get(type) || ''; }
+  };
+  const clipboardData = Object.create(prototype);
+  Object.defineProperty(clipboardData, 'clearData', {
+    value(type) { if (type) values.delete(type); else values.clear(); },
+    configurable: false,
+    writable: false
+  });
+  const target = instance.window.document.querySelector('#target');
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text/plain', 'x2');
+    event.clipboardData.setData('text/html', '<span>x<sup>2</sup></span>');
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', { value: clipboardData });
+  target.dispatchEvent(event);
+  assert.equal(Object.hasOwn(clipboardData, 'setData'), false);
+  assert.equal(values.get('text/plain'), 'x2');
+  assert.equal(values.get('text/html'), '<span>x<sup>2</sup></span>');
+});
+
+test('Google Docs published and preview pages keep ordinary DOM copy cleanup', () => {
+  for (const suffix of ['preview', 'pub']) {
+    const instance = dom(
+      '<p id="target">alpha\u200b&nbsp;beta</p>',
+      'https://docs.google.com/document/d/example/' + suffix
+    );
+    const target = instance.window.document.querySelector('#target');
+    selectContents(instance.window, target);
+    cleanCopy.install(instance.window.document, instance.window);
+    const clipboard = new Map();
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', {
+      value: {
+        clearData() { clipboard.clear(); },
+        setData(type, value) { clipboard.set(type, value); },
+        getData(type) { return clipboard.get(type) || ''; },
+        get types() { return Array.from(clipboard.keys()); }
+      }
+    });
+    target.dispatchEvent(event);
+    assert.equal(clipboard.get('text/plain'), 'alpha beta');
+    assert.equal(event.defaultPrevented, true);
+  }
+});
+
+test('repairs explicit rich-clipboard scripts on any site and rejects mismatched or flat guesses', () => {
+  const run = (plain, html, customSlice) => {
+    const instance = dom('<div id="target" contenteditable="true">' + plain + '</div>');
+    const target = instance.window.document.querySelector('#target');
+    selectContents(instance.window, target);
+    cleanCopy.install(instance.window.document, instance.window);
+    const clipboard = new Map();
+    target.addEventListener('copy', (event) => {
+      event.clipboardData.setData('text/plain', plain);
+      if (html) event.clipboardData.setData('text/html', html);
+      if (customSlice) {
+        event.clipboardData.setData('application/x-vnd.google-docs-document-slice-clip+wrapped', customSlice);
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', {
+      value: {
+        clearData() { clipboard.clear(); },
+        setData(type, value) { clipboard.set(type, value); },
+        getData(type) { return clipboard.get(type) || ''; },
+        get types() { return Array.from(clipboard.keys()); }
+      }
+    });
+    target.dispatchEvent(event);
+    return clipboard;
+  };
+  const googleRich = [
+    '<meta charset="utf-8"><b id="docs-internal-guid-script">',
+    'x<span style="font-size:0.6em;vertical-align:super">2<script>LEAK</script>',
+    '<span style="display:none">SECRET</span></span> + ',
+    'H<span style="vertical-align:sub">2</span>O</b>'
+  ].join('');
+  const corrected = run('x2 + H2O', googleRich);
+  assert.equal(corrected.get('text/plain'), 'x² + H₂O');
+  assert.equal(corrected.get('text/html'), googleRich);
+  assert.equal(run('(27.187)2 and H2O', '').get('text/plain'), '(27.187)2 and H2O');
+  assert.equal(
+    run('Room 101', '<span>x<sup>2</sup></span>').get('text/plain'),
+    'Room 101'
+  );
+  assert.equal(
+    run('(27.187)2', '', reportedGoogleDocsEquationSlice()).get('text/plain'),
+    '(27.187)2'
+  );
 });
 
 test('reconstructs Word for the web positioned subscripts without copying its layout DOM', () => {
