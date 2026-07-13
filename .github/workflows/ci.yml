@@ -27,4 +27,5 @@ jobs:
       - run: npm run browser-smoke
         env:
           CHROME_BIN: /usr/bin/chromium
+          CHROME_DEVEL_SANDBOX: /opt/google/chrome/chrome-sandbox
       - run: npm audit --audit-level=high

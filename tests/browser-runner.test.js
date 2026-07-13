@@ -15,7 +15,8 @@ test('browser smoke runner keeps CDP local and does not disable browser sandboxi
 });
 
 test('browser smoke prefers Chromium for unpacked-extension testing', () => {
-  assert.match(runner, /\['chromium', 'chromium-browser', 'google-chrome'/);
+  assert.match(runner, /'\/Applications\/Chromium[^]*'\/Applications\/Google Chrome/);
+  assert.match(runner, /\['chromium', 'chromium-browser', 'brave-browser'[^]*'google-chrome'\]/);
 });
 
 test('browser smoke runner observes launch errors and awaits graceful and forced termination', () => {

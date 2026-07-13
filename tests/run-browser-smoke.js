@@ -10,17 +10,17 @@ const { spawn, spawnSync } = require('node:child_process');
 function browserExecutable() {
   const candidates = [
     process.env.CHROME_BIN,
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
     '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
     '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium'
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
   ].filter(Boolean);
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) return candidate;
   }
   // Branded Chrome no longer accepts unpacked-extension flags. Chromium keeps
   // them available for the isolated-world userscript smoke test.
-  for (const command of ['chromium', 'chromium-browser', 'google-chrome', 'brave-browser', 'microsoft-edge']) {
+  for (const command of ['chromium', 'chromium-browser', 'brave-browser', 'microsoft-edge', 'google-chrome']) {
     const located = spawnSync(process.platform === 'win32' ? 'where' : 'which', [command], { encoding: 'utf8' });
     if (located.status === 0 && located.stdout.trim()) return located.stdout.trim().split(/\r?\n/)[0];
   }
