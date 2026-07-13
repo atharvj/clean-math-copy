@@ -24,8 +24,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - name: Enable Chromium's user-namespace sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: npm run browser-smoke
         env:
           CHROME_BIN: /usr/bin/chromium
-          CHROME_DEVEL_SANDBOX: /opt/google/chrome/chrome-sandbox
       - run: npm audit --audit-level=high
