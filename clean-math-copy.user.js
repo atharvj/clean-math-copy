@@ -1,10 +1,14 @@
 // ==UserScript==
 // @name         Clean Math Copy
-// @namespace    https://github.com/atharvjoshi/clean-math-copy
-// @version      1.2.2
-// @description  Copy exact math selections from ChatGPT, KaTeX, MathJax, MathML, and Word as calculator-safe text plus clean rich formatting.
+// @namespace    https://github.com/atharvj/clean-math-copy
+// @version      2.0.0
+// @description  Faithfully copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
+// @homepageURL  https://github.com/atharvj/clean-math-copy
+// @supportURL   https://github.com/atharvj/clean-math-copy/issues
+// @downloadURL  https://raw.githubusercontent.com/atharvj/clean-math-copy/main/clean-math-copy.user.js
+// @updateURL    https://raw.githubusercontent.com/atharvj/clean-math-copy/main/clean-math-copy.user.js
 // @match        http://*/*
 // @match        https://*/*
 // @match        file:///*
@@ -35,15 +39,28 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function cleanMathCopyFactory(global) {
   'use strict';
 
-  const VERSION = '1.2.2';
-  const STORAGE_KEY = 'cleanMathCopy.settings.v2';
+  const VERSION = '2.0.0';
+  const STORAGE_KEY = 'cleanMathCopy.settings.v3';
   const MATHML_NAMESPACE = 'http://www.w3.org/1998/Math/MathML';
   const MAX_CLIPBOARD_MARKUP_LENGTH = 1024 * 1024;
   const MAX_MATHML_NODES = 5000;
   const MAX_MATHML_DEPTH = 128;
   const MAX_RICH_SELECTION_NODES = 1000;
   const MAX_RICH_SELECTION_DEPTH = 128;
+  const MAX_ORDINARY_SELECTION_MARKUP_LENGTH = 1024 * 1024;
   const MAX_SELECTION_KEY_LENGTH = 50000;
+  const MAX_MATH_SOURCE_LENGTH = 50000;
+  const MAX_MATH_ROOTS_PER_SELECTION = 128;
+  const MAX_MATH_DISCOVERY_CANDIDATES = 4096;
+  const MAX_PARTIAL_MATCH_CANDIDATES = 256;
+  const MAX_PARTIAL_MATCH_NODES = 1200;
+  const MAX_PARTIAL_MATCH_OCCURRENCES = 64;
+  const MAX_PARTIAL_MATCH_WORK = 30000;
+  const MAX_POSITIONED_DISCOVERY_NODES = 1200;
+  const MAX_POSITIONED_TOKEN_CANDIDATES = 512;
+  const MAX_POSITIONED_SELECTED_TOKENS = 128;
+  const MAX_POSITIONED_BASE_LOOKBACK = 24;
+  const MAX_SELECTION_RANGES = 64;
   const MAX_LATEX_PARSE_DEPTH = 128;
   const MAX_LATEX_PARSE_STEPS = 25000;
   const DECLARED_OPERATOR_START = '\ue100';
@@ -51,8 +68,21 @@
   const RELATIONAL_MID = '\ue102';
   const DECLARED_IDENTIFIER_START = '\ue103';
   const DECLARED_IDENTIFIER_END = '\ue104';
+  const FAITHFUL_FUNCTION_APPLY = '\ue105';
+  const FAITHFUL_ABS_OPEN = '\ue106';
+  const FAITHFUL_ABS_CLOSE = '\ue107';
+  const FAITHFUL_NORM_OPEN = '\ue108';
+  const FAITHFUL_NORM_CLOSE = '\ue109';
+  const FAITHFUL_GROUP_OPEN = '\ue10a';
+  const FAITHFUL_GROUP_CLOSE = '\ue10b';
+  const FAITHFUL_SCOPE_OPEN = '\ue10c';
+  const FAITHFUL_SCOPE_CLOSE = '\ue10d';
+  const FAITHFUL_TEXT_OPEN = '\ue10e';
+  const FAITHFUL_TEXT_CLOSE = '\ue10f';
   const LATEX_BUDGET_ERROR = 'CLEAN_MATH_COPY_LATEX_BUDGET';
+  const POSITIONED_OVER_BUDGET = Symbol('clean-math-copy-positioned-over-budget');
   const TRUSTED_RICH_STYLE_NODES = new WeakSet();
+  const TRUSTED_TEXT_PLACEHOLDERS = new WeakMap();
   const MATH_ROOT_SELECTOR = [
     '.katex-display',
     '.katex',
@@ -96,32 +126,33 @@
   ].join(',');
 
   const DEFAULT_SETTINGS = Object.freeze({
-    outputMode: 'calculator',
+    outputMode: 'faithful',
     convertDelimitedLatex: true,
     cleanInvisibleArtifacts: true
   });
 
   const SYMBOLS = Object.freeze({
-    alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ε', varepsilon: 'ϵ',
-    zeta: 'ζ', eta: 'η', theta: 'θ', vartheta: 'ϑ', iota: 'ι', kappa: 'κ',
+    alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ϵ', varepsilon: 'ε',
+    zeta: 'ζ', eta: 'η', theta: 'θ', vartheta: 'ϑ', iota: 'ι', kappa: 'κ', varkappa: 'ϰ',
     lambda: 'λ', mu: 'μ', nu: 'ν', xi: 'ξ', omicron: 'ο', pi: 'π', varpi: 'ϖ',
     rho: 'ρ', varrho: 'ϱ', sigma: 'σ', varsigma: 'ς', tau: 'τ', upsilon: 'υ',
-    phi: 'φ', varphi: 'ϕ', chi: 'χ', psi: 'ψ', omega: 'ω',
+    phi: 'ϕ', varphi: 'φ', chi: 'χ', psi: 'ψ', omega: 'ω',
     Gamma: 'Γ', Delta: 'Δ', Theta: 'Θ', Lambda: 'Λ', Xi: 'Ξ', Pi: 'Π',
     Sigma: 'Σ', Upsilon: 'Υ', Phi: 'Φ', Psi: 'Ψ', Omega: 'Ω',
-    pm: '±', mp: '∓', times: '×', div: '÷', cdot: '·', ast: '∗', star: '⋆',
-    circ: '∘', bullet: '•', cap: '∩', cup: '∪', uplus: '⊎', sqcap: '⊓',
-    sqcup: '⊔', vee: '∨', wedge: '∧', setminus: '∖', wr: '≀', diamond: '⋄',
+    pm: '±', mp: '∓', times: '×', div: '÷', cdot: '⋅', ast: '∗', star: '⋆',
+    circ: '∘', bullet: '∙', cap: '∩', cup: '∪', uplus: '⊎', sqcap: '⊓',
+    sqcup: '⊔', vee: '∨', wedge: '∧', land: '∧', lor: '∨',
+    setminus: '∖', smallsetminus: '∖', wr: '≀', diamond: '⋄',
     bigtriangleup: '△', bigtriangledown: '▽', triangleleft: '◁', triangleright: '▷',
     oplus: '⊕', ominus: '⊖', otimes: '⊗', oslash: '⊘', odot: '⊙',
     bigcirc: '◯', dagger: '†', ddagger: '‡', amalg: '⨿',
     le: '≤', leq: '≤', ge: '≥', geq: '≥', neq: '≠', ne: '≠', equiv: '≡',
     approx: '≈', sim: '∼', simeq: '≃', cong: '≅', propto: '∝', doteq: '≐',
     ll: '≪', gg: '≫', prec: '≺', succ: '≻', preceq: '≼', succeq: '≽',
-    subset: '⊂', supset: '⊃', subseteq: '⊆', supseteq: '⊇', sqsubset: '⊏',
-    sqsupset: '⊐', sqsubseteq: '⊑', sqsupseteq: '⊒', in: '∈', ni: '∋',
-    notin: '∉', vdash: '⊢', dashv: '⊣', models: '⊨', perp: '⊥', parallel: '∥',
-    mid: '∣', smile: '⌣', frown: '⌢', asymp: '≍', bowtie: '⋈',
+    subset: '⊂', supset: '⊃', subseteq: '⊆', supseteq: '⊇', subsetneq: '⊊', supsetneq: '⊋', sqsubset: '⊏',
+    sqsupset: '⊐', sqsubseteq: '⊑', sqsupseteq: '⊒', in: '∈', ni: '∋', owns: '∋',
+    notin: '∉', vdash: '⊢', dashv: '⊣', models: '⊨', perp: '⊥', parallel: '∥', nparallel: '∦',
+    mid: '∣', nmid: '∤', smile: '⌣', frown: '⌢', asymp: '≍', bowtie: '⋈',
     leftarrow: '←', gets: '←', rightarrow: '→', to: '→', leftrightarrow: '↔',
     Leftarrow: '⇐', Rightarrow: '⇒', Leftrightarrow: '⇔', mapsto: '↦',
     hookleftarrow: '↩', hookrightarrow: '↪', leftharpoonup: '↼',
@@ -142,12 +173,13 @@
     jmath: 'ȷ', Re: 'ℜ', Im: 'ℑ', wp: '℘', aleph: 'ℵ', beth: 'ℶ', gimel: 'ℷ',
     emptyset: '∅', varnothing: '∅', forall: '∀', exists: '∃', nexists: '∄',
     neg: '¬', lnot: '¬', top: '⊤', bot: '⊥', angle: '∠', measuredangle: '∡',
-    triangle: '△', square: '□', prime: '′', backslash: '∖', ldots: '…',
+    triangle: '△', square: '□', Box: '□', Diamond: '◊', prime: '′', backslash: '∖', ldots: '…',
     cdots: '⋯', vdots: '⋮', ddots: '⋱', dots: '…', therefore: '∴', because: '∵',
-    degree: '°', checkmark: '✓', pounds: '£', euro: '€', yen: '¥',
+    degree: '°', checkmark: '✓', clubsuit: '♣', diamondsuit: '♢', heartsuit: '♡', spadesuit: '♠',
+    pounds: '£', euro: '€', yen: '¥',
     lfloor: '⌊', rfloor: '⌋', lceil: '⌈', rceil: '⌉', langle: '⟨', rangle: '⟩',
     lvert: '|', rvert: '|', vert: '|', lVert: '‖', rVert: '‖', Vert: '‖', colon: ':',
-    lt: '<', gt: '>', implies: '⇒', impliedby: '⇐', iff: '⇔',
+    lt: '<', gt: '>', implies: '⟹', impliedby: '⟸', iff: '⟺',
     AA: 'Å', ae: 'æ', AE: 'Æ', oe: 'œ', OE: 'Œ', ss: 'ß', o: 'ø', O: 'Ø'
   });
 
@@ -176,6 +208,36 @@
   const DOUBLE_STRUCK = Object.freeze({
     C: 'ℂ', H: 'ℍ', N: 'ℕ', P: 'ℙ', Q: 'ℚ', R: 'ℝ', Z: 'ℤ'
   });
+  const MATH_VARIANT_GREEK_UPPER = Array.from('ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡϴΣΤΥΦΧΨΩ');
+  const MATH_VARIANT_GREEK_LOWER = Array.from('αβγδεζηθικλμνξοπρςστυφχψω');
+  const MATH_VARIANT_GREEK_SYMBOLS = Array.from('∂ϵϑϰϕϱϖ');
+  const MATH_VARIANT_SPECS = Object.freeze({
+    bold: { upper: 0x1d400, lower: 0x1d41a, digit: 0x1d7ce, greekUpper: 0x1d6a8, greekLower: 0x1d6c2 },
+    italic: { upper: 0x1d434, lower: 0x1d44e, greekUpper: 0x1d6e2, greekLower: 0x1d6fc },
+    'bold-italic': { upper: 0x1d468, lower: 0x1d482, greekUpper: 0x1d71c, greekLower: 0x1d736 },
+    script: { upper: 0x1d49c, lower: 0x1d4b6 },
+    'bold-script': { upper: 0x1d4d0, lower: 0x1d4ea },
+    fraktur: { upper: 0x1d504, lower: 0x1d51e },
+    'bold-fraktur': { upper: 0x1d56c, lower: 0x1d586 },
+    'double-struck': { upper: 0x1d538, lower: 0x1d552, digit: 0x1d7d8 },
+    'sans-serif': { upper: 0x1d5a0, lower: 0x1d5ba, digit: 0x1d7e2 },
+    'bold-sans-serif': { upper: 0x1d5d4, lower: 0x1d5ee, digit: 0x1d7ec, greekUpper: 0x1d756, greekLower: 0x1d770 },
+    'sans-serif-italic': { upper: 0x1d608, lower: 0x1d622 },
+    'sans-serif-bold-italic': { upper: 0x1d63c, lower: 0x1d656, greekUpper: 0x1d790, greekLower: 0x1d7aa },
+    monospace: { upper: 0x1d670, lower: 0x1d68a, digit: 0x1d7f6 }
+  });
+  const MATH_VARIANT_EXCEPTIONS = Object.freeze({
+    italic: { h: 'ℎ' },
+    script: {
+      B: 'ℬ', E: 'ℰ', F: 'ℱ', H: 'ℋ', I: 'ℐ', L: 'ℒ', M: 'ℳ', R: 'ℛ',
+      e: 'ℯ', g: 'ℊ', o: 'ℴ'
+    },
+    fraktur: { C: 'ℭ', H: 'ℌ', I: 'ℑ', R: 'ℜ', Z: 'ℨ' },
+    'double-struck': { ...DOUBLE_STRUCK }
+  });
+  const OFFICE_SEMANTIC_LETTERLIKE = new Set([
+    ...Object.values(DOUBLE_STRUCK), 'ℏ', 'ℓ', '℘', 'ℜ', 'ℑ'
+  ]);
 
   const ASCII_SYMBOLS = Object.freeze({
     '≤': '<=', '≥': '>=', '≠': '!=', '≈': '~=', '≃': '~=', '≅': '~=', '≡': '===',
@@ -206,10 +268,23 @@
   ]);
   const SKIP_TAGS = new Set(['script', 'style', 'noscript', 'template', 'canvas']);
   const PRESERVE_TAGS = new Set(['pre', 'textarea']);
+  const ORDINARY_RICH_TAGS = new Set([
+    'a', 'abbr', 'article', 'aside', 'b', 'bdi', 'bdo', 'blockquote', 'br',
+    'caption', 'cite', 'code', 'col', 'colgroup', 'dd', 'del', 'details', 'dfn',
+    'div', 'dl', 'dt', 'em', 'figcaption', 'figure', 'footer', 'h1', 'h2', 'h3', 'hr',
+    'h4', 'h5', 'h6', 'header', 'hgroup', 'i', 'ins', 'kbd', 'li', 'main',
+    'mark', 'nav', 'ol', 'p', 'pre', 'q', 'rp', 'rt', 'ruby', 's', 'samp',
+    'section', 'small', 'span', 'strong', 'sub', 'summary', 'sup', 'table',
+    'tbody', 'td', 'tfoot', 'th', 'thead', 'time', 'tr', 'u', 'ul', 'var', 'wbr'
+  ]);
+  const ORDINARY_DROP_CONTENT_TAGS = new Set([
+    'applet', 'audio', 'canvas', 'embed', 'frame', 'frameset', 'iframe', 'link',
+    'meta', 'noscript', 'object', 'script', 'style', 'svg', 'template', 'video'
+  ]);
 
   function normalizeSettings(settings) {
     const candidate = settings && typeof settings === 'object' ? settings : {};
-    const outputMode = ['calculator', 'unicode', 'latex', 'ascii'].includes(candidate.outputMode)
+    const outputMode = ['calculator', 'faithful', 'unicode', 'latex', 'ascii'].includes(candidate.outputMode)
       ? candidate.outputMode
       : DEFAULT_SETTINGS.outputMode;
     return {
@@ -247,12 +322,468 @@
     return converted;
   }
 
-  function applyMathVariant(text, variant) {
-    const value = String(text);
-    if (/double-struck|blackboard/i.test(variant || '')) {
-      return Array.from(value, (character) => DOUBLE_STRUCK[character] || character).join('');
+  function toFaithfulScript(text, map, fallbackMarker) {
+    const source = String(text == null ? '' : text).trim();
+    if (!source) return '';
+    if (fallbackMarker === '^' && /^[′″‴']+$/u.test(source)) {
+      return source.replace(/'/g, '′');
     }
-    return value;
+    const compact = source.replace(/\s+/g, '');
+    const aliases = map === SUBSCRIPTS
+      ? { β: 'ᵦ', γ: 'ᵧ', ρ: 'ᵨ', φ: 'ᵩ', χ: 'ᵪ' }
+      : {};
+    let converted = '';
+    for (const character of compact) {
+      if (!Object.prototype.hasOwnProperty.call(map, character) && !Object.prototype.hasOwnProperty.call(aliases, character)) {
+        return Array.from(source).length === 1 && /^[\p{L}\p{N}\p{M}\p{S}]$/u.test(source)
+          ? fallbackMarker + source.replace('−', '-')
+          : fallbackMarker + '(' + source + ')';
+      }
+      converted += map[character] || aliases[character];
+    }
+    return converted;
+  }
+
+  function protectFaithfulText(input) {
+    const encoded = Array.from(String(input == null ? '' : input), (character) =>
+      character.codePointAt(0).toString(16)
+    ).join('.');
+    return FAITHFUL_TEXT_OPEN + encoded + FAITHFUL_TEXT_CLOSE;
+  }
+
+  function escapeFaithfulSentinelCollisions(input) {
+    const sentinels = new Set([
+      DECLARED_OPERATOR_START, DECLARED_OPERATOR_END, RELATIONAL_MID,
+      DECLARED_IDENTIFIER_START, DECLARED_IDENTIFIER_END,
+      FAITHFUL_FUNCTION_APPLY, FAITHFUL_ABS_OPEN, FAITHFUL_ABS_CLOSE,
+      FAITHFUL_NORM_OPEN, FAITHFUL_NORM_CLOSE, FAITHFUL_GROUP_OPEN,
+      FAITHFUL_GROUP_CLOSE, FAITHFUL_SCOPE_OPEN, FAITHFUL_SCOPE_CLOSE,
+      FAITHFUL_TEXT_OPEN, FAITHFUL_TEXT_CLOSE
+    ]);
+    return Array.from(String(input == null ? '' : input), (character) =>
+      sentinels.has(character) ? protectFaithfulText(character) : character
+    ).join('');
+  }
+
+  function restoreFaithfulText(input) {
+    const source = String(input == null ? '' : input);
+    let output = '';
+    for (let position = 0; position < source.length;) {
+      if (source[position] === FAITHFUL_TEXT_CLOSE) {
+        position += 1;
+        continue;
+      }
+      if (source[position] !== FAITHFUL_TEXT_OPEN) {
+        output += source[position];
+        position += 1;
+        continue;
+      }
+      const close = source.indexOf(FAITHFUL_TEXT_CLOSE, position + 1);
+      if (close < 0) {
+        position += 1;
+        continue;
+      }
+      const encoded = source.slice(position + 1, close);
+      if (/^(?:[0-9a-f]+(?:\.[0-9a-f]+)*)?$/iu.test(encoded)) {
+        try {
+          output += encoded
+            ? encoded.split('.').map((value) => String.fromCodePoint(parseInt(value, 16))).join('')
+            : '';
+        } catch (_error) {
+          // Invalid code points are discarded with their private framing.
+        }
+      }
+      position = close + 1;
+    }
+    return output;
+  }
+
+  function faithfulMarkedScope(input, strong) {
+    const text = String(input == null ? '' : input);
+    return (strong ? FAITHFUL_SCOPE_OPEN : FAITHFUL_GROUP_OPEN) + text +
+      (strong ? FAITHFUL_SCOPE_CLOSE : FAITHFUL_GROUP_CLOSE);
+  }
+
+  function faithfulHasBalancedOuterParentheses(input) {
+    const text = String(input == null ? '' : input).trim();
+    if (text.length < 2 || text[0] !== '(' || text[text.length - 1] !== ')') return false;
+    let depth = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      if (text[index] === '(') depth += 1;
+      else if (text[index] === ')') depth -= 1;
+      if (depth < 0 || (depth === 0 && index < text.length - 1)) return false;
+    }
+    return depth === 0;
+  }
+
+  function faithfulExpressionIsAtomic(input) {
+    const text = String(input == null ? '' : input).trim();
+    if (!text) return false;
+    if (faithfulFullyFenced(text) || faithfulAtomicRadicand(text)) return true;
+    if (new RegExp('^' + FAITHFUL_TEXT_OPEN + '[0-9a-f.]*' + FAITHFUL_TEXT_CLOSE + '$', 'i').test(text)) {
+      return true;
+    }
+    const root = text.match(/^(?:[⁰¹²³⁴⁵⁶⁷⁸⁹]+√|√|∛|∜)(.+)$/u);
+    if (root && faithfulAtomicRadicand(root[1])) return true;
+    return /^[\p{L}\p{M}][\p{L}\p{N}\p{M}_]*[₀-₟⁰-⁹⁺⁻⁼⁽⁾ⁿⁱᵢⱼᵦ-ᵪ′″‴⁗]*\([^\n]+\)$/u.test(text);
+  }
+
+  function faithfulTopLevelTraits(input) {
+    const text = String(input == null ? '' : input);
+    const pairs = { '(': ')', '[': ']', '{': '}', '⟨': '⟩', '⌈': '⌉', '⌊': '⌋' };
+    const closing = new Set(Object.values(pairs));
+    const stack = [];
+    let lowPrecedence = false;
+    let division = false;
+    for (const character of text) {
+      if (pairs[character]) {
+        stack.push(pairs[character]);
+        continue;
+      }
+      if (closing.has(character)) {
+        if (stack[stack.length - 1] === character) stack.pop();
+        continue;
+      }
+      if (stack.length) continue;
+      if (character === '/' || character === '÷' || character === '∕' || character === '⁄') division = true;
+      if (/[+−±∓-]/u.test(character) || /[=≠≈≃≅≡≤≥<>∈∉∋∌⊂⊃⊆⊇⊊⊋≺≻≼≽∝⇐⇒⇔↔→←↦∣-∦⟵-⟺]/u.test(character)) {
+        lowPrecedence = true;
+      }
+    }
+    return { lowPrecedence, division };
+  }
+
+  function faithfulScopeNeedsParentheses(content, strong, before, after) {
+    const text = String(content == null ? '' : content).trim();
+    if (!text || faithfulFullyFenced(text)) return false;
+    const previous = String(before == null ? '' : before).match(/\S$/u);
+    const next = String(after == null ? '' : after).match(/^\s*(\S)/u);
+    const previousCharacter = previous ? previous[0] : '';
+    const nextCharacter = next ? next[1] : '';
+    const atomic = faithfulExpressionIsAtomic(text);
+    const scriptOrPostfix = /^[₀-₟⁰-⁹¹²³⁺⁻⁼⁽⁾ⁿⁱᵢⱼᵦ-ᵪ′″‴⁗'!_^]/u.test(nextCharacter);
+    if (scriptOrPostfix && (strong || !atomic)) return true;
+    if (previousCharacter === FAITHFUL_FUNCTION_APPLY && (strong || !atomic)) return true;
+
+    const traits = faithfulTopLevelTraits(text);
+    const previousIsLargeOperator = /(?:lim(?:_\([^)]*\)|[₀-₟ᵢⱼᵦ-ᵪ]+)?(?:\^\([^)]*\)|[⁰-⁹¹²³⁺⁻⁼⁽⁾ⁿⁱ]+)?|[∑∏∐∫∬∭∮](?:_\([^)]*\)|[₀-₟ᵢⱼᵦ-ᵪ]+)?(?:\^\([^)]*\)|[⁰-⁹¹²³⁺⁻⁼⁽⁾ⁿⁱ]+)?)$/u.test(String(before == null ? '' : before).trim());
+    const previousOperand = !previousIsLargeOperator && /[\p{L}\p{N}\p{M})\]}⟩⌉⌋₀-₟⁰-⁹′″‴⁗]/u.test(previousCharacter);
+    const nextOperand = /[\p{L}\p{N}\p{M}([{⟨⌈⌊√∛∜]/u.test(nextCharacter);
+    const previousBinding = previousOperand || /[*/×·⋅∗÷∕⁄−-]/u.test(previousCharacter);
+    const nextBinding = nextOperand || /[*/×·⋅∗÷∕⁄]/u.test(nextCharacter);
+    if (traits.lowPrecedence && (previousBinding || nextBinding)) return true;
+    if (traits.division && (previousOperand || nextOperand)) return true;
+    return false;
+  }
+
+  function resolveFaithfulScopes(input) {
+    const source = String(input == null ? '' : input);
+    const parse = (start, closingMarker) => {
+      const nodes = [];
+      let buffer = '';
+      let position = start;
+      const flush = () => {
+        if (buffer) nodes.push(buffer);
+        buffer = '';
+      };
+      while (position < source.length) {
+        const character = source[position];
+        if (closingMarker && character === closingMarker) {
+          flush();
+          return { nodes, position: position + 1 };
+        }
+        if (character === FAITHFUL_GROUP_OPEN || character === FAITHFUL_SCOPE_OPEN) {
+          flush();
+          const strong = character === FAITHFUL_SCOPE_OPEN;
+          const nested = parse(position + 1, strong ? FAITHFUL_SCOPE_CLOSE : FAITHFUL_GROUP_CLOSE);
+          nodes.push({ nodes: nested.nodes, strong });
+          position = nested.position;
+          continue;
+        }
+        buffer += character;
+        position += 1;
+      }
+      flush();
+      return { nodes, position };
+    };
+    const preview = (nodes) => nodes.map((node) =>
+      typeof node === 'string' ? node : preview(node.nodes)
+    ).join('');
+    const render = (nodes, prefix) => {
+      let output = prefix || '';
+      for (let index = 0; index < nodes.length; index += 1) {
+        const node = nodes[index];
+        if (typeof node === 'string') {
+          output += node;
+          continue;
+        }
+        let content = render(node.nodes, '');
+        const suffix = preview(nodes.slice(index + 1));
+        const next = suffix.match(/^\s*(\S)/u);
+        const nextCharacter = next ? next[1] : '';
+        const radical = content.match(/^((?:[⁰¹²³⁴⁵⁶⁷⁸⁹]+√|√(?:\[[^\]]+\])?|∛|∜))(.+)$/u);
+        const nextIsScriptOrPostfix = /^[₀-₟⁰-⁹¹²³⁺⁻⁼⁽⁾ⁿⁱᵢⱼᵦ-ᵪ′″‴⁗'!_^]/u.test(nextCharacter);
+        // A plain Unicode radical has no vinculum. If a separate following
+        // factor could be swallowed into an atomic radicand, fence the
+        // radicand itself (`√(x)y`) rather than the completed root
+        // (`(√x)y`). This stays closest to the displayed radical while making
+        // its original two-dimensional boundary explicit.
+        if (node.strong && radical && !nextIsScriptOrPostfix &&
+            /[\p{L}\p{N}\p{M}([{⟨⌈⌊]/u.test(nextCharacter) &&
+            !faithfulHasBalancedOuterParentheses(radical[2])) {
+          content = radical[1] + '(' + radical[2] + ')';
+        }
+        output += faithfulScopeNeedsParentheses(content, node.strong, output, suffix)
+          ? '(' + content + ')'
+          : content;
+      }
+      return output;
+    };
+    return render(parse(0, '').nodes, '');
+  }
+
+  function faithfulFractionPart(input, denominator, options) {
+    const text = resolveFaithfulScopes(String(input == null ? '' : input)).trim();
+    if (!text || faithfulFullyFenced(text) || faithfulExpressionIsAtomic(text)) return text;
+    const readableText = text.replace(new RegExp(FAITHFUL_FUNCTION_APPLY, 'g'), ' ');
+    let depth = 0;
+    const settings = options || {};
+    let needsGrouping = Boolean(denominator && (settings.forceGrouping || /^[+−-]/u.test(text)));
+    if (denominator && !settings.atomic && /^(?:[\p{L}\p{M}]{2,}|\d+(?:[.,]\d+)?[\p{L}\p{M}]+|[\p{L}\p{M}]+\s+[\p{L}\p{M}]+)$/u.test(text)) {
+      needsGrouping = true;
+    }
+    if (denominator && !settings.atomic &&
+        /(?:[\p{L}\p{N}\p{M})\]}₀-₟⁰-⁹′″‴⁗])\s*[(\[{⟨⌈⌊]/u.test(text)) needsGrouping = true;
+    if (denominator && !settings.atomic &&
+        /[)\]}⟩⌉⌋|‖]\s*[\p{L}\p{N}\p{M}√∛∜]/u.test(text)) needsGrouping = true;
+    if (denominator && !settings.atomic &&
+        /[\p{L}\p{N}\p{M}₀-₟⁰-⁹′″‴⁗]\s*(?:√|∛|∜)/u.test(text)) needsGrouping = true;
+    if (denominator && !settings.atomic &&
+        (text.match(/[√∛∜]/gu) || []).length > 1) needsGrouping = true;
+    if (!settings.atomic &&
+        /^(?:sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|sinh|cosh|tanh|log|ln|lg|exp|det|dim|gcd|hom|ker|Pr)\S*\s+\S/iu.test(readableText)) {
+      needsGrouping = true;
+    }
+    if (/[\p{L}\p{M}](?:[\u2080-\u209cᵢⱼᵦ-ᵪ]+|_[\p{L}\p{N}\p{M}])\s*[\p{Ll}\p{Lu}]/u.test(text)) {
+      needsGrouping = true;
+    }
+    for (let index = 0; index < text.length && !needsGrouping; index += 1) {
+      const character = text[index];
+      if ('([{'.includes(character)) { depth += 1; continue; }
+      if (')]}'.includes(character)) { depth = Math.max(0, depth - 1); continue; }
+      if (depth !== 0) continue;
+      if ('*/×·⋅∗÷∕⁄=<>'.includes(character) ||
+          /[≠≈≃≅≡≤≥∝∈∉⊂⊃⊆⊇∪∩]/u.test(character)) {
+        needsGrouping = true;
+        continue;
+      }
+      if ((character === '+' || character === '-' || character === '−' || character === '±' || character === '∓') && index > 0) needsGrouping = true;
+    }
+    return needsGrouping ? '(' + text + ')' : text;
+  }
+
+  function faithfulFraction(numerator, denominator, options) {
+    const settings = options || {};
+    const fraction = faithfulFractionPart(numerator, false) + '/' + faithfulFractionPart(denominator, true, {
+      forceGrouping: Boolean(settings.denominatorForceGrouping),
+      atomic: Boolean(settings.denominatorAtomic)
+    });
+    return faithfulMarkedScope(fraction, true);
+  }
+
+  function faithfulFullyFenced(input) {
+    const text = String(input == null ? '' : input).trim();
+    if (faithfulHasBalancedOuterParentheses(text)) return true;
+    const pairs = { '[': ']', '{': '}', '⟨': '⟩', '⌈': '⌉', '⌊': '⌋' };
+    const close = pairs[text[0]];
+    if (close && text[text.length - 1] === close) {
+      let depth = 0;
+      for (let index = 0; index < text.length; index += 1) {
+        if (text[index] === text[0]) depth += 1;
+        else if (text[index] === close) depth -= 1;
+        if (depth < 0 || (depth === 0 && index < text.length - 1)) return false;
+      }
+      return depth === 0;
+    }
+    if ((text[0] === FAITHFUL_ABS_OPEN && text[text.length - 1] === FAITHFUL_ABS_CLOSE) ||
+        (text[0] === FAITHFUL_NORM_OPEN && text[text.length - 1] === FAITHFUL_NORM_CLOSE)) return true;
+    return (/^\|[^|\n]+\|$/u.test(text) || /^‖[^‖\n]+‖$/u.test(text));
+  }
+
+  function faithfulAtomicRadicand(input) {
+    const text = String(input == null ? '' : input).trim();
+    if (!text) return false;
+    if (faithfulFullyFenced(text)) return true;
+    // Decimal/integer literals and a single identifier with attached scripts
+    // are unambiguous after a radical. Products, functions, sums, fractions,
+    // and signed expressions retain parentheses so the missing vinculum can
+    // never change the scope when pasted as plain text.
+    if (/^\d+(?:[.,]\d+)?(?:[⁰-₟²³¹]+)?$/u.test(text)) return true;
+    const characters = Array.from(text);
+    if (characters.length === 0 || !/^[\p{L}\p{M}∞]$/u.test(characters[0])) return false;
+    const scriptGlyphs = new Set([
+      ...Object.values(SUPERSCRIPTS),
+      ...Object.values(SUBSCRIPTS),
+      '′', '″', '‴', '⁗'
+    ]);
+    let index = 1;
+    while (index < characters.length) {
+      if (scriptGlyphs.has(characters[index])) {
+        index += 1;
+        continue;
+      }
+      if (characters[index] !== '_' && characters[index] !== '^') return false;
+      index += 1;
+      if (index >= characters.length) return false;
+      if (characters[index] !== '(') {
+        if (!/^[\p{L}\p{N}\p{M}]$/u.test(characters[index])) return false;
+        index += 1;
+        continue;
+      }
+      let depth = 0;
+      do {
+        if (characters[index] === '(') depth += 1;
+        else if (characters[index] === ')') depth -= 1;
+        index += 1;
+      } while (index < characters.length && depth > 0);
+      if (depth !== 0) return false;
+    }
+    return true;
+  }
+
+  function faithfulRoot(index, radicand) {
+    const degree = String(index == null ? '' : index).trim();
+    const value = resolveFaithfulScopes(String(radicand == null ? '' : radicand)).trim();
+    let prefix = '√';
+    if (degree === '3') prefix = '∛';
+    else if (degree === '4') prefix = '∜';
+    else if (degree) {
+      prefix = /^[0-9]+$/u.test(degree)
+        ? toFaithfulScript(degree, SUPERSCRIPTS, '^') + '√'
+        : '√[' + degree + ']';
+    }
+    // A Unicode radical has no vinculum in plain text. A superscript or prime
+    // after its operand can therefore be read as applying to the completed
+    // root (`(√x)²`) instead of belonging under it (`√(x²)`). Subscripts are
+    // part of the identifier and remain unambiguous, but superscripted and
+    // primed radicands need explicit scope just like sums and products do.
+    const superscriptOrPrime = new Set([...Object.values(SUPERSCRIPTS), '′', '″', '‴', '⁗', '^']);
+    const ambiguousPostfix = !faithfulFullyFenced(value) &&
+      Array.from(value).some((character) => superscriptOrPrime.has(character));
+    const atomic = faithfulAtomicRadicand(value) && !ambiguousPostfix;
+    return faithfulMarkedScope(prefix + (atomic ? value : '(' + value + ')'), true);
+  }
+
+  function faithfulLatexDenominatorOptions(source) {
+    const raw = String(source == null ? '' : source).trim();
+    const atomicWrapper = /^\\(?:mathrm|mathbf|mathit|mathsf|mathtt|mathbb|mathcal|mathscr|mathfrak|operatorname)\*?\s*\{[\s\S]*\}$/u.test(raw);
+    const functionProduct = /^\\(?:sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|sinh|cosh|tanh|log|ln|lg|exp|det|dim|gcd|hom|ker|Pr)\b[\s\S]+$/u.test(raw);
+    return {
+      denominatorAtomic: atomicWrapper,
+      denominatorForceGrouping: functionProduct
+    };
+  }
+
+  function faithfulAccent(command, input, combiningMark) {
+    const value = resolveFaithfulScopes(String(input == null ? '' : input)).trim();
+    if (faithfulAtomicRadicand(value)) return value + combiningMark;
+    const names = {
+      bar: 'overline', overline: 'overline', overbrace: 'overbrace',
+      underline: 'underline', underbrace: 'underbrace',
+      hat: 'hat', widehat: 'hat', tilde: 'tilde', widetilde: 'tilde',
+      vec: 'vec', overrightarrow: 'vec', overleftarrow: 'overleftarrow',
+      dot: 'dot', ddot: 'ddot', acute: 'acute', grave: 'grave',
+      breve: 'breve', check: 'check', mathring: 'mathring'
+    };
+    return faithfulMarkedScope((names[command] || command) + '(' + value + ')', true);
+  }
+
+  function canonicalMathVariant(variant) {
+    const value = String(variant == null ? '' : variant).trim().toLowerCase()
+      .replace(/_/g, '-');
+    return ({
+      blackboard: 'double-struck', 'blackboard-bold': 'double-struck',
+      'sans-serif-bold': 'bold-sans-serif',
+      'bold-sans-serif-italic': 'sans-serif-bold-italic'
+    })[value] || value;
+  }
+
+  function mathVariantBaseCharacter(character) {
+    try {
+      const normalized = character.normalize('NFKD');
+      return Array.from(normalized).length === 1 ? normalized : character;
+    } catch (_error) {
+      return character;
+    }
+  }
+
+  function mathematicalVariantCharacter(character, variant, spec) {
+    const base = mathVariantBaseCharacter(character);
+    const exceptions = MATH_VARIANT_EXCEPTIONS[variant] || {};
+    if (Object.prototype.hasOwnProperty.call(exceptions, base)) return exceptions[base];
+    const code = base.codePointAt(0);
+    if (code >= 65 && code <= 90 && spec.upper != null) {
+      return String.fromCodePoint(spec.upper + code - 65);
+    }
+    if (code >= 97 && code <= 122 && spec.lower != null) {
+      return String.fromCodePoint(spec.lower + code - 97);
+    }
+    if (code >= 48 && code <= 57 && spec.digit != null) {
+      return String.fromCodePoint(spec.digit + code - 48);
+    }
+    if (spec.greekUpper != null) {
+      const upper = MATH_VARIANT_GREEK_UPPER.indexOf(base);
+      if (upper >= 0) return String.fromCodePoint(spec.greekUpper + upper);
+      if (base === '∇') return String.fromCodePoint(spec.greekUpper + MATH_VARIANT_GREEK_UPPER.length);
+    }
+    if (spec.greekLower != null) {
+      const lower = MATH_VARIANT_GREEK_LOWER.indexOf(base);
+      if (lower >= 0) return String.fromCodePoint(spec.greekLower + lower);
+      const symbol = MATH_VARIANT_GREEK_SYMBOLS.indexOf(base);
+      if (symbol >= 0) return String.fromCodePoint(spec.greekLower + MATH_VARIANT_GREEK_LOWER.length + symbol);
+    }
+    if (/^\s$/u.test(base) || /^\p{M}$/u.test(base)) return base;
+    const point = character.codePointAt(0);
+    if (point >= 0xe100 && point <= 0xe10f) return character;
+    if (MATH_VARIANT_GREEK_UPPER.includes(base) || MATH_VARIANT_GREEK_LOWER.includes(base) ||
+        MATH_VARIANT_GREEK_SYMBOLS.includes(base) || base === '∇' || /^[\p{L}\p{N}]$/u.test(base)) {
+      return null;
+    }
+    return base;
+  }
+
+  function applyMathVariant(text, variant, fallbackLabel) {
+    const value = String(text == null ? '' : text);
+    const canonical = canonicalMathVariant(variant);
+    if (!canonical) return value;
+    if (canonical === 'normal') {
+      return Array.from(value, (character) =>
+        MATH_VARIANT_GREEK_SYMBOLS.includes(character) || character === 'ϴ'
+          ? character
+          : mathVariantBaseCharacter(character)
+      ).join('');
+    }
+    const spec = MATH_VARIANT_SPECS[canonical];
+    const label = String(fallbackLabel || canonical || 'mathvariant').replace(/[^a-z0-9_-]+/gi, '') || 'mathvariant';
+    if (!spec) return label + '(' + value + ')';
+    let converted = '';
+    const characters = Array.from(value);
+    for (let index = 0; index < characters.length;) {
+      const styled = mathematicalVariantCharacter(characters[index], canonical, spec);
+      if (styled != null) {
+        converted += styled;
+        index += 1;
+        continue;
+      }
+      let unsupported = characters[index];
+      index += 1;
+      while (index < characters.length && mathematicalVariantCharacter(characters[index], canonical, spec) == null) {
+        unsupported += characters[index];
+        index += 1;
+      }
+      converted += label + '(' + unsupported + ')';
+    }
+    return converted;
   }
 
   function splitLatexTopLevel(input, kind) {
@@ -324,11 +855,13 @@
 
   class LatexParser {
     constructor(input, options) {
-      this.input = stripLatexDelimiters(input)
+      this.calculatorMode = Boolean(options && options.calculatorMode);
+      this.faithfulMode = Boolean(options && options.faithfulMode);
+      const source = stripLatexDelimiters(input);
+      this.input = (this.faithfulMode ? escapeFaithfulSentinelCollisions(source) : source)
         .replace(/(^|[^\\])%[^\n\r]*/g, '$1')
         .replace(/\\displaystyle\b/g, '');
       this.position = 0;
-      this.calculatorMode = Boolean(options && options.calculatorMode);
       this.budget = options && options.budget || { depth: 0, steps: 0 };
     }
 
@@ -368,7 +901,9 @@
         if (character === '{') {
           this.position += 1;
           const group = this.nested(() => this.parse('}'));
-          output += this.calculatorMode ? '(' + group + ')' : group;
+          output += this.calculatorMode
+            ? '(' + group + ')'
+            : (this.faithfulMode ? faithfulMarkedScope(group, false) : group);
           continue;
         }
         if (character === '}') {
@@ -384,9 +919,13 @@
         if (character === '^' || character === '_') {
           this.position += 1;
           const argument = this.parseArgument();
-          output += character === '^'
-            ? toScript(argument, SUPERSCRIPTS, '^')
-            : toScript(argument, SUBSCRIPTS, '_');
+          output += this.faithfulMode
+            ? (character === '^'
+              ? toFaithfulScript(argument, SUPERSCRIPTS, '^')
+              : toFaithfulScript(argument, SUBSCRIPTS, '_'))
+            : (character === '^'
+              ? toScript(argument, SUPERSCRIPTS, '^')
+              : toScript(argument, SUBSCRIPTS, '_'));
           continue;
         }
         if (character === '~') {
@@ -395,7 +934,7 @@
           continue;
         }
         if (/\s/.test(character)) {
-          output += ' ';
+          if (!this.faithfulMode) output += ' ';
           this.position += 1;
           while (this.position < this.input.length && /\s/.test(this.input[this.position])) {
             this.position += 1;
@@ -423,6 +962,44 @@
       return character;
     }
 
+    peekArgumentSource() {
+      let cursor = this.position;
+      while (cursor < this.input.length && /\s/.test(this.input[cursor])) cursor += 1;
+      if (this.input[cursor] !== '{') {
+        if (this.input[cursor] !== '\\') return this.input[cursor] || '';
+        const command = this.input.slice(cursor).match(/^\\(?:[A-Za-z]+|.)/);
+        return command ? command[0] : '';
+      }
+      const start = cursor + 1;
+      cursor = start;
+      let depth = 1;
+      while (cursor < this.input.length && depth > 0) {
+        const character = this.input[cursor];
+        const escaped = cursor > start && this.input[cursor - 1] === '\\';
+        if (!escaped && character === '{') depth += 1;
+        else if (!escaped && character === '}') depth -= 1;
+        cursor += 1;
+      }
+      return this.input.slice(start, depth === 0 ? cursor - 1 : cursor);
+    }
+
+    consumeDimension() {
+      while (this.position < this.input.length && /\s/.test(this.input[this.position])) {
+        this.consumeStep();
+        this.position += 1;
+      }
+      if (this.input[this.position] === '{') {
+        this.readRawGroup();
+        return;
+      }
+      const dimension = this.input.slice(this.position).match(
+        /^[+\-]?(?:(?:\d+(?:\.\d*)?|\.\d+))(?:\s*true\s*)?[A-Za-z]+/
+      );
+      if (!dimension) return;
+      for (let index = 0; index < dimension[0].length; index += 1) this.consumeStep();
+      this.position += dimension[0].length;
+    }
+
     readRawGroup() {
       while (this.position < this.input.length && /\s/.test(this.input[this.position])) {
         this.position += 1;
@@ -432,6 +1009,7 @@
       const start = this.position;
       let depth = 1;
       while (this.position < this.input.length && depth > 0) {
+        this.consumeStep();
         const character = this.input[this.position];
         const escaped = this.position > 0 && this.input[this.position - 1] === '\\';
         if (!escaped && character === '{') depth += 1;
@@ -448,6 +1026,7 @@
       const start = this.position;
       let depth = 1;
       while (this.position < this.input.length && depth > 0) {
+        this.consumeStep();
         if (this.input[this.position] === '[') depth += 1;
         if (this.input[this.position] === ']') depth -= 1;
         this.position += 1;
@@ -465,6 +1044,7 @@
       }
       const start = this.position;
       while (this.position < this.input.length && /[A-Za-z]/.test(this.input[this.position])) {
+        this.consumeStep();
         this.position += 1;
       }
       return this.input.slice(start, this.position);
@@ -477,6 +1057,7 @@
       let depth = 1;
       let cursor = this.position;
       while (cursor < this.input.length) {
+        this.consumeStep();
         const nextBegin = this.input.indexOf(beginToken, cursor);
         const nextEnd = this.input.indexOf(endToken, cursor);
         if (nextEnd < 0) {
@@ -549,11 +1130,29 @@
       return skipped;
     }
 
+    parseNestedSource(source, mode) {
+      return this.nested(() => {
+        const parsed = new LatexParser(source, {
+          calculatorMode: mode === 'calculator',
+          faithfulMode: mode === 'faithful',
+          budget: this.budget
+        }).parse();
+        if (mode === 'faithful') return formatFaithfulMathText(parsed);
+        if (mode === 'unicode') return formatMathText(parsed);
+        return parsed;
+      });
+    }
+
     parseCalculatorInner(source) {
-      return new LatexParser(source, {
-        calculatorMode: true,
-        budget: this.budget
-      }).parse();
+      return this.parseNestedSource(source, 'calculator');
+    }
+
+    parseUnicodeInner(source) {
+      return this.parseNestedSource(source, 'unicode');
+    }
+
+    parseFaithfulInner(source) {
+      return this.parseNestedSource(source, 'faithful');
     }
 
     rawDelimiterAt(position) {
@@ -713,6 +1312,21 @@
       return call;
     }
 
+    parseFaithfulFunction(symbol) {
+      const scripts = { '^': '', '_': '' };
+      this.skipCalculatorSpacing();
+      while (this.input[this.position] === '^' || this.input[this.position] === '_') {
+        const marker = this.input[this.position];
+        this.position += 1;
+        scripts[marker] = this.parseArgument();
+        this.skipCalculatorSpacing();
+      }
+      return symbol +
+        (scripts['_'] ? toFaithfulScript(scripts['_'], SUBSCRIPTS, '_') : '') +
+        (scripts['^'] ? toFaithfulScript(scripts['^'], SUPERSCRIPTS, '^') : '') +
+        FAITHFUL_FUNCTION_APPLY;
+    }
+
     parseCalculatorAggregate(name) {
       const scripts = { '^': '', '_': '' };
       this.skipCalculatorSpacing();
@@ -749,9 +1363,14 @@
         return this.parseCalculatorAggregate(name);
       }
       if (this.calculatorMode && name === 'mid') return RELATIONAL_MID;
+      if (this.faithfulMode && name === 'lvert') return FAITHFUL_ABS_OPEN;
+      if (this.faithfulMode && name === 'rvert') return FAITHFUL_ABS_CLOSE;
+      if (this.faithfulMode && name === 'lVert') return FAITHFUL_NORM_OPEN;
+      if (this.faithfulMode && name === 'rVert') return FAITHFUL_NORM_CLOSE;
       if (Object.prototype.hasOwnProperty.call(SYMBOLS, name)) {
         const symbol = SYMBOLS[name];
         if (this.calculatorMode && CALCULATOR_FUNCTIONS.has(symbol)) return this.parseCalculatorFunction(symbol);
+        if (this.faithfulMode && CALCULATOR_FUNCTIONS.has(symbol)) return this.parseFaithfulFunction(symbol);
         return symbol;
       }
       if (name === '\\') return ' ';
@@ -762,10 +1381,16 @@
 
       if (name === 'frac' || name === 'dfrac' || name === 'tfrac' || name === 'cfrac') {
         const numerator = this.parseArgument();
+        const denominatorSource = this.faithfulMode ? this.peekArgumentSource() : '';
         const denominator = this.parseArgument();
         if (this.calculatorMode) {
           return calculatorFraction(unicodeToCalculator(numerator), unicodeToCalculator(denominator));
         }
+        if (this.faithfulMode) return faithfulFraction(
+          numerator,
+          denominator,
+          faithfulLatexDenominatorOptions(denominatorSource)
+        );
         return '(' + numerator + ')/(' + denominator + ')';
       }
       if (name === 'binom' || name === 'dbinom' || name === 'tbinom') {
@@ -774,13 +1399,18 @@
       if (name === 'sqrt') {
         const index = this.parseOptionalArgument();
         const radicand = this.parseArgument();
-        if (index && this.calculatorMode) return '(' + radicand + ')^(1/(' + latexToUnicode(index) + '))';
+        if (index && this.calculatorMode) return '(' + radicand + ')^(1/(' + this.parseUnicodeInner(index) + '))';
         if (this.calculatorMode) return 'sqrt(' + stripBalancedOuterParentheses(radicand) + ')';
-        const root = index ? toScript(latexToUnicode(index), SUPERSCRIPTS, '^') + '√' : '√';
+        if (this.faithfulMode) {
+          const faithfulIndex = index ? this.parseFaithfulInner(index) : '';
+          return faithfulRoot(faithfulIndex, radicand);
+        }
+        const root = index ? toScript(this.parseUnicodeInner(index), SUPERSCRIPTS, '^') + '√' : '√';
         return root + '(' + radicand + ')';
       }
       if (['text', 'textrm', 'textnormal', 'mbox', 'hbox'].includes(name)) {
-        return this.readRawGroup().replace(/~/g, ' ').replace(/\\([%_$#&{}])/g, '$1');
+        const value = this.readRawGroup().replace(/~/g, ' ').replace(/\\([%_$#&{}])/g, '$1');
+        return this.faithfulMode ? protectFaithfulText(value) : value;
       }
       if (['mathrm', 'mathbf', 'mathit', 'mathsf', 'mathtt', 'boldsymbol', 'bm', 'operatorname'].includes(name)) {
         if (name === 'operatorname' && this.input[this.position] === '*') this.position += 1;
@@ -789,6 +1419,17 @@
           const declared = DECLARED_OPERATOR_START + value + DECLARED_OPERATOR_END;
           return this.parseCalculatorFunction(declared);
         }
+        if (name === 'operatorname' && this.faithfulMode && /^[A-Za-z][A-Za-z0-9_]*$/.test(value)) {
+          return this.parseFaithfulFunction(value);
+        }
+        if (this.faithfulMode && name !== 'operatorname') {
+          const variants = {
+            mathrm: 'normal', mathbf: 'bold', mathit: 'italic',
+            mathsf: 'sans-serif', mathtt: 'monospace',
+            boldsymbol: 'bold-italic', bm: 'bold-italic'
+          };
+          return applyMathVariant(value, variants[name], name);
+        }
         if (this.calculatorMode && /^[A-Za-z][A-Za-z0-9_]*$/.test(value)) {
           return DECLARED_IDENTIFIER_START + value + DECLARED_IDENTIFIER_END;
         }
@@ -796,8 +1437,13 @@
           ? '(' + value + ')'
           : value;
       }
-      if (['mathbb', 'Bbb'].includes(name)) return applyMathVariant(this.parseArgument(), 'double-struck');
-      if (['mathcal', 'mathscr', 'mathfrak'].includes(name)) return this.parseArgument();
+      if (['mathbb', 'Bbb'].includes(name)) {
+        return applyMathVariant(this.parseArgument(), 'double-struck', this.faithfulMode ? name : 'double-struck');
+      }
+      if (['mathcal', 'mathscr', 'mathfrak'].includes(name)) {
+        const variants = { mathcal: 'script', mathscr: 'script', mathfrak: 'fraktur' };
+        return applyMathVariant(this.parseArgument(), variants[name], this.faithfulMode ? name : variants[name]);
+      }
       if (['color', 'class', 'cssId', 'style'].includes(name)) {
         this.parseArgument();
         return this.parseArgument();
@@ -820,7 +1466,12 @@
           name === 'Big' || name === 'bigg' || name === 'Bigg' || name === 'bigl' ||
           name === 'bigr' || name === 'Bigl' || name === 'Bigr' || name === 'biggl' ||
           name === 'biggr' || name === 'Biggl' || name === 'Biggr') {
-        return this.parseDelimiter();
+        const delimiter = this.parseDelimiter();
+        if (this.faithfulMode && name === 'left' && delimiter === '|') return FAITHFUL_ABS_OPEN;
+        if (this.faithfulMode && name === 'right' && delimiter === '|') return FAITHFUL_ABS_CLOSE;
+        if (this.faithfulMode && name === 'left' && delimiter === '‖') return FAITHFUL_NORM_OPEN;
+        if (this.faithfulMode && name === 'right' && delimiter === '‖') return FAITHFUL_NORM_CLOSE;
+        return delimiter;
       }
       if (name === 'not') {
         while (this.position < this.input.length && /\s/.test(this.input[this.position])) this.position += 1;
@@ -834,38 +1485,61 @@
       }
       if (name === 'pmod' || name === 'pod') return '(' + (name === 'pmod' ? 'mod ' : '') + this.parseArgument() + ')';
       if (name === 'mod' || name === 'bmod') return ' mod ';
+      if (name === 'space') return ' ';
       if (name === 'quad' || name === 'qquad' || name === 'enspace' || name === 'hspace' || name === 'hspace*') {
         if (name === 'hspace' && this.input[this.position] === '*') this.position += 1;
         if (name.startsWith('hspace')) this.parseArgument();
         return ' ';
       }
       if (['displaystyle', 'textstyle', 'scriptstyle', 'scriptscriptstyle', 'limits', 'nolimits'].includes(name)) return '';
-      if (name === 'kern' || name === 'mkern' || name === 'raisebox' || name === 'rule') {
+      if (name === 'kern' || name === 'mkern' || name === 'hskip' || name === 'mskip') {
+        this.consumeDimension();
+        return this.faithfulMode ? ' ' : '';
+      }
+      if (name === 'raisebox' || name === 'rule') {
         this.parseArgument();
         if (name === 'raisebox') return this.parseArgument();
         return '';
       }
-      if (name === 'overline' || name === 'bar' || name === 'overbrace') return this.parseArgument() + '\u0305';
-      if (name === 'underline') return this.parseArgument() + '\u0332';
-      if (name === 'underbrace') return this.parseArgument() + '\u0332';
-      if (name === 'hat' || name === 'widehat') return this.parseArgument() + '\u0302';
-      if (name === 'tilde' || name === 'widetilde') return this.parseArgument() + '\u0303';
-      if (name === 'vec' || name === 'overrightarrow') return this.parseArgument() + '\u20d7';
-      if (name === 'overleftarrow') return this.parseArgument() + '\u20d6';
-      if (name === 'dot') return this.parseArgument() + '\u0307';
-      if (name === 'ddot') return this.parseArgument() + '\u0308';
-      if (name === 'acute') return this.parseArgument() + '\u0301';
-      if (name === 'grave') return this.parseArgument() + '\u0300';
-      if (name === 'breve') return this.parseArgument() + '\u0306';
-      if (name === 'check') return this.parseArgument() + '\u030c';
+      const accents = {
+        overline: '\u0305', bar: '\u0305', overbrace: '\u0305',
+        underline: '\u0332', underbrace: '\u0332', hat: '\u0302', widehat: '\u0302',
+        tilde: '\u0303', widetilde: '\u0303', vec: '\u20d7', overrightarrow: '\u20d7',
+        overleftarrow: '\u20d6', dot: '\u0307', ddot: '\u0308', acute: '\u0301',
+        grave: '\u0300', breve: '\u0306', check: '\u030c', mathring: '\u030a'
+      };
+      if (Object.prototype.hasOwnProperty.call(accents, name)) {
+        const value = this.parseArgument();
+        return this.faithfulMode ? faithfulAccent(name, value, accents[name]) : value + accents[name];
+      }
       if (name === 'overset' || name === 'stackrel') {
         const over = this.parseArgument();
         const base = this.parseArgument();
+        if (this.faithfulMode) {
+          const readableBase = resolveFaithfulScopes(base).trim();
+          if (/^(?:∑|∏|∐|∫|∬|∭|∮|lim)$/u.test(readableBase)) {
+            return base + toFaithfulScript(over, SUPERSCRIPTS, '^');
+          }
+          const annotation = 'overset(' + over + ', ' + base + ')';
+          return /^[=+−±∓<>≠≈≃≅≡≤≥∈∉∋∌⊂⊃⊆⊇⊊⊋∣-∦∝←-⇿⟵-⟺]$/u.test(readableBase)
+            ? ' ' + annotation + ' '
+            : annotation;
+        }
         return base + toScript(over, SUPERSCRIPTS, '^');
       }
       if (name === 'underset') {
         const under = this.parseArgument();
         const base = this.parseArgument();
+        if (this.faithfulMode) {
+          const readableBase = resolveFaithfulScopes(base).trim();
+          if (/^(?:∑|∏|∐|∫|∬|∭|∮|lim)$/u.test(readableBase)) {
+            return base + toFaithfulScript(under, SUBSCRIPTS, '_');
+          }
+          const annotation = 'underset(' + under + ', ' + base + ')';
+          return /^[=+−±∓<>≠≈≃≅≡≤≥∈∉∋∌⊂⊃⊆⊇⊊⊋∣-∦∝←-⇿⟵-⟺]$/u.test(readableBase)
+            ? ' ' + annotation + ' '
+            : annotation;
+        }
         return base + toScript(under, SUBSCRIPTS, '_');
       }
       if (name === 'begin') {
@@ -873,7 +1547,10 @@
         const body = this.readEnvironmentBody(environment);
         return convertLatexEnvironment(environment, body, {
           calculatorMode: this.calculatorMode,
-          convertCell: (cell) => this.calculatorMode ? this.parseCalculatorInner(cell) : latexToUnicode(cell)
+          faithfulMode: this.faithfulMode,
+          convertCell: (cell) => this.calculatorMode
+            ? this.parseCalculatorInner(cell)
+            : (this.faithfulMode ? this.parseFaithfulInner(cell) : this.parseUnicodeInner(cell))
         });
       }
       if (name === 'end') {
@@ -885,13 +1562,32 @@
         const value = this.parseArgument();
         return name === 'tag' ? ' (' + value + ')' : '';
       }
+      if (name === 'prescript') {
+        const upper = this.parseArgument();
+        const lower = this.parseArgument();
+        const base = this.parseArgument();
+        if (this.faithfulMode) {
+          const upperScript = toFaithfulScript(upper, SUPERSCRIPTS, '^');
+          const lowerScript = toFaithfulScript(lower, SUBSCRIPTS, '_');
+          if (upperScript.startsWith('^') || lowerScript.startsWith('_')) {
+            return 'prescript(' + upper + ', ' + lower + ', ' + base + ')';
+          }
+          return upperScript + lowerScript + base;
+        }
+        return toScript(upper, SUPERSCRIPTS, '^') + toScript(lower, SUBSCRIPTS, '_') + base;
+      }
       if (['boxed', 'cancel', 'bcancel', 'xcancel', 'cancelto'].includes(name)) {
-        if (name === 'cancelto') this.parseArgument();
+        const target = name === 'cancelto' ? this.parseArgument() : '';
         const value = this.parseArgument();
+        if (this.faithfulMode) {
+          return name === 'cancelto'
+            ? 'cancelto(' + target + ', ' + value + ')'
+            : name + '(' + value + ')';
+        }
         return name === 'boxed' ? 'boxed(' + value + ')' : value;
       }
       if (name === 'substack') {
-        return splitLatexTopLevel(this.readRawGroup(), 'row').map(latexToUnicode).join(', ');
+        return splitLatexTopLevel(this.readRawGroup(), 'row').map((row) => this.parseUnicodeInner(row)).join(', ');
       }
       if (name === 'ce' || name === 'pu') return this.readRawGroup();
 
@@ -925,10 +1621,59 @@
 
   function latexToUnicode(input) {
     try {
-      return formatMathText(new LatexParser(input).parse());
-    } catch (error) {
-      if (error && error.code === LATEX_BUDGET_ERROR) return '';
-      throw error;
+      const source = String(input == null ? '' : input);
+      if (source.length > MAX_MATH_SOURCE_LENGTH) return '';
+      return formatMathText(new LatexParser(source).parse());
+    } catch (_error) {
+      // Page-authored TeX must never be able to abort a copy event. Budget,
+      // stack, parser, and host-object failures all decline conversion.
+      return '';
+    }
+  }
+
+  function formatFaithfulMathText(input, retainProtectedText) {
+    let text = resolveFaithfulScopes(cleanClipboardText(String(input == null ? '' : input)));
+    text = text
+      .replace(/([0-9])\u2062(?=[0-9])/g, '$1⋅')
+      .replace(/[\u2061]/g, '')
+      .replace(/[\u2062]/g, '')
+      .replace(/[\u2063]/g, ', ')
+      .replace(/[\u2064]/g, '+')
+      .replace(new RegExp(FAITHFUL_FUNCTION_APPLY + '(?=\\s*\\()', 'g'), '')
+      .replace(new RegExp(FAITHFUL_FUNCTION_APPLY, 'g'), ' ')
+      .replace(new RegExp(FAITHFUL_ABS_OPEN + '\\s*', 'g'), '|')
+      .replace(new RegExp('\\s*' + FAITHFUL_ABS_CLOSE, 'g'), '|')
+      .replace(new RegExp(FAITHFUL_NORM_OPEN + '\\s*', 'g'), '‖')
+      .replace(new RegExp('\\s*' + FAITHFUL_NORM_CLOSE, 'g'), '‖')
+      .replace(/([\p{L}\p{N}\p{M})\]}\u2032-\u2034])('+)/gu,
+        (_match, base, primes) => base + primes.replace(/'/g, '′'))
+      .replace(/[\t\r\n ]+/g, ' ')
+      .replace(/-/g, '−')
+      .replace(/\s*([=≠≈≃≅≡≤≥<>∈∉∋∌⊂⊃⊆⊇⊊⊋≺≻≼≽∝⇐⇒⇔↔→←↦∣-∦⟵-⟺])\s*/g, ' $1 ')
+      .replace(/([|∣∥‖])\s+(?=[₀-₟⁰-⁹¹²³⁺⁻⁼⁽⁾ⁿⁱᵢⱼᵦ-ᵪ_^])/gu, '$1')
+      .replace(/([\p{L}\p{N}\p{M})\]}])\s*([+−-])\s*(?=[\p{L}\p{N}\p{M}(\[{\u221a])/gu, '$1 $2 ')
+      .replace(/\s*([×÷·⋅∗∙∖±∓∪∩∧∨⊕⊗])\s*/g, ' $1 ')
+      .replace(/\s*,\s*/g, ', ')
+      .replace(/\s*;\s*/g, '; ')
+      .replace(/([([{\u27e8\u2308\u230a])\s+/g, '$1')
+      .replace(/\s+([)\]}\u27e9\u2309\u230b,;])/g, '$1')
+      .replace(/√\s+\(/g, '√(')
+      .replace(/(lim(?![\p{Ll}\p{Lu}])(?:_\([^)]*\)|[\u2080-\u209cᵢⱼᵦ-ᵪ]+)?(?:\^\([^)]*\)|[⁰-⁹⁺⁻⁼⁽⁾ⁿⁱ]+)?)(?=[\p{Ll}\p{Lu}\p{Nd}√(|‖])/gu, '$1 ')
+      .replace(/((?:∑|∏|∐|∫|∬|∭|∮)(?:_\([^)]*\)|[\u2080-\u209cᵢⱼᵦ-ᵪ]+)?(?:\^\([^)]*\)|[⁰-⁹⁺⁻⁼⁽⁾ⁿⁱ¹²³]+)?)(?=[\p{Ll}\p{Lu}\p{Nd}√(|‖])/gu, '$1 ')
+      .replace(/[ ]{2,}/g, ' ')
+      .trim();
+    text = text.replace(/[\ue100-\ue10d]/g, '');
+    if (!retainProtectedText) text = restoreFaithfulText(text);
+    return text.normalize ? text.normalize('NFC') : text;
+  }
+
+  function latexToFaithful(input) {
+    try {
+      const source = String(input == null ? '' : input);
+      if (source.length > MAX_MATH_SOURCE_LENGTH) return '';
+      return formatFaithfulMathText(new LatexParser(source, { faithfulMode: true }).parse());
+    } catch (_error) {
+      return '';
     }
   }
 
@@ -1264,10 +2009,11 @@
 
   function latexToCalculator(input) {
     try {
-      return unicodeToCalculator(formatMathText(new LatexParser(input, { calculatorMode: true }).parse()));
-    } catch (error) {
-      if (error && error.code === LATEX_BUDGET_ERROR) return '';
-      throw error;
+      const source = String(input == null ? '' : input);
+      if (source.length > MAX_MATH_SOURCE_LENGTH) return '';
+      return unicodeToCalculator(formatMathText(new LatexParser(source, { calculatorMode: true }).parse()));
+    } catch (_error) {
+      return '';
     }
   }
 
@@ -1286,6 +2032,25 @@
     return false;
   }
 
+  function isCurrencyDollar(text, index) {
+    if (text[index] !== '$' || text[index + 1] === '$' || !/^\d/u.test(text.slice(index + 1))) return false;
+    let end = index + 1;
+    while (end < text.length) {
+      end = text.indexOf('$', end);
+      if (end < 0) return true;
+      if (!isEscaped(text, end)) break;
+      end += 1;
+    }
+    if (end < 0) return true;
+    const source = text.slice(index + 1, end);
+    // A numeric LaTeX expression such as `$5 + 3$` has one real closing
+    // delimiter. In ordinary currency arithmetic (`$5 + $10 = $15`), the
+    // next dollar starts another amount, so none of those currency signs may
+    // be paired as TeX delimiters.
+    const nextStartsAmount = /^\$\d/u.test(text.slice(end));
+    return nextStartsAmount || !looksLikeLatex(source);
+  }
+
   function convertDelimitedLatexText(input, outputMode) {
     const text = String(input);
     let output = '';
@@ -1296,6 +2061,7 @@
       let rendered;
       if (outputMode === 'latex') rendered = display ? '$$' + source + '$$' : '$' + source + '$';
       else if (outputMode === 'calculator') rendered = latexToCalculator(source);
+      else if (outputMode === 'faithful') rendered = latexToFaithful(source);
       else {
         const unicode = latexToUnicode(source);
         rendered = outputMode === 'ascii' ? unicodeToAscii(unicode) : unicode;
@@ -1315,7 +2081,7 @@
         opener = '\\['; closer = '\\]'; display = true;
       } else if (text.startsWith('\\(', cursor) && !isEscaped(text, cursor)) {
         opener = '\\('; closer = '\\)';
-      } else if (text[cursor] === '$' && !isEscaped(text, cursor)) {
+      } else if (text[cursor] === '$' && !isEscaped(text, cursor) && !isCurrencyDollar(text, cursor)) {
         opener = '$'; closer = '$';
       }
 
@@ -1382,7 +2148,15 @@
     value = value.replace(/[\u2061-\u2064]/g, (character) => ({
       '\u2061': ' ', '\u2062': '·', '\u2063': ', ', '\u2064': '+'
     })[character]);
-    return applyMathVariant(value, node.getAttribute && node.getAttribute('mathvariant'));
+    let variant = '';
+    for (let current = node; current && current.nodeType === 1; current = current.parentElement) {
+      if (current.hasAttribute && current.hasAttribute('mathvariant')) {
+        variant = current.getAttribute('mathvariant') || '';
+        break;
+      }
+      if ((current.localName || '').toLowerCase() === 'math') break;
+    }
+    return applyMathVariant(value, variant);
   }
 
   function serializeContentMathML(node) {
@@ -2077,6 +2851,560 @@
     return formatMathText(serializeMathMLNode(mathElement));
   }
 
+  function faithfulResult(text, kind, options) {
+    return { text: String(text == null ? '' : text), kind: kind || 'operand', ...(options || {}) };
+  }
+
+  function faithfulOperator(node) {
+    const raw = normalizedMathToken(node.textContent || '');
+    if (!raw) return faithfulResult('', 'space');
+    const escapedRaw = escapeFaithfulSentinelCollisions(raw);
+    if (escapedRaw !== raw) return faithfulResult(escapedRaw, 'operator', { compact: true });
+    if (raw === '\u2061') return faithfulResult('', 'apply');
+    if (raw === '\u2062') return faithfulResult('', 'invisibleTimes');
+    if (raw === '\u2063') return faithfulResult(',', 'separator');
+    if (raw === '\u2064') return faithfulResult('+', 'operator');
+    if (isVerticalBarToken(raw)) {
+      const fence = (node.getAttribute && node.getAttribute('fence') || '').toLowerCase();
+      const stretchy = (node.getAttribute && node.getAttribute('stretchy') || '').toLowerCase();
+      const explicitFence = fence === 'true' || stretchy === 'false';
+      const explicitRelation = fence === 'false';
+      const doubled = /[‖∥‗]/u.test(raw);
+      if (raw === '∥' && (explicitRelation || !explicitFence)) return faithfulResult('∥', 'relation');
+      return faithfulResult(doubled ? '‖' : (raw === '∣' ? '∣' : '|'), 'bar', {
+        barRole: explicitFence ? 'fence' : (explicitRelation ? 'relation' : 'ambiguous'),
+        fenceText: doubled ? '‖' : '|'
+      });
+    }
+    if ('([{⟨⌈⌊'.includes(raw)) return faithfulResult(raw, 'open');
+    if (')]}\u27e9\u2309\u230b'.includes(raw)) return faithfulResult(raw, 'close');
+    if (raw === ',' || raw === ';' || raw === ':') return faithfulResult(raw, 'separator');
+    if (/^[′″‴!]+$/u.test(raw)) return faithfulResult(raw.replace(/'/g, '′'), 'postfix');
+    const relations = /^[=≠≈≃≅≡≤≥<>∈∉∋∌⊂⊃⊆⊇⊊⊋≺≻≼≽∣∤∥∦∝⇐⇒⇔↔→←↦⟵-⟺]$/u;
+    return faithfulResult(raw, relations.test(raw) ? 'relation' : 'operator', {
+      compact: /^[/*]$/u.test(raw)
+    });
+  }
+
+  function faithfulCanEnd(token) {
+    return token && ['identifier', 'number', 'operand', 'close', 'postfix', 'large'].includes(token.kind);
+  }
+
+  function faithfulCanStart(token) {
+    return token && ['identifier', 'number', 'operand', 'open', 'large'].includes(token.kind);
+  }
+
+  function faithfulSignificantToken(tokens, start, direction) {
+    for (let index = start; index >= 0 && index < tokens.length; index += direction) {
+      if (!['space', 'apply'].includes(tokens[index].kind)) return { token: tokens[index], index };
+    }
+    return null;
+  }
+
+  function faithfulBarPairs(tokens) {
+    const stacks = { '|': [], '‖': [] };
+    const tentative = [];
+    const closing = new Set();
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index];
+      if (token.kind !== 'bar' || token.barRole === 'relation') continue;
+      const fenceText = token.fenceText || '|';
+      const stack = stacks[fenceText];
+      const previous = faithfulSignificantToken(tokens, index - 1, -1);
+      const previousCanEnd = previous && (faithfulCanEnd(previous.token) || closing.has(previous.index));
+      if (stack.length && previousCanEnd) {
+        const open = stack.pop();
+        tentative.push({ open, close: index });
+        closing.add(index);
+      } else if (stack.length < MAX_MATHML_DEPTH) stack.push(index);
+    }
+    const leftBoundary = (entry) => !entry || ['operator', 'relation', 'open', 'separator', 'bar'].includes(entry.token.kind);
+    const rightBoundary = (entry) => !entry || ['operator', 'relation', 'close', 'separator', 'postfix', 'bar'].includes(entry.token.kind);
+    const pairs = new Map();
+    for (const pair of tentative) {
+      const left = faithfulSignificantToken(tokens, pair.open - 1, -1);
+      const right = faithfulSignificantToken(tokens, pair.close + 1, 1);
+      const explicit = tokens[pair.open].barRole === 'fence' && tokens[pair.close].barRole === 'fence';
+      if (explicit || leftBoundary(left) || rightBoundary(right)) pairs.set(pair.open, pair.close);
+    }
+    return pairs;
+  }
+
+  function serializeMathMLFaithfulTokens(tokens, depth) {
+    const level = depth || 0;
+    if (level > MAX_MATHML_DEPTH) return tokens.map((token) => token.text || '').join('');
+    const pairs = faithfulBarPairs(tokens);
+    const collapse = (start, end, nestedDepth) => {
+      const collapsed = [];
+      if (nestedDepth > MAX_MATHML_DEPTH) return tokens.slice(start, end);
+      for (let index = start; index < end; index += 1) {
+        const token = tokens[index];
+        const close = pairs.get(index);
+        if (close != null && close < end) {
+          const inner = serializeMathMLFaithfulLinear(collapse(index + 1, close, nestedDepth + 1));
+          const fence = token.fenceText || '|';
+          collapsed.push(faithfulResult(fence + inner + fence + (tokens[close].scriptSuffix || ''), 'operand', {
+            subscripted: Boolean(tokens[close].subscripted),
+            variableLike: false
+          }));
+          index = close;
+          continue;
+        }
+        if (token.kind === 'bar') {
+          collapsed.push(faithfulResult(
+            (token.barRole === 'fence' ? token.fenceText : token.text) + (token.scriptSuffix || ''),
+            'relation'
+          ));
+        } else collapsed.push(token);
+      }
+      return collapsed;
+    };
+    return serializeMathMLFaithfulLinear(collapse(0, tokens.length, 0));
+  }
+
+  function serializeMathMLFaithfulLinear(tokens) {
+    let output = '';
+    let previous = null;
+    let applyPending = false;
+    let invisibleTimesPending = false;
+    let explicitSpace = false;
+    const trimEnd = () => { output = output.replace(/\s+$/u, ''); };
+    for (const token of tokens) {
+      if (!token || token.kind === 'space') {
+        explicitSpace = Boolean(output);
+        continue;
+      }
+      if (token.kind === 'apply') {
+        applyPending = true;
+        continue;
+      }
+      if (token.kind === 'invisibleTimes') {
+        invisibleTimesPending = true;
+        continue;
+      }
+      if (token.kind === 'relation') {
+        trimEnd();
+        output += ' ' + token.text + ' ';
+        previous = token;
+        explicitSpace = false;
+        applyPending = false;
+        continue;
+      }
+      if (token.kind === 'separator') {
+        trimEnd();
+        output += token.text + (token.text === ',' || token.text === ';' ? ' ' : ' ');
+        previous = token;
+        explicitSpace = false;
+        applyPending = false;
+        continue;
+      }
+      if (token.kind === 'operator') {
+        const unary = !previous || ['operator', 'relation', 'open', 'separator'].includes(previous.kind);
+        trimEnd();
+        if (token.compact) output += token.text;
+        else if (unary && /^[+−±∓¬-]$/u.test(token.text)) output += token.text;
+        else output += ' ' + token.text + ' ';
+        previous = token;
+        explicitSpace = false;
+        applyPending = false;
+        continue;
+      }
+      if (token.kind === 'postfix') {
+        trimEnd();
+        output += token.text;
+        previous = token;
+        explicitSpace = false;
+        applyPending = false;
+        continue;
+      }
+      if (applyPending) {
+        if ((token.functionArgumentScope && !faithfulExpressionIsAtomic(resolveFaithfulScopes(token.text))) ||
+            token.scriptFence) {
+          trimEnd();
+          output += '(' + resolveFaithfulScopes(token.text) + ')';
+          previous = token;
+          explicitSpace = false;
+          applyPending = false;
+          invisibleTimesPending = false;
+          continue;
+        }
+        if (token.kind !== 'open' && output && !/\s$/u.test(output)) output += ' ';
+      } else if (invisibleTimesPending) {
+        const numericMerge = previous && previous.kind === 'number' && token.kind === 'number';
+        const wordMerge = previous && previous.kind === 'identifier' && token.kind === 'identifier' &&
+          (Array.from(previous.text).length > 1 || Array.from(token.text).length > 1);
+        if (numericMerge || wordMerge) output += '⋅';
+      } else if (previous && previous.kind === 'large') {
+        if (output && !/\s$/u.test(output)) output += ' ';
+      } else if (explicitSpace && previous && faithfulCanEnd(previous) && faithfulCanStart(token) &&
+                 !/\s$/u.test(output)) {
+        output += ' ';
+      }
+      output += token.text;
+      previous = token;
+      explicitSpace = false;
+      applyPending = false;
+      invisibleTimesPending = false;
+    }
+    return formatFaithfulMathText(output, true);
+  }
+
+  function faithfulPiecewiseRow(children) {
+    const meaningful = children.filter((child) =>
+      !['mspace', 'annotation', 'annotation-xml', 'mphantom', 'none'].includes((child.localName || '').toLowerCase())
+    );
+    if (meaningful.length !== 2 || normalizedMathToken(meaningful[0].textContent || '') !== '{' ||
+        (meaningful[1].localName || '').toLowerCase() !== 'mtable') return null;
+    const rows = elementChildren(meaningful[1]).filter((row) =>
+      ['mtr', 'mlabeledtr'].includes((row.localName || '').toLowerCase())
+    );
+    if (!rows.length) return null;
+    const branches = rows.map((row) => {
+      const cells = elementChildren(row).filter((cell) => (cell.localName || '').toLowerCase() === 'mtd')
+        .map((cell) => serializeMathMLFaithfulNode(cell).text);
+      if (cells.length < 2) return cells[0] || '';
+      const condition = cells.slice(1).join(' ').trim();
+      return cells[0] + (/^(?:if|when|for|otherwise)\b/iu.test(condition) ? ' ' : ' if ') + condition;
+    });
+    return faithfulResult('{' + branches.join('; ') + '}', 'operand');
+  }
+
+  function serializeMathMLFaithfulRow(children) {
+    const transparent = new Set(['math', 'mrow', 'mstyle', 'mpadded']);
+    const flattenSequence = (nodes) => {
+      const flattened = [];
+      for (const node of nodes) {
+        const name = String(node && (node.localName || node.nodeName) || '').toLowerCase();
+        if (transparent.has(name)) {
+          const nestedChildren = elementChildren(node);
+          const piecewise = faithfulPiecewiseRow(nestedChildren);
+          if (piecewise) {
+            flattened.push(piecewise);
+          } else if (name === 'mrow') {
+            // A nested presentation row is often the only surviving evidence
+            // of an invisible TeX group. Keep it as a soft scope: the scope
+            // resolver adds parentheses only when adjacent factors, scripts,
+            // or division would otherwise change the rendered meaning.
+            flattened.push(faithfulResult(
+              faithfulMarkedScope(serializeMathMLFaithfulRow(nestedChildren), false),
+              'operand',
+              {
+                functionArgumentScope: Boolean(
+                  flattened.length && flattened[flattened.length - 1].kind === 'apply'
+                )
+              }
+            ));
+          } else {
+            flattened.push(...flattenSequence(nestedChildren));
+          }
+          continue;
+        }
+        if (name === 'semantics') {
+          const presentation = presentationMathNode(node);
+          if (presentation) flattened.push(...flattenSequence([presentation]));
+          continue;
+        }
+        flattened.push(serializeMathMLFaithfulNode(node));
+      }
+      return flattened;
+    };
+    const tokens = flattenSequence(children).filter((token) =>
+      token.text || ['space', 'apply', 'invisibleTimes'].includes(token.kind)
+    );
+    for (let index = 1; index + 1 < tokens.length; index += 1) {
+      if (!tokens[index].zeroLineFraction || tokens[index - 1].kind !== 'open' ||
+          tokens[index - 1].text !== '(' || tokens[index + 1].kind !== 'close' ||
+          tokens[index + 1].text !== ')') continue;
+      tokens.splice(index - 1, 3, faithfulResult(
+        'C(' + tokens[index].numerator + ', ' + tokens[index].denominator + ')',
+        'operand'
+      ));
+      index -= 1;
+    }
+    for (let index = 1; index + 1 < tokens.length; index += 1) {
+      if (tokens[index].tableText == null || tokens[index - 1].kind !== 'open' || tokens[index + 1].kind !== 'close') continue;
+      tokens[index] = { ...tokens[index], text: tokens[index].tableText };
+    }
+    return serializeMathMLFaithfulTokens(tokens, 0);
+  }
+
+  function faithfulMathMLDenominatorOptions(node) {
+    if (!node || node.nodeType !== 1) return {};
+    const name = String(node.localName || node.nodeName || '').toLowerCase();
+    if (['mi', 'mn', 'msqrt', 'mroot', 'mfenced'].includes(name)) return { denominatorAtomic: true };
+    if (['msup', 'msub', 'msubsup', 'mmultiscripts', 'mover', 'munder', 'munderover'].includes(name)) {
+      return faithfulMathMLDenominatorOptions(elementChildren(node)[0]);
+    }
+    if (['math', 'mrow', 'mstyle', 'mpadded', 'semantics'].includes(name)) {
+      const meaningful = elementChildren(node).filter((child) =>
+        !['mspace', 'annotation', 'annotation-xml', 'mphantom', 'none'].includes(
+          String(child.localName || child.nodeName || '').toLowerCase()
+        )
+      );
+      if (meaningful.length === 1) return faithfulMathMLDenominatorOptions(meaningful[0]);
+    }
+    return {};
+  }
+
+  function faithfulScriptBaseText(base) {
+    const text = resolveFaithfulScopes(base && base.text || '').trim();
+    if (!text || faithfulFullyFenced(text)) return text;
+    if (base && base.scriptFence) return '(' + text + ')';
+    if (base && (base.kind === 'identifier' || base.kind === 'number' || base.variableLike)) return text;
+    return faithfulExpressionIsAtomic(text) ? text : '(' + text + ')';
+  }
+
+  function faithfulMathMLAccent(base, upper) {
+    const value = String(upper == null ? '' : upper).trim();
+    const accents = {
+      '^': ['hat', '\u0302'], 'ˆ': ['hat', '\u0302'],
+      '~': ['tilde', '\u0303'], '˜': ['tilde', '\u0303'],
+      '¯': ['overline', '\u0305'], '‾': ['overline', '\u0305'], 'ˉ': ['overline', '\u0305'], '\u0305': ['overline', '\u0305'],
+      '→': ['vec', '\u20d7'], '\u20d7': ['vec', '\u20d7'],
+      '←': ['overleftarrow', '\u20d6'], '\u20d6': ['overleftarrow', '\u20d6'],
+      '˙': ['dot', '\u0307'], '\u0307': ['dot', '\u0307'],
+      '¨': ['ddot', '\u0308'], '\u0308': ['ddot', '\u0308'],
+      'ˊ': ['acute', '\u0301'], '\u0301': ['acute', '\u0301'],
+      'ˋ': ['grave', '\u0300'], '\u0300': ['grave', '\u0300'],
+      '˘': ['breve', '\u0306'], '\u0306': ['breve', '\u0306'],
+      'ˇ': ['check', '\u030c'], '\u030c': ['check', '\u030c'],
+      '˚': ['mathring', '\u030a'], '\u030a': ['mathring', '\u030a']
+    };
+    if (!accents[value]) return null;
+    return faithfulAccent(accents[value][0], base && base.text || '', accents[value][1]);
+  }
+
+  function faithfulMathMLUnderAccent(base, lower) {
+    const value = String(lower == null ? '' : lower).trim();
+    if (!['‾', '¯', 'ˉ', '\u0305', '\u0332'].includes(value)) return null;
+    return faithfulAccent('underline', base && base.text || '', '\u0332');
+  }
+
+  function faithfulMathMLSemanticBase(node) {
+    let current = node;
+    while (current && ['math', 'mrow', 'mstyle', 'mpadded'].includes(
+      String(current.localName || current.nodeName || '').toLowerCase()
+    )) {
+      const meaningful = elementChildren(current).filter((child) =>
+        !['mspace', 'annotation', 'annotation-xml', 'mphantom', 'none'].includes(
+          String(child.localName || child.nodeName || '').toLowerCase()
+        )
+      );
+      if (meaningful.length !== 1) break;
+      current = meaningful[0];
+    }
+    return current || node;
+  }
+
+  function faithfulMenclose(notation, input) {
+    const names = String(notation == null ? '' : notation).toLowerCase().match(/[a-z]+/g) || [];
+    const remaining = new Set(names);
+    let value = String(input == null ? '' : input);
+    const up = remaining.delete('updiagonalstrike');
+    const down = remaining.delete('downdiagonalstrike');
+    if (up && down) value = 'xcancel(' + value + ')';
+    else if (up) value = 'cancel(' + value + ')';
+    else if (down) value = 'bcancel(' + value + ')';
+    if (remaining.delete('radical')) value = faithfulRoot('', value);
+    const box = remaining.delete('box');
+    const roundedBox = remaining.delete('roundedbox');
+    if (box || roundedBox) value = 'boxed(' + value + ')';
+    if (remaining.size) value = 'enclose(' + Array.from(remaining).join(' ') + ', ' + value + ')';
+    return value;
+  }
+
+  function serializeMathMLFaithfulNode(node) {
+    if (!node) return faithfulResult('', 'space');
+    if (node.nodeType === 3) return faithfulResult(escapeFaithfulSentinelCollisions(node.nodeValue || ''), 'operand');
+    if (node.nodeType !== 1) return faithfulResult('', 'space');
+    const name = (node.localName || node.nodeName || '').toLowerCase();
+    const children = elementChildren(node);
+    const childResult = (index) => serializeMathMLFaithfulNode(children[index]);
+    const childText = (index) => childResult(index).text;
+    const rowText = () => serializeMathMLFaithfulRow(children);
+
+    if (['math', 'mrow', 'mstyle', 'mpadded'].includes(name)) {
+      const piecewise = faithfulPiecewiseRow(children);
+      if (piecewise) return piecewise;
+    }
+    if (name === 'mi') {
+      const rawValue = mathMLTokenText(node).trim();
+      const value = escapeFaithfulSentinelCollisions(rawValue);
+      if (value !== rawValue) return faithfulResult(value, 'identifier', { variableLike: true });
+      if (isVerticalBarToken(value)) return faithfulOperator(node);
+      return faithfulResult(value, 'identifier', { variableLike: true });
+    }
+    if (name === 'mn') return faithfulResult(escapeFaithfulSentinelCollisions(mathMLTokenText(node).trim()), 'number');
+    if (name === 'mo') return faithfulOperator(node);
+    if (name === 'mtext' || name === 'ms' || name === 'mglyph') {
+      return faithfulResult(protectFaithfulText(mathMLTokenText(node)), 'operand');
+    }
+    if (name === 'mspace') return faithfulResult('', 'space');
+    if (name === 'mphantom' || name === 'annotation' || name === 'annotation-xml' || name === 'none') {
+      return faithfulResult('', 'space');
+    }
+    if (name === 'semantics') {
+      const presentation = children.find((item) => !['annotation', 'annotation-xml'].includes((item.localName || '').toLowerCase()));
+      return serializeMathMLFaithfulNode(presentation);
+    }
+    if (name === 'mfrac') {
+      const lineThickness = String(node.getAttribute && node.getAttribute('linethickness') || '').trim().toLowerCase();
+      if (/^(?:0|0+(?:\.0+)?(?:px|pt|em|ex|%)?)$/u.test(lineThickness)) {
+        const numerator = childText(0);
+        const denominator = childText(1);
+        return faithfulResult('stack(' + numerator + ', ' + denominator + ')', 'operand', {
+          zeroLineFraction: true,
+          numerator,
+          denominator,
+          scriptFence: true
+        });
+      }
+      return faithfulResult(
+        faithfulFraction(childText(0), childText(1), faithfulMathMLDenominatorOptions(children[1])),
+        'operand',
+        { scriptFence: true }
+      );
+    }
+    if (name === 'msqrt') return faithfulResult(faithfulRoot('', rowText()), 'operand', { scriptFence: true });
+    if (name === 'mroot') {
+      return faithfulResult(faithfulRoot(childText(1), childText(0)), 'operand', { scriptFence: true });
+    }
+    if (name === 'msup' || name === 'msub' || name === 'msubsup') {
+      const base = childResult(0);
+      const lower = name === 'msup' ? '' : childText(1);
+      const upper = name === 'msub' ? '' : childText(name === 'msup' ? 1 : 2);
+      const lowerSuffix = lower ? toFaithfulScript(lower, SUBSCRIPTS, '_') : '';
+      const upperSuffix = upper ? toFaithfulScript(upper, SUPERSCRIPTS, '^') : '';
+      if (!resolveFaithfulScopes(base.text).trim()) {
+        return faithfulResult(upperSuffix + lowerSuffix, 'operand', { prescript: true });
+      }
+      if (base.kind === 'bar') {
+        return { ...base, scriptSuffix: lowerSuffix + upperSuffix, subscripted: Boolean(lower) };
+      }
+      if (base.kind === 'open' || base.kind === 'close') {
+        return { ...base, text: base.text + lowerSuffix + upperSuffix, subscripted: Boolean(lower) };
+      }
+      const large = Boolean(mathMLLargeOperatorName(children[0]) || base.kind === 'large' || /^(?:∑|∏|∐|∫|∬|∭|∮|lim)$/u.test(base.text));
+      const scriptedBase = calculatorFunctionApplicationBase(children[0])
+        ? { ...base, variableLike: true }
+        : base;
+      return faithfulResult(faithfulScriptBaseText(scriptedBase) + lowerSuffix + upperSuffix, large ? 'large' : 'operand', {
+        subscripted: Boolean(lower),
+        variableLike: Boolean(base.variableLike)
+      });
+    }
+    if (name === 'mover' || name === 'munder' || name === 'munderover') {
+      const base = serializeMathMLFaithfulNode(faithfulMathMLSemanticBase(children[0]));
+      const lower = name === 'mover' ? '' : childText(1);
+      const upper = name === 'munder' ? '' : childText(name === 'mover' ? 1 : 2);
+      const accentAttribute = String(node.getAttribute && node.getAttribute('accent') || '').toLowerCase();
+      const accent = name === 'mover' && accentAttribute !== 'false'
+        ? faithfulMathMLAccent(base, upper)
+        : null;
+      const accentUnderAttribute = String(node.getAttribute && node.getAttribute('accentunder') || '').toLowerCase();
+      const underAccent = name === 'munder' && accentUnderAttribute !== 'false'
+        ? faithfulMathMLUnderAccent(base, lower)
+        : null;
+      if (accent || underAccent) {
+        return faithfulResult(accent || underAccent, 'operand', { variableLike: base.variableLike });
+      }
+      const large = Boolean(mathMLLargeOperatorName(children[0]) || /^(?:∑|∏|∐|∫|∬|∭|∮|lim)$/u.test(base.text));
+      if (!large) {
+        const annotationKind = ['relation', 'operator'].includes(base.kind) ? base.kind : 'operand';
+        if (name === 'mover') return faithfulResult('overset(' + upper + ', ' + base.text + ')', annotationKind);
+        if (name === 'munder') return faithfulResult('underset(' + lower + ', ' + base.text + ')', annotationKind);
+        return faithfulResult(
+          'overset(' + upper + ', underset(' + lower + ', ' + base.text + '))',
+          annotationKind
+        );
+      }
+      return faithfulResult(
+        base.text + (lower ? toFaithfulScript(lower, SUBSCRIPTS, '_') : '') +
+          (upper ? toFaithfulScript(upper, SUPERSCRIPTS, '^') : ''),
+        large ? 'large' : 'operand',
+        { subscripted: Boolean(lower), variableLike: base.variableLike }
+      );
+    }
+    if (name === 'mfenced') {
+      const open = node.getAttribute('open') == null ? '(' : node.getAttribute('open');
+      const close = node.getAttribute('close') == null ? ')' : node.getAttribute('close');
+      const separator = (node.getAttribute('separators') || ',')[0];
+      const contents = children.map((child) => serializeMathMLFaithfulNode(child).text)
+        .join(separator + (separator === ',' || separator === ';' ? ' ' : ''));
+      if (isVerticalBarToken(open) && isVerticalBarToken(close)) {
+        const fence = /[‖∥‗]/u.test(open + close) ? '‖' : '|';
+        return faithfulResult(fence + contents + fence, 'operand');
+      }
+      return faithfulResult(open + contents + close, 'operand');
+    }
+    if (name === 'mtable') {
+      const columnAlign = String(node.getAttribute && node.getAttribute('columnalign') || '')
+        .trim().toLowerCase().split(/\s+/u).filter(Boolean);
+      const columnSpacing = String(node.getAttribute && node.getAttribute('columnspacing') || '')
+        .trim().toLowerCase().split(/\s+/u).filter(Boolean);
+      const rowCellCounts = children.map((row) => elementChildren(row).length);
+      const zeroSpaced = columnSpacing.length > 0 && columnSpacing.every((value) =>
+        /^0+(?:\.0+)?(?:px|pt|em|ex|%)?$/u.test(value)
+      );
+      const alignmentLayout = zeroSpaced && (
+        (rowCellCounts.length > 0 && rowCellCounts.every((count) => count === 1) && columnAlign[0] === 'center') ||
+        (columnAlign.length >= 2 && columnAlign.every((value, index) => value === (index % 2 ? 'left' : 'right')))
+      );
+      const rows = children.map((row) => elementChildren(row)
+        .map((cell) => serializeMathMLFaithfulNode(cell).text)
+        .join(alignmentLayout ? ' ' : ', '));
+      const tableText = rows.join('; ');
+      return faithfulResult(alignmentLayout ? tableText : '[' + tableText + ']', 'operand', { tableText });
+    }
+    if (name === 'mtr' || name === 'mlabeledtr') {
+      return faithfulResult(children.map((child) => serializeMathMLFaithfulNode(child).text).join(', '), 'operand');
+    }
+    if (name === 'mtd') return faithfulResult(rowText(), 'operand');
+    if (name === 'menclose') {
+      const notation = node.getAttribute('notation') || '';
+      return faithfulResult(faithfulMenclose(notation, rowText()), 'operand');
+    }
+    if (name === 'mmultiscripts') {
+      const result = childResult(0);
+      let preText = '';
+      let postText = '';
+      let prescripts = false;
+      let subscripted = false;
+      for (let index = 1; index < children.length;) {
+        if ((children[index].localName || '').toLowerCase() === 'mprescripts') {
+          prescripts = true;
+          index += 1;
+          continue;
+        }
+        const lowerNode = children[index];
+        const upperNode = children[index + 1];
+        const lower = lowerNode && (lowerNode.localName || '').toLowerCase() !== 'none'
+          ? toFaithfulScript(serializeMathMLFaithfulNode(lowerNode).text, SUBSCRIPTS, '_')
+          : '';
+        const upper = upperNode && (upperNode.localName || '').toLowerCase() !== 'none'
+          ? toFaithfulScript(serializeMathMLFaithfulNode(upperNode).text, SUPERSCRIPTS, '^')
+          : '';
+        if (lower) {
+          subscripted = true;
+        }
+        if (prescripts) preText = upper + lower + preText;
+        else postText += lower + upper;
+        index += 2;
+      }
+      const text = preText + faithfulScriptBaseText(result) + postText;
+      return faithfulResult(text, 'operand', { subscripted, variableLike: result.variableLike });
+    }
+    if (name === 'maction') return childResult(0);
+    if (name === 'apply' || name === 'bind' || name === 'ci' || name === 'cn' || name === 'csymbol') {
+      return faithfulResult(formatFaithfulMathText(escapeFaithfulSentinelCollisions(serializeContentMathML(node)), true), 'operand');
+    }
+    return faithfulResult(rowText() || escapeFaithfulSentinelCollisions(mathMLTokenText(node)), 'operand');
+  }
+
+  function mathMLToFaithful(mathElement) {
+    return formatFaithfulMathText(serializeMathMLFaithfulNode(mathElement).text);
+  }
+
   function mathSelectionKey(input) {
     let value = cleanClipboardText(String(input == null ? '' : input));
     try {
@@ -2322,6 +3650,7 @@
       if (single && !elementChildren(single).length && isVerticalBarToken(single.textContent || '')) return '|';
       return mathMLToCalculator(mathElement);
     }
+    if (outputMode === 'faithful') return mathMLToFaithful(mathElement);
     if (outputMode === 'latex') return '$' + mathMLToLatexNode(mathElement) + '$';
     const unicode = mathMLToUnicode(mathElement);
     return outputMode === 'ascii' ? unicodeToAscii(unicode) : unicode;
@@ -2331,7 +3660,7 @@
     const selectedKey = mathSelectionKey(selectedText);
     const presentation = presentationMathNode(mathElement);
     if (!selectedKey || selectedKey.length > MAX_SELECTION_KEY_LENGTH || !presentation ||
-        !domTreeWithinBudget(presentation, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return null;
+        !domTreeWithinBudget(presentation, MAX_PARTIAL_MATCH_NODES, MAX_MATHML_DEPTH)) return null;
     const visualKey = mathSelectionKey(visualText || '');
     const structureHints = preferredStructures instanceof Set ? preferredStructures : new Set(preferredStructures || []);
     const candidates = [];
@@ -2340,6 +3669,15 @@
     const surfaceCache = new WeakMap();
     const rowNames = new Set(['math', 'mrow', 'mstyle', 'mpadded', 'menclose', 'mtd', 'mtr', 'mlabeledtr']);
     const structuralNames = new Set(['mfrac', 'msqrt', 'mroot', 'msup', 'msub', 'msubsup', 'mover', 'munder', 'munderover', 'mfenced']);
+    let partialMatchWork = 0;
+    let partialMatchBudgetExceeded = false;
+    let directVisualCandidate = null;
+
+    const spendPartialMatchWork = (amount = 1) => {
+      partialMatchWork += amount;
+      if (partialMatchWork > MAX_PARTIAL_MATCH_WORK) partialMatchBudgetExceeded = true;
+      return !partialMatchBudgetExceeded;
+    };
 
     const variantsFor = (node) => {
       if (surfaceCache.has(node)) return surfaceCache.get(node);
@@ -2349,26 +3687,35 @@
     };
     let candidateId = 0;
     const assignCandidateIds = (node) => {
-      if (!node || node.nodeType !== 1 || candidateIds.has(node)) return;
+      if (!node || node.nodeType !== 1 || candidateIds.has(node) ||
+          !spendPartialMatchWork()) return;
       candidateIds.set(node, String(candidateId++));
-      for (const child of elementChildren(node)) assignCandidateIds(child);
+      for (const child of elementChildren(node)) {
+        assignCandidateIds(child);
+        if (partialMatchBudgetExceeded) break;
+      }
     };
     assignCandidateIds(presentation);
+    if (partialMatchBudgetExceeded) return null;
 
     const addCandidate = (nodes, coherent, depth, knownVariants) => {
-      if (!nodes.length || candidates.length >= 4096) return;
+      if (!nodes.length || !spendPartialMatchWork()) return null;
+      if (candidates.length >= MAX_PARTIAL_MATCH_CANDIDATES) {
+        partialMatchBudgetExceeded = true;
+        return null;
+      }
       const variants = knownVariants || (nodes.length === 1
         ? variantsFor(nodes[0])
         : combineSurfaceVariants(nodes.map(variantsFor), 24));
-      if (!variants.includes(selectedKey)) return;
+      if (!variants.includes(selectedKey)) return null;
       const firstRange = semanticRanges.get(nodes[0]);
       const signature = nodes.map((node) => candidateIds.get(node) || '').join(':');
-      if (seen.has(signature)) return;
+      if (seen.has(signature)) return null;
       seen.add(signature);
       const wrapper = wrapMathMLFragment(nodes, mathElement.ownerDocument);
-      if (!wrapper) return;
+      if (!wrapper) return null;
       const structure = nodes.length === 1 ? (nodes[0].localName || '').toLowerCase() : '';
-      candidates.push({
+      const candidate = {
         math: wrapper,
         nodes: nodes.slice(),
         coherent,
@@ -2378,16 +3725,25 @@
         nodeCount: wrapper.querySelectorAll('*').length,
         semanticOffset: firstRange ? firstRange.start : Number.POSITIVE_INFINITY,
         visualDistance: Number.POSITIVE_INFINITY,
-        surfaceRank: Number.POSITIVE_INFINITY
-      });
+        surfaceRank: Number.POSITIVE_INFINITY,
+        directOffsetSafe: nodes.every((item) =>
+          ['mi', 'mn', 'mo', 'mtext', 'ms', 'mglyph'].includes((item.localName || '').toLowerCase())
+        )
+      };
+      candidates.push(candidate);
+      return candidate;
     };
     const addSlicedCandidate = (nodes, depth, occurrence, signature) => {
       const selectedNodes = nodes.filter(Boolean);
-      if (!selectedNodes.length || candidates.length >= 4096 || seen.has(signature)) return;
+      if (!selectedNodes.length || seen.has(signature) || !spendPartialMatchWork()) return null;
+      if (candidates.length >= MAX_PARTIAL_MATCH_CANDIDATES) {
+        partialMatchBudgetExceeded = true;
+        return null;
+      }
       const wrapper = wrapMathMLFragment(selectedNodes, mathElement.ownerDocument);
-      if (!wrapper || mathSelectionKey(wrapper.textContent || '') !== selectedKey) return;
+      if (!wrapper || mathSelectionKey(wrapper.textContent || '') !== selectedKey) return null;
       seen.add(signature);
-      candidates.push({
+      const candidate = {
         math: wrapper,
         nodes: [],
         coherent: 1,
@@ -2398,27 +3754,37 @@
         semanticOffset: occurrence,
         visualDistance: Number.isFinite(selectedOffset) ? Math.abs(occurrence - selectedOffset) : 0,
         surfaceRank: 0,
-        sliced: true
-      });
+        sliced: true,
+        directOffsetSafe: selectedNodes.every((item) =>
+          ['mi', 'mn', 'mo', 'mtext', 'ms', 'mglyph'].includes((item.localName || '').toLowerCase())
+        )
+      };
+      candidates.push(candidate);
+      return candidate;
     };
 
     const semanticRanges = new WeakMap();
     let semanticCursor = 0;
     const indexSemanticRanges = (node) => {
-      if (!node || node.nodeType !== 1) return;
+      if (!node || node.nodeType !== 1 || !spendPartialMatchWork()) return;
       const start = semanticCursor;
       const name = (node.localName || '').toLowerCase();
       if (['mi', 'mn', 'mo', 'mtext', 'ms', 'mglyph'].includes(name)) {
         semanticCursor += mathSelectionKey(mathMLTokenText(node)).length;
       } else if (!['annotation', 'annotation-xml', 'mphantom', 'none', 'mspace'].includes(name)) {
-        for (const child of elementChildren(node)) indexSemanticRanges(child);
+        for (const child of elementChildren(node)) {
+          indexSemanticRanges(child);
+          if (partialMatchBudgetExceeded) break;
+        }
       }
       semanticRanges.set(node, { start, end: semanticCursor });
     };
     indexSemanticRanges(presentation);
+    if (partialMatchBudgetExceeded) return null;
 
     const walk = (node, depth) => {
-      if (!node || node.nodeType !== 1) return;
+      if (!node || node.nodeType !== 1 || directVisualCandidate ||
+          partialMatchBudgetExceeded || !spendPartialMatchWork()) return;
       const name = (node.localName || '').toLowerCase();
       if (['annotation', 'annotation-xml', 'mphantom', 'none'].includes(name)) return;
       if (!['math', 'semantics'].includes(name)) addCandidate([node], structuralNames.has(name) ? 3 : 2, depth);
@@ -2431,10 +3797,12 @@
       if (rowNames.has(name) && surfaceChildren.length) {
         let sequences = [{ text: '', boundaries: [0], variants: [] }];
         for (const child of surfaceChildren) {
+          if (!spendPartialMatchWork()) break;
           const childVariants = variantsFor(child).length ? variantsFor(child) : [''];
           const next = [];
           for (const sequence of sequences) {
             for (const variant of childVariants) {
+              if (!spendPartialMatchWork()) break;
               const text = sequence.text + variant;
               if (next.some((item) => item.text === text)) continue;
               next.push({
@@ -2444,36 +3812,63 @@
               });
               if (next.length >= 24) break;
             }
+            if (partialMatchBudgetExceeded) break;
             if (next.length >= 24) break;
           }
           sequences = next;
+          if (partialMatchBudgetExceeded) break;
         }
+        if (partialMatchBudgetExceeded) return;
         for (const sequence of sequences) {
-          let occurrence = sequence.text.indexOf(selectedKey);
+          const boundaryIndex = new Map(sequence.boundaries.map((offset, index) => [offset, index]));
+          const directOccurrence = Number.isFinite(selectedOffset) && visualKey &&
+            sequence.text === visualKey &&
+            sequence.text.slice(selectedOffset, selectedOffset + selectedKey.length) === selectedKey
+            ? selectedOffset
+            : -1;
+          let occurrence = directOccurrence >= 0 ? directOccurrence : sequence.text.indexOf(selectedKey);
+          let occurrenceCount = 0;
           while (occurrence >= 0) {
-            const finish = occurrence + selectedKey.length;
-            const starts = [];
-            const ends = [];
-            sequence.boundaries.forEach((offset, index) => {
-              if (offset === occurrence && index < surfaceChildren.length) starts.push(index);
-              if (offset === finish && index > 0) ends.push(index);
-            });
-            for (const start of starts) {
-              for (const end of ends) {
-                if (end <= start) continue;
-                addCandidate(surfaceChildren.slice(start, end), end - start > 1 ? 1 : 2, depth, [selectedKey]);
-              }
+            if (!spendPartialMatchWork()) return;
+            occurrenceCount += 1;
+            if (directOccurrence < 0 && occurrenceCount > MAX_PARTIAL_MATCH_OCCURRENCES) {
+              partialMatchBudgetExceeded = true;
+              return;
             }
-            if (!starts.length || !ends.length) {
-              const startIndex = sequence.boundaries.findIndex((offset, index) =>
-                index < surfaceChildren.length && offset <= occurrence && occurrence < sequence.boundaries[index + 1]
+            const finish = occurrence + selectedKey.length;
+            const alignedStart = boundaryIndex.get(occurrence);
+            const alignedEnd = boundaryIndex.get(finish);
+            let candidate = null;
+            if (alignedStart != null && alignedEnd != null && alignedEnd > alignedStart) {
+              candidate = addCandidate(
+                surfaceChildren.slice(alignedStart, alignedEnd),
+                alignedEnd - alignedStart > 1 ? 1 : 2,
+                depth,
+                [selectedKey]
               );
-              const endIndex = sequence.boundaries.findIndex((offset, index) =>
-                index < surfaceChildren.length && offset < finish && finish <= sequence.boundaries[index + 1]
-              );
+            } else {
+              const childIndexAt = (offset, endBoundary) => {
+                let low = 0;
+                let high = sequence.boundaries.length - 2;
+                let found = -1;
+                while (low <= high) {
+                  const middle = (low + high) >> 1;
+                  const before = endBoundary
+                    ? sequence.boundaries[middle] < offset
+                    : sequence.boundaries[middle] <= offset;
+                  if (before) {
+                    found = middle;
+                    low = middle + 1;
+                  } else high = middle - 1;
+                }
+                return found < surfaceChildren.length ? found : -1;
+              };
+              const startIndex = childIndexAt(occurrence, false);
+              const endIndex = childIndexAt(finish, true);
               if (startIndex >= 0 && endIndex >= startIndex) {
                 const sliced = [];
                 for (let index = startIndex; index <= endIndex; index += 1) {
+                  if (!spendPartialMatchWork()) return;
                   const variant = sequence.variants[index];
                   const localStart = Math.max(0, occurrence - sequence.boundaries[index]);
                   const localEnd = Math.min(variant.length, finish - sequence.boundaries[index]);
@@ -2483,7 +3878,7 @@
                   if (!piece) { sliced.length = 0; break; }
                   sliced.push(piece);
                 }
-                addSlicedCandidate(
+                candidate = addSlicedCandidate(
                   sliced,
                   depth,
                   occurrence,
@@ -2491,13 +3886,28 @@
                 );
               }
             }
+            if (directOccurrence >= 0) {
+              // Offset-only matching is authoritative for flat token rows. A
+              // structural node may expose an elided surface (for example an
+              // <msqrt> whose DOM text is just its radicand), so those still
+              // go through structural/layout ranking before being returned.
+              if (candidate && candidate.directOffsetSafe) directVisualCandidate = candidate;
+              break;
+            }
+            if (partialMatchBudgetExceeded) return;
             occurrence = sequence.text.indexOf(selectedKey, occurrence + 1);
           }
+          if (directVisualCandidate || partialMatchBudgetExceeded) return;
         }
       }
-      for (const child of children) walk(child, depth + 1);
+      for (const child of children) {
+        walk(child, depth + 1);
+        if (directVisualCandidate || partialMatchBudgetExceeded) break;
+      }
     };
     walk(presentation, 0);
+    if (directVisualCandidate) return directVisualCandidate.math;
+    if (partialMatchBudgetExceeded) return null;
 
     // Build bounded surface layouts only when two semantic candidates look the
     // same. Layout spans retain which MathML node occupies each visual offset,
@@ -2629,7 +4039,7 @@
   }
 
   function findOfficeMathRoots(container) {
-    if (!container) return [];
+    if (!container || !domTreeWithinBudget(container, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return [];
     const elements = [];
     if (container.nodeType === 1) elements.push(container);
     if (container.querySelectorAll) elements.push(...container.querySelectorAll('*'));
@@ -2640,9 +4050,15 @@
       return !Array.from(element.querySelectorAll ? element.querySelectorAll('*') : [])
         .some((child) => officeElementName(child) === 'omath');
     });
-    return roots.filter((root, index) =>
-      !roots.some((other, otherIndex) => otherIndex !== index && other.contains && other.contains(root))
-    ).sort((left, right) => {
+    const rootSet = new Set(roots);
+    return roots.filter((root) => {
+      let ancestor = root.parentElement;
+      while (ancestor && ancestor !== container) {
+        if (rootSet.has(ancestor)) return false;
+        ancestor = ancestor.parentElement;
+      }
+      return !ancestor || !rootSet.has(ancestor);
+    }).sort((left, right) => {
       if (left === right || !left.compareDocumentPosition) return 0;
       return left.compareDocumentPosition(right) & 2 ? 1 : -1;
     });
@@ -2822,7 +4238,10 @@
     const annotations = root.querySelectorAll('annotation[encoding], annotation-xml[encoding]');
     for (const annotation of annotations) {
       const encoding = (annotation.getAttribute('encoding') || '').toLowerCase();
-      if (encoding.includes('tex') || encoding.includes('latex')) return (annotation.textContent || '').trim();
+      if (encoding.includes('tex') || encoding.includes('latex')) {
+        const value = annotation.textContent || '';
+        if (value.length <= MAX_MATH_SOURCE_LENGTH) return value.trim();
+      }
     }
     return '';
   }
@@ -2882,28 +4301,44 @@
   }
 
   function getMathSource(root, pageWindow) {
-    if (!root || root.nodeType !== 1) return '';
+    if (!root || root.nodeType !== 1 || !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return '';
+    const bounded = (value) => {
+      const source = typeof value === 'string' ? value : '';
+      return source && source.length <= MAX_MATH_SOURCE_LENGTH ? stripLatexDelimiters(source) : '';
+    };
     const attributeNames = ['data-latex', 'data-tex', 'data-math-source', 'data-original-tex', 'alttext'];
     for (const name of attributeNames) {
       const value = root.getAttribute && root.getAttribute(name);
-      if (value) return stripLatexDelimiters(value);
+      if (value) {
+        const source = bounded(value);
+        if (source) return source;
+      }
     }
     const annotated = findTexAnnotation(root);
-    if (annotated) return stripLatexDelimiters(annotated);
+    if (annotated) return bounded(annotated);
     const math = (root.matches && root.matches('math')) ? root : (root.querySelector && root.querySelector('math'));
     if (math) {
       const altText = math.getAttribute('alttext');
-      if (altText) return stripLatexDelimiters(altText);
+      if (altText) {
+        const source = bounded(altText);
+        if (source) return source;
+      }
       const mathAnnotation = findTexAnnotation(math);
-      if (mathAnnotation) return stripLatexDelimiters(mathAnnotation);
+      if (mathAnnotation) return bounded(mathAnnotation);
     }
-    if (root.matches && root.matches('script[type^="math/tex"]')) return (root.textContent || '').trim();
+    if (root.matches && root.matches('script[type^="math/tex"]')) return bounded((root.textContent || '').trim());
     const embeddedScript = root.querySelector && root.querySelector('script[type^="math/tex"]');
-    if (embeddedScript && embeddedScript.textContent) return embeddedScript.textContent.trim();
-    for (const sibling of [root.previousElementSibling, root.nextElementSibling]) {
-      if (sibling && sibling.matches && sibling.matches('script[type^="math/tex"]')) return (sibling.textContent || '').trim();
+    if (embeddedScript && embeddedScript.textContent) {
+      const source = bounded(embeddedScript.textContent.trim());
+      if (source) return source;
     }
-    return stripLatexDelimiters(getMathJaxSource(root, pageWindow));
+    for (const sibling of [root.previousElementSibling, root.nextElementSibling]) {
+      if (sibling && sibling.matches && sibling.matches('script[type^="math/tex"]')) {
+        const source = bounded((sibling.textContent || '').trim());
+        if (source) return source;
+      }
+    }
+    return bounded(getMathJaxSource(root, pageWindow));
   }
 
   function getMathElement(root) {
@@ -2918,11 +4353,15 @@
   function fallbackMathText(root) {
     if (!root) return '';
     const aria = root.getAttribute && (root.getAttribute('aria-label') || root.getAttribute('alt'));
-    if (aria) return aria;
+    if (aria) return aria.length <= MAX_MATH_SOURCE_LENGTH ? aria : '';
     const image = root.querySelector && root.querySelector('img[alt]');
-    if (image && image.getAttribute('alt')) return image.getAttribute('alt');
+    if (image && image.getAttribute('alt')) {
+      const value = image.getAttribute('alt');
+      return value.length <= MAX_MATH_SOURCE_LENGTH ? value : '';
+    }
     const visual = root.querySelector && root.querySelector('.katex-html, mjx-container, svg');
-    return cleanClipboardText((visual || root).textContent || '');
+    const value = (visual || root).textContent || '';
+    return value.length <= MAX_MATH_SOURCE_LENGTH ? cleanClipboardText(value) : '';
   }
 
   function isDisplayMath(root) {
@@ -2935,8 +4374,81 @@
     );
   }
 
+  function faithfulAgreementKey(input) {
+    const value = cleanClipboardText(String(input == null ? '' : input))
+      .replace(/[\u061c\u200e\u200f\u202a-\u202e\u2061-\u2069\ufe00-\ufe0f\s]/gu, '');
+    return value.normalize ? value.normalize('NFC') : value;
+  }
+
+  function faithfulSourceAgreesWithRendered(sourceText, renderedText) {
+    const source = String(sourceText == null ? '' : sourceText);
+    const rendered = String(renderedText == null ? '' : renderedText);
+    if (!source || !rendered || source.includes('\\')) return false;
+    // Parentheses are semantic scope, not cosmetic punctuation. A source
+    // annotation may be stale, macro-expanded differently, or page-forged;
+    // it is allowed to influence the clipboard only when its linearized
+    // structure actually agrees with the sanitized rendered MathML.
+    return faithfulAgreementKey(source) === faithfulAgreementKey(rendered);
+  }
+
+  function faithfulRenderedMathText(root, mathElement, pageWindow) {
+    const rendered = mathElement ? mathMLToFaithful(mathElement) : '';
+    const source = getMathSource(root, pageWindow);
+    const faithfulSource = source ? latexToFaithful(source) : '';
+    return faithfulSourceAgreesWithRendered(faithfulSource, rendered)
+      ? faithfulSource
+      : (rendered || faithfulSource);
+  }
+
+  function independentVisibleMathText(root) {
+    if (!root || !root.querySelector) return '';
+    const candidate = (root.matches && root.matches('.katex-html, mjx-container, .visual-layout, .math-visual, svg'))
+      ? root
+      : root.querySelector('.katex-html, mjx-container, .visual-layout, .math-visual, svg, [aria-hidden="true"]');
+    const candidateText = cleanClipboardText(candidate && candidate.textContent || '');
+    if (candidateText) return candidateText;
+    // With no semantic MathML present, ordinary descendant text is the only
+    // independent evidence for a data-latex/data-tex annotation. Attribute-
+    // only image/ARIA formulas intentionally return empty here because their
+    // source is also their sole accessible representation.
+    return cleanClipboardText(root.textContent || '');
+  }
+
+  function sourceOnlyMathAgreesWithVisible(root, pageWindow) {
+    const source = getMathSource(root, pageWindow);
+    const visible = independentVisibleMathText(root);
+    if (!source || !visible) return true;
+    const faithfulSource = latexToFaithful(source);
+    if (!faithfulSource || faithfulSource.includes('\\')) return false;
+    const sourceSignature = semanticVisibleAnchorSignature(faithfulSource);
+    const visibleSignature = semanticVisibleAnchorSignature(visible);
+    if (sourceSignature.overBudget || visibleSignature.overBudget) return false;
+    if (sourceSignature.identifiers !== visibleSignature.identifiers) return false;
+    if (!sourceSignature.uncertainOperators && !visibleSignature.uncertainOperators &&
+        sourceSignature.operators !== visibleSignature.operators) return false;
+    if (sourceSignature.identifiers || visibleSignature.identifiers) {
+      // Grouping symbols such as a fraction slash or radical are synthesized
+      // from TeX but often drawn only with CSS/SVG, so compare the order-free
+      // identifier/number anchors here. Stable authored operators must agree
+      // too; only structure-only slash/root/fence marks are excluded.
+      return true;
+    }
+    if (!sourceSignature.uncertainOperators && !visibleSignature.uncertainOperators &&
+        (sourceSignature.operators || visibleSignature.operators)) {
+      return sourceSignature.operators === visibleSignature.operators;
+    }
+    if (sourceSignature.glyphs || visibleSignature.glyphs) {
+      return Boolean(sourceSignature.glyphs && sourceSignature.glyphs === visibleSignature.glyphs);
+    }
+    const sourceKey = mathSelectionKey(faithfulSource);
+    const visibleKey = mathSelectionKey(visible);
+    return Boolean(sourceKey && sourceKey === visibleKey);
+  }
+
   function extractMathText(root, outputMode, pageWindow) {
-    const mode = ['calculator', 'unicode', 'latex', 'ascii'].includes(outputMode) ? outputMode : 'calculator';
+    const mode = ['calculator', 'faithful', 'unicode', 'latex', 'ascii'].includes(outputMode)
+      ? outputMode
+      : DEFAULT_SETTINGS.outputMode;
     const source = getMathSource(root, pageWindow);
     const math = getMathElement(root);
     if (mode === 'latex' && source) {
@@ -2946,6 +4458,11 @@
       if (math) return mathMLToCalculator(math);
       if (source) return latexToCalculator(source);
       return unicodeToCalculator(formatMathText(fallbackMathText(root)));
+    }
+    if (mode === 'faithful') {
+      if (math) return faithfulRenderedMathText(root, math, pageWindow);
+      if (source) return latexToFaithful(source);
+      return formatFaithfulMathText(fallbackMathText(root));
     }
     let unicode = math ? mathMLToUnicode(math) : '';
     if (!unicode && source) unicode = latexToUnicode(source);
@@ -2987,12 +4504,44 @@
     return Array.from(element.childNodes || []).some((node) => node.nodeType === 3 && /\S/.test(node.nodeValue || ''));
   }
 
-  function mathElementCount(element) {
-    if (!element || !element.querySelectorAll) return 0;
-    return element.matches && element.matches('math') ? 1 : element.querySelectorAll('math').length;
+  function createMathDiscoveryContext() {
+    return {
+      mathCounts: new WeakMap(),
+      mathRoots: new WeakMap(),
+      directHiddenVisualChildren: new WeakMap()
+    };
   }
 
-  function isAccessibilityMath(mathElement) {
+  function isMathRootCached(element, context) {
+    const cache = context && context.mathRoots;
+    if (cache && cache.has(element)) return cache.get(element);
+    const result = isMathRoot(element);
+    if (cache && element && (typeof element === 'object' || typeof element === 'function')) {
+      cache.set(element, result);
+    }
+    return result;
+  }
+
+  function mathElementCount(element, context) {
+    if (!element || !element.querySelectorAll) return 0;
+    const cache = context && context.mathCounts;
+    if (cache && cache.has(element)) return cache.get(element);
+    const count = (element.matches && element.matches('math') ? 1 : 0) +
+      element.querySelectorAll('math').length;
+    if (cache) cache.set(element, count);
+    return count;
+  }
+
+  function hasDirectHiddenVisualChild(element, context) {
+    if (!element || !element.querySelector) return false;
+    const cache = context && context.directHiddenVisualChildren;
+    if (cache && cache.has(element)) return cache.get(element);
+    const result = Boolean(element.querySelector(':scope > [aria-hidden="true"]'));
+    if (cache) cache.set(element, result);
+    return result;
+  }
+
+  function isAccessibilityMath(mathElement, context) {
     let element = mathElement;
     let levels = 0;
     while (element && levels < 6) {
@@ -3001,28 +4550,28 @@
       if (/katex-mathml|assistive|sr-only|visually-hidden|screen-reader|mathml/i.test(className) ||
           /clip\s*:|clip-path\s*:|position\s*:\s*absolute/.test(style) ||
           element.hidden) return true;
-      if (element.parentElement && element.parentElement.querySelector(':scope > [aria-hidden="true"]')) return true;
+      if (hasDirectHiddenVisualChild(element.parentElement, context)) return true;
       element = element.parentElement;
       levels += 1;
     }
     return false;
   }
 
-  function rendererContainerForMath(mathElement) {
+  function rendererContainerForMath(mathElement, context) {
     if (!mathElement || mathElement.nodeType !== 1) return null;
     let found = mathElement;
     let element = mathElement.parentElement;
     let levels = 0;
-    const accessibilityTree = isAccessibilityMath(mathElement);
-    while (element && levels < 8 && mathElementCount(element) === 1) {
-      const recognized = isMathRoot(element);
+    const accessibilityTree = isAccessibilityMath(mathElement, context);
+    while (element && levels < 8 && mathElementCount(element, context) === 1) {
+      const recognized = isMathRootCached(element, context);
       if (!recognized && !accessibilityTree) break;
       if (['body', 'html'].includes((element.localName || '').toLowerCase())) break;
       if (hasSignificantDirectText(element) && !recognized) break;
       found = element;
       if (recognized) {
         const parent = element.parentElement;
-        if (!parent || !isMathRoot(parent) || mathElementCount(parent) !== 1) break;
+        if (!parent || !isMathRootCached(parent, context) || mathElementCount(parent, context) !== 1) break;
       }
       element = element.parentElement;
       levels += 1;
@@ -3030,14 +4579,16 @@
     return found;
   }
 
-  function implicitMathContainerFromNode(node) {
+  function implicitMathContainerFromNode(node, context) {
     const original = node && node.nodeType === 1 ? node : node && node.parentElement;
     let element = original;
     let levels = 0;
     while (element && levels < 8) {
-      const mathElements = element.querySelectorAll ? element.querySelectorAll('math') : [];
-      if (mathElements.length === 1 && !mathElements[0].contains(node)) {
-        const promoted = rendererContainerForMath(mathElements[0]);
+      const oneMath = mathElementCount(element, context) === 1 && element.querySelector
+        ? element.querySelector('math')
+        : null;
+      if (oneMath && !oneMath.contains(node)) {
+        const promoted = rendererContainerForMath(oneMath, context);
         if (promoted && promoted.contains(node)) return promoted;
       }
       if (hasSignificantDirectText(element) && element !== original) break;
@@ -3047,34 +4598,64 @@
     return null;
   }
 
-  function outermostMathAncestor(node) {
+  function outermostMathAncestor(node, context) {
     let element = node && node.nodeType === 1 ? node : node && node.parentElement;
     let found = null;
     while (element) {
-      if (isMathRoot(element)) found = element;
+      if (isMathRootCached(element, context)) found = element;
       element = element.parentElement;
     }
-    return found || implicitMathContainerFromNode(node);
+    return found || implicitMathContainerFromNode(node, context);
+  }
+
+  function sortMathRoots(roots) {
+    return roots.sort((left, right) => {
+      if (left === right || !left.compareDocumentPosition) return 0;
+      return left.compareDocumentPosition(right) & 2 ? 1 : -1;
+    });
+  }
+
+  function canonicalMathRootDiscovery(container, contextInput) {
+    if (!container) return { roots: [], overBudget: false };
+    const context = contextInput || createMathDiscoveryContext();
+    const base = container.nodeType === 1 ? container : container.parentElement || container;
+    if (!base) return { roots: [], overBudget: false };
+    const candidates = new Set();
+    if (isMathRootCached(base, context)) candidates.add(base);
+    if (base.querySelectorAll) {
+      const discovered = base.querySelectorAll(MATH_DISCOVERY_SELECTOR);
+      if (discovered.length > MAX_MATH_DISCOVERY_CANDIDATES) {
+        return { roots: [], overBudget: true };
+      }
+      for (const candidate of discovered) {
+        if (isMathRootCached(candidate, context)) candidates.add(candidate);
+        if ((candidate.localName || '').toLowerCase() === 'math') {
+          const promoted = rendererContainerForMath(candidate, context);
+          if (promoted) candidates.add(promoted);
+        }
+      }
+    }
+    // A Set removes promoted/root duplicates. Walking ancestors against that
+    // Set keeps only canonical outer roots without the former all-pairs scan.
+    const roots = [];
+    for (const candidate of candidates) {
+      let ancestor = candidate.parentElement;
+      let nested = false;
+      while (ancestor) {
+        if (candidates.has(ancestor)) {
+          nested = true;
+          break;
+        }
+        ancestor = ancestor.parentElement;
+      }
+      if (!nested) roots.push(candidate);
+    }
+    return { roots: sortMathRoots(roots), overBudget: false };
   }
 
   function canonicalMathRoots(container) {
-    if (!container) return [];
-    const base = container.nodeType === 1 ? container : container.parentElement || container;
-    const candidates = [];
-    if (isMathRoot(base)) candidates.push(base);
-    if (base.querySelectorAll) {
-      for (const candidate of base.querySelectorAll(MATH_DISCOVERY_SELECTOR)) {
-        if (isMathRoot(candidate)) candidates.push(candidate);
-      }
-      for (const math of base.querySelectorAll('math')) {
-        const promoted = rendererContainerForMath(math);
-        if (promoted) candidates.push(promoted);
-      }
-    }
-    return candidates.filter((candidate, index) => {
-      if (candidates.indexOf(candidate) !== index) return false;
-      return !candidates.some((other) => other !== candidate && other.contains && other.contains(candidate));
-    });
+    const discovery = canonicalMathRootDiscovery(container);
+    return discovery.overBudget ? [] : discovery.roots;
   }
 
   function rangeIntersects(range, node) {
@@ -3085,21 +4666,39 @@
     }
   }
 
-  function rootsForRange(range) {
+  function mathRootDiscoveryForRange(range) {
+    if (!range || !range.commonAncestorContainer) return { roots: [], overBudget: false };
+    const context = createMathDiscoveryContext();
     const container = range.commonAncestorContainer.nodeType === 1
       ? range.commonAncestorContainer
       : range.commonAncestorContainer.parentElement;
-    const roots = canonicalMathRoots(container).filter((root) => rangeIntersects(range, root));
+    const canonical = canonicalMathRootDiscovery(container, context);
+    if (canonical.overBudget) return canonical;
+    const rootSet = new Set(canonical.roots.filter((root) => rangeIntersects(range, root)));
     for (const boundaryNode of [range.startContainer, range.endContainer]) {
-      const ancestor = outermostMathAncestor(boundaryNode);
-      if (ancestor && !roots.includes(ancestor)) roots.push(ancestor);
+      const ancestor = outermostMathAncestor(boundaryNode, context);
+      if (ancestor) rootSet.add(ancestor);
     }
-    roots.sort((left, right) => {
-      if (left === right || !left.compareDocumentPosition) return 0;
-      const position = left.compareDocumentPosition(right);
-      return position & 2 ? 1 : -1;
-    });
-    return roots.filter((root) => !roots.some((other) => other !== root && other.contains(root)));
+    if (rootSet.size > MAX_MATH_ROOTS_PER_SELECTION) return { roots: [], overBudget: true };
+    const roots = [];
+    for (const root of rootSet) {
+      let ancestor = root.parentElement;
+      let nested = false;
+      while (ancestor) {
+        if (rootSet.has(ancestor)) {
+          nested = true;
+          break;
+        }
+        ancestor = ancestor.parentElement;
+      }
+      if (!nested) roots.push(root);
+    }
+    return { roots: sortMathRoots(roots), overBudget: false };
+  }
+
+  function rootsForRange(range) {
+    const discovery = mathRootDiscoveryForRange(range);
+    return discovery.overBudget ? [] : discovery.roots;
   }
 
   function expandedMathRange(range, roots) {
@@ -3117,13 +4716,20 @@
     return expanded;
   }
 
-  function isHiddenElement(element) {
+  function isVisuallyHiddenElement(element) {
     if (!element || element.nodeType !== 1) return false;
-    if (element.hidden || element.getAttribute('aria-hidden') === 'true') return true;
+    if (element.hidden) return true;
     const style = (element.getAttribute('style') || '').toLowerCase();
-    if (/display\s*:\s*none|visibility\s*:\s*hidden/.test(style)) return true;
+    if (/display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|content-visibility\s*:\s*hidden/.test(style)) return true;
+    return false;
+  }
+
+  function isHiddenElement(element) {
+    if (isVisuallyHiddenElement(element)) return true;
+    if (!element || element.nodeType !== 1) return false;
     const className = typeof element.className === 'string' ? element.className : '';
-    return /(?:^|\s)(?:sr-only|visually-hidden|screen-reader-only|MJX_Assistive_MathML)(?:\s|$)/i.test(className);
+    return element.getAttribute('aria-hidden') === 'true' ||
+      /(?:^|\s)(?:sr-only|visually-hidden|screen-reader-only|MJX_Assistive_MathML)(?:\s|$)/i.test(className);
   }
 
   function serializeDomFragment(fragment) {
@@ -3158,10 +4764,11 @@
       const element = node;
       const tag = (element.localName || '').toLowerCase();
       if (SKIP_TAGS.has(tag) || isHiddenElement(element)) return;
-      if (element.hasAttribute('data-clean-math-copy-value')) {
-        const display = element.getAttribute('data-clean-math-copy-display') === 'true';
+      const trustedPlaceholder = TRUSTED_TEXT_PLACEHOLDERS.get(element);
+      if (trustedPlaceholder) {
+        const display = trustedPlaceholder.display === true;
         if (display) newline(1);
-        append(element.getAttribute('data-clean-math-copy-value') || '', false);
+        append(trustedPlaceholder.text || '', false);
         if (display) newline(1);
         return;
       }
@@ -3254,9 +4861,7 @@
 
     if (name === 'mi') {
       const value = mathMLTokenText(node);
-      const variant = (node.getAttribute('mathvariant') || '').toLowerCase();
-      const rendered = !variant && Array.from(value).length === 1 ? mathematicalItalicText(value) : value;
-      return documentObject.createTextNode(rendered);
+      return documentObject.createTextNode(value);
     }
     if (['mn', 'mtext', 'ms'].includes(name)) return documentObject.createTextNode(mathMLTokenText(node));
     if (name === 'mo') {
@@ -3270,9 +4875,16 @@
       return richMathNodeFromMathML(presentation, documentObject);
     }
     if (name === 'mfrac') {
+      const lineThickness = String(node.getAttribute && node.getAttribute('linethickness') || '').trim().toLowerCase();
+      const zeroLine = /^(?:0|0+(?:\.0+)?(?:px|pt|em|ex|%)?)$/u.test(lineThickness);
       const fraction = setRichStyle(span(), 'display:inline-block;vertical-align:middle;text-align:center;line-height:1.08;margin:0 0.12em;');
       const numerator = setRichStyle(span(), 'display:block;padding:0 0.18em 0.08em;');
-      const denominator = setRichStyle(span(), 'display:block;border-top:1px solid currentColor;padding:0.08em 0.18em 0;');
+      // A zero-thickness MathML fraction is a stack (for example \binom or
+      // \atop), not division. Preserve that visual distinction in rich HTML
+      // instead of inventing a fraction bar during paste.
+      const denominator = setRichStyle(span(), zeroLine
+        ? 'display:block;padding:0.08em 0.18em 0;'
+        : 'display:block;border-top:1px solid currentColor;padding:0.08em 0.18em 0;');
       numerator.appendChild(richMathNodeFromMathML(children[0], documentObject));
       denominator.appendChild(richMathNodeFromMathML(children[1], documentObject));
       fraction.append(numerator, denominator);
@@ -3293,6 +4905,13 @@
       return root;
     }
     if (name === 'msup' || name === 'msub' || name === 'msubsup') {
+      // TeX renders an empty scripted base before the following nucleus for
+      // isotope-style prescripts ({}^{14}_{6}C). Literal <sub>/<sup> nodes
+      // would serialize in the opposite order in rich-text consumers, so use
+      // the same portable Unicode/caret representation as plain text here.
+      if (!mathMLTokenText(children[0]).trim()) {
+        return documentObject.createTextNode(mathMLToFaithful(node));
+      }
       const wrapper = span();
       wrapper.appendChild(richMathNodeFromMathML(children[0], documentObject));
       if (name === 'msub' || name === 'msubsup') {
@@ -3306,6 +4925,11 @@
         wrapper.appendChild(sup);
       }
       return wrapper;
+    }
+    if (name === 'mmultiscripts') {
+      // HTML has no native prescript element. Unicode scripts (with ^/_
+      // fallback when necessary) preserve both side and order everywhere.
+      return documentObject.createTextNode(mathMLToFaithful(node));
     }
     if (name === 'mfenced') {
       const wrapper = span();
@@ -3331,6 +4955,18 @@
       return table;
     }
     if (name === 'mover' || name === 'munder' || name === 'munderover') {
+      if (name === 'mover' && String(node.getAttribute && node.getAttribute('accent') || '').toLowerCase() !== 'false') {
+        const base = serializeMathMLFaithfulNode(children[0]);
+        const upper = serializeMathMLFaithfulNode(children[1]).text;
+        const accent = faithfulMathMLAccent(base, upper);
+        if (accent) return documentObject.createTextNode(formatFaithfulMathText(accent));
+      }
+      if (name === 'munder' && String(node.getAttribute && node.getAttribute('accentunder') || '').toLowerCase() !== 'false') {
+        const base = serializeMathMLFaithfulNode(faithfulMathMLSemanticBase(children[0]));
+        const lower = serializeMathMLFaithfulNode(children[1]).text;
+        const accent = faithfulMathMLUnderAccent(base, lower);
+        if (accent) return documentObject.createTextNode(formatFaithfulMathText(accent));
+      }
       const wrapper = span();
       wrapper.appendChild(richMathNodeFromMathML(children[0], documentObject));
       if (name === 'munder' || name === 'munderover') {
@@ -3343,6 +4979,42 @@
         sup.appendChild(richMathNodeFromMathML(children[name === 'mover' ? 1 : 2], documentObject));
         wrapper.appendChild(sup);
       }
+      return wrapper;
+    }
+    if (name === 'menclose') {
+      const notation = String(node.getAttribute && node.getAttribute('notation') || '').toLowerCase();
+      const labels = faithfulMenclose(notation, serializeMathMLFaithfulRow(children));
+      const names = new Set(notation.match(/[a-z]+/g) || []);
+      const supported = new Set([
+        'updiagonalstrike', 'downdiagonalstrike', 'horizontalstrike', 'verticalstrike',
+        'box', 'roundedbox', 'circle', 'top', 'bottom', 'left', 'right'
+      ]);
+      if (!names.size || Array.from(names).some((item) => !supported.has(item))) {
+        return documentObject.createTextNode(formatFaithfulMathText(labels));
+      }
+      const declarations = ['display:inline-block', 'position:relative', 'padding:0.04em 0.12em'];
+      const backgrounds = [];
+      if (names.has('updiagonalstrike')) {
+        backgrounds.push('linear-gradient(to top right,transparent 47%,currentColor 48%,currentColor 52%,transparent 53%)');
+      }
+      if (names.has('downdiagonalstrike')) {
+        backgrounds.push('linear-gradient(to bottom right,transparent 47%,currentColor 48%,currentColor 52%,transparent 53%)');
+      }
+      if (names.has('verticalstrike')) {
+        backgrounds.push('linear-gradient(to right,transparent 47%,currentColor 48%,currentColor 52%,transparent 53%)');
+      }
+      if (backgrounds.length) declarations.push('background-image:' + backgrounds.join(','));
+      if (names.has('horizontalstrike')) declarations.push('text-decoration:line-through');
+      if (names.has('box') || names.has('roundedbox')) declarations.push('border:1px solid currentColor');
+      if (names.has('roundedbox')) declarations.push('border-radius:0.22em');
+      if (names.has('circle')) declarations.push('border:1px solid currentColor', 'border-radius:50%');
+      if (names.has('top')) declarations.push('border-top:1px solid currentColor');
+      if (names.has('bottom')) declarations.push('border-bottom:1px solid currentColor');
+      if (names.has('left')) declarations.push('border-left:1px solid currentColor');
+      if (names.has('right')) declarations.push('border-right:1px solid currentColor');
+      const wrapper = setRichStyle(span(), declarations.join(';') + ';');
+      wrapper.setAttribute('aria-label', formatFaithfulMathText(labels));
+      appendChildren(wrapper, children);
       return wrapper;
     }
     if (name === 'maction') return richMathNodeFromMathML(children[0], documentObject);
@@ -3365,11 +5037,21 @@
   }
 
   function sanitizeRichFragment(fragment) {
+    const stack = Array.from(fragment && fragment.childNodes || []);
+    while (stack.length) {
+      const node = stack.pop();
+      if (!node) continue;
+      if (node.nodeType === 8) {
+        node.remove();
+        continue;
+      }
+      stack.push(...Array.from(node.childNodes || []));
+    }
     const elements = Array.from(fragment.querySelectorAll ? fragment.querySelectorAll('*') : []);
     for (const element of elements) {
       if (!element.isConnected && !fragment.contains(element)) continue;
       const tag = (element.localName || '').toLowerCase();
-      if (SKIP_TAGS.has(tag) || isHiddenElement(element)) {
+      if (SKIP_TAGS.has(tag) || isVisuallyHiddenElement(element)) {
         element.remove();
         continue;
       }
@@ -3377,12 +5059,21 @@
         element.replaceWith(element.ownerDocument.createTextNode(element.getAttribute('alt') || ''));
         continue;
       }
+      if (!ORDINARY_RICH_TAGS.has(tag)) {
+        const parent = element.parentNode;
+        if (parent) {
+          while (element.firstChild) parent.insertBefore(element.firstChild, element);
+          element.remove();
+        }
+        continue;
+      }
       // Page content can forge attributes, so style retention is authorized
       // only for nodes created by this module in the current realm.
       const keepStyle = TRUSTED_RICH_STYLE_NODES.has(element);
       for (const attribute of Array.from(element.attributes || [])) {
         const name = attribute.name.toLowerCase();
-        const keep = (keepStyle && name === 'style') || name === 'role' || name === 'colspan' || name === 'rowspan' || name === 'start';
+        const keep = (keepStyle && (name === 'style' || name === 'aria-label')) ||
+          name === 'role' || name === 'colspan' || name === 'rowspan' || name === 'start';
         if (!keep) element.removeAttribute(attribute.name);
       }
     }
@@ -3428,11 +5119,34 @@
       if (node.nodeType !== 1) return null;
       const name = (node.localName || '').toLowerCase();
       if (name === 'annotation' || name === 'annotation-xml') return null;
-      if (node.namespaceURI && node.namespaceURI !== MATHML_NAMESPACE) return null;
       if (name === 'mglyph') return documentObject.createTextNode(cleanXMLText(node.getAttribute('alt') || ''));
       if (!allowedElements.has(name)) {
         if (!removableForeignElements.has(name)) unsupportedMathML = true;
         return null;
+      }
+      // HTML's MathML parser intentionally switches descendants of token
+      // elements (mi/mo/mn/mtext/ms) back to the HTML namespace. KaTeX uses
+      // such wrappers for constructs including \bmod, \boldsymbol, and nested
+      // oversets. The names are still an explicit MathML allowlist and every
+      // attribute is rebuilt below, so accepting only MathML/HTML namespaces
+      // preserves that safe structure without admitting arbitrary foreign DOM.
+      if (node.namespaceURI && node.namespaceURI !== MATHML_NAMESPACE &&
+          node.namespaceURI !== 'http://www.w3.org/1999/xhtml') return null;
+      const structuralToken = ['mi', 'mn', 'mo', 'mtext', 'ms'].includes(name) &&
+        elementChildren(node).length > 0;
+      if (structuralToken) {
+        const row = documentObject.createElementNS(MATHML_NAMESPACE, 'mrow');
+        for (const attribute of Array.from(node.attributes || [])) {
+          const attributeName = attribute.name.split(':').pop().toLowerCase();
+          if (['mathvariant', 'mathsize', 'dir', 'displaystyle', 'scriptlevel'].includes(attributeName)) {
+            row.setAttribute(attributeName, cleanXMLText(attribute.value));
+          }
+        }
+        for (const child of Array.from(node.childNodes || [])) {
+          const rebuilt = rebuild(child);
+          if (rebuilt) row.appendChild(rebuilt);
+        }
+        return row;
       }
       const safe = documentObject.createElementNS(MATHML_NAMESPACE, name);
       for (const attribute of Array.from(node.attributes || [])) {
@@ -3488,6 +5202,22 @@
     return root.querySelector && root.querySelector('.katex-html, .visual-layout, .math-visual, [aria-hidden="true"]');
   }
 
+  function visualBranchRepresentsWholeMath(root, branch) {
+    if (!root || !branch) return false;
+    if (branch === root) return true;
+    // Native MathML children are semantic subexpressions, not alternate
+    // renderings of the entire root. Treating a direct <mi> as a whole visual
+    // branch silently widens an exact one-token selection to the full formula.
+    if ((root.localName || '').toLowerCase() === 'math') return false;
+    return Boolean(branch.matches && branch.matches([
+      '.katex-html',
+      '.visual-layout',
+      '.math-visual',
+      'mjx-container > :not(mjx-assistive-mml)',
+      '[aria-hidden="true"]'
+    ].join(',')));
+  }
+
   function selectedVisualStructureHints(range, visualBranch) {
     const hints = new Set();
     if (!range || !visualBranch) return hints;
@@ -3512,15 +5242,118 @@
     return hints;
   }
 
-  function semanticMathSelectionPayload(root, range, settings) {
+  function semanticVisibleAnchorSignature(input) {
+    const rawValue = String(input == null ? '' : input);
+    if (rawValue.length > MAX_SELECTION_KEY_LENGTH) {
+      return { identifiers: '', operators: '', glyphs: '', uncertainOperators: true, overBudget: true };
+    }
+    let value = rawValue;
+    try { value = value.normalize('NFKD'); } catch (_error) { /* keep original */ }
+    const identifiers = [];
+    const operators = [];
+    const glyphs = [];
+    let uncertainOperators = /\ue020/u.test(rawValue);
+    const canonicalOperators = {
+      '-': '−', '−': '−',
+      '·': '⋅', '⋅': '⋅', '∗': '*'
+    };
+    const stableOperators = new Set(Array.from(
+      '=≠≈≃≅≡<>≤≥±∓+−-×⋅·*∗÷∝∈∉∋∌⊂⊃⊆⊇⊊⊋⊄⊅⊈⊉∪∩∧∨∑∏∐∫∬∭∮∞%!?→←↦⇒⇔⟶⟹⟺'
+    ));
+    for (const character of Array.from(value)) {
+      if (/^[\p{L}\p{N}]$/u.test(character)) {
+        identifiers.push(character);
+      }
+    }
+    // Inspect operators before compatibility decomposition. Otherwise `≠`
+    // becomes `=` plus a combining slash and can falsely agree with a stale
+    // plain equals sign. Styled identifiers still use the NFKD pass above.
+    const operatorCharacters = Array.from(rawValue);
+    for (let index = 0; index < operatorCharacters.length; index += 1) {
+      const character = operatorCharacters[index];
+      if (/^[\p{M}\p{Cf}]$/u.test(character) || /[\ue000-\uf8ff]/u.test(character)) continue;
+      if (!stableOperators.has(character)) continue;
+      if (character === '/' && index > 0 && /[∈∋⊂⊃⊆⊇<>=|∣∥]/u.test(operatorCharacters[index - 1])) {
+        uncertainOperators = true;
+      }
+      operators.push(canonicalOperators[character] || character);
+    }
+    const structuralGlyphs = new Set(Array.from('√∛∜/|∣∥‖()[]{}⟨⟩⌈⌉⌊⌋,;:_^'));
+    for (const character of operatorCharacters) {
+      if (/^[\p{L}\p{N}\p{M}\p{Z}\p{Cf}]$/u.test(character) ||
+          /[\ue000-\uf8ff]/u.test(character) || stableOperators.has(character) ||
+          structuralGlyphs.has(character)) continue;
+      glyphs.push(character);
+    }
+    identifiers.sort();
+    operators.sort();
+    glyphs.sort();
+    return {
+      identifiers: identifiers.join(''),
+      operators: operators.join(''),
+      glyphs: glyphs.join(''),
+      uncertainOperators
+    };
+  }
+
+  function semanticMathAgreesWithVisibleBranch(math, visualBranch) {
+    if (!math || !visualBranch || nodeInside(math, visualBranch)) return true;
+    const presentation = presentationMathNode(math);
+    if (!presentation) return true;
+    const semantic = semanticVisibleAnchorSignature(presentation.textContent || '');
+    const visible = semanticVisibleAnchorSignature(visualBranch.textContent || '');
+    if (semantic.overBudget || visible.overBudget) return false;
+    // Separate accessibility/presentation trees may flatten fractions and
+    // roots in a different order, but they must still describe the same
+    // identifiers, numbers, and stable written operators. This catches stale
+    // or forged hidden MathML (`x` behind visible `y`) without reintroducing
+    // the exact-order bug this userscript exists to repair.
+    if (semantic.identifiers !== visible.identifiers) return false;
+    if (!semantic.uncertainOperators && !visible.uncertainOperators &&
+        semantic.operators !== visible.operators) return false;
+    if (semantic.identifiers || semantic.operators || visible.identifiers || visible.operators) return true;
+    return Boolean(semantic.glyphs && semantic.glyphs === visible.glyphs);
+  }
+
+  function semanticMathSelectionPayload(root, range, settings, pageWindow) {
     const math = getMathElement(root);
-    if (!math) return { kind: 'unmatched' };
     const selectedText = cleanClipboardText(range.toString());
     const selectedKey = mathSelectionKey(selectedText);
-    if (!selectedKey) return { kind: 'unmatched' };
+    if (!selectedKey || selectedKey.length > MAX_SELECTION_KEY_LENGTH) return { kind: 'unmatched' };
+    if (!math) {
+      const visibleKey = mathSelectionKey(independentVisibleMathText(root));
+      // Source-only SVG/CHTML renderers still support a typical mouse drag
+      // whose endpoints live inside the visual branch. Promote only an exact
+      // complete surface match; every strict partial remains native so source
+      // metadata can never widen what the user highlighted.
+      return visibleKey && selectedKey === visibleKey && sourceOnlyMathAgreesWithVisible(root, pageWindow)
+        ? { kind: 'whole' }
+        : { kind: 'unmatched' };
+    }
+    if (!domTreeWithinBudget(math, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) {
+      return { kind: 'unmatched' };
+    }
     const visualBranch = visibleMathBranchForRange(root, range);
+    const selectsWholeVisualBranch = visualBranch && visualBranchRepresentsWholeMath(root, visualBranch) &&
+      range.startContainer === visualBranch && range.startOffset === 0 &&
+      range.endContainer === visualBranch && range.endOffset === visualBranch.childNodes.length;
+    if (selectsWholeVisualBranch) {
+      return semanticMathAgreesWithVisibleBranch(math, visualBranch)
+        ? { kind: 'whole' }
+        : { kind: 'unmatched' };
+    }
+    const presentation = presentationMathNode(math);
+    if (!presentation || !domTreeWithinBudget(
+      presentation,
+      MAX_PARTIAL_MATCH_NODES,
+      MAX_MATHML_DEPTH
+    )) return { kind: 'unmatched' };
     if (visualBranch && selectedKey === mathSelectionKey(visualBranch.textContent || '')) {
-      return { kind: 'whole' };
+      if (visualBranchRepresentsWholeMath(root, visualBranch)) {
+        return semanticMathAgreesWithVisibleBranch(math, visualBranch)
+          ? { kind: 'whole' }
+          : { kind: 'unmatched' };
+      }
     }
     let selectedOffset = NaN;
     if (visualBranch && nodeInside(visualBranch, range.startContainer)) {
@@ -3536,7 +5369,11 @@
     const structureHints = selectedVisualStructureHints(range, visualBranch);
     const katexVisualOrder = Boolean(root.matches && root.matches('.katex, .katex-display')) ||
       Boolean(root.closest && root.closest('.katex, .katex-display'));
-    const selectedMath = findSelectedMathMLFragment(
+    const directMathMLBranch = visualBranch && visualBranch !== math && nodeInside(math, visualBranch) &&
+      selectedKey === mathSelectionKey(visualBranch.textContent || '')
+      ? wrapMathMLFragment([visualBranch], math.ownerDocument)
+      : null;
+    const selectedMath = directMathMLBranch || findSelectedMathMLFragment(
       math,
       selectedText,
       selectedOffset,
@@ -3565,11 +5402,15 @@
 
   function wholeMathRootPayload(root, settings, pageWindow) {
     const sourceMath = getMathElement(root);
+    if (!sourceMath && !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return null;
+    if (!sourceMath && !sourceOnlyMathAgreesWithVisible(root, pageWindow)) return null;
     const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
     if (sourceMath && !safeMath) return null;
-    const text = safeMath && settings.outputMode !== 'latex'
-      ? mathMLFragmentText(safeMath, settings.outputMode)
-      : extractMathText(root, settings.outputMode, pageWindow);
+    const text = settings.outputMode === 'faithful' && safeMath
+      ? faithfulRenderedMathText(root, safeMath, pageWindow)
+      : (safeMath && settings.outputMode !== 'latex'
+        ? mathMLFragmentText(safeMath, settings.outputMode)
+        : extractMathText(root, settings.outputMode, pageWindow));
     if (!text || !text.trim()) return null;
     const documentObject = root.ownerDocument;
     const richFragment = documentObject.createDocumentFragment();
@@ -3601,7 +5442,7 @@
       return null;
     }
     if (selected.collapsed) return null;
-    const semantic = semanticMathSelectionPayload(root, selected, settings);
+    const semantic = semanticMathSelectionPayload(root, selected, settings, pageWindow);
     if (semantic.kind === 'payload') {
       semantic.payload.display = isDisplayMath(root);
       semantic.payload.mathRanges = 1;
@@ -3611,15 +5452,25 @@
     return null;
   }
 
-  function rawRangePayload(range) {
+  function safeCompanionRangePayload(range, retainRichContext) {
     if (!range || range.collapsed) return null;
-    const textFragment = range.cloneContents();
-    const text = serializeDomFragment(textFragment);
+    const documentObject = range.startContainer && range.startContainer.ownerDocument;
+    if (!documentObject) return null;
+    const fragment = cloneOrdinaryRangeWithContext(range, documentObject);
+    if (!fragment) return null;
+    const text = serializeOrdinaryFragment(fragment).text;
     if (!text && !range.toString()) return null;
-    const richFragment = range.cloneContents();
+    let richFragment = fragment;
+    if (retainRichContext === false) {
+      try {
+        richFragment = range.cloneContents();
+      } catch (_error) {
+        return null;
+      }
+    }
     return {
       text,
-      html: sanitizeRichFragment(richFragment),
+      html: safeOrdinaryRichHTML([richFragment], documentObject),
       mathML: '',
       display: false,
       mathRanges: 0
@@ -3630,6 +5481,46 @@
     return String(html || '')
       .replace(/^<!--StartFragment-->/, '')
       .replace(/<!--EndFragment-->$/, '');
+  }
+
+  function utf8ByteLength(input) {
+    let length = 0;
+    for (const character of String(input == null ? '' : input)) {
+      const point = character.codePointAt(0);
+      length += point <= 0x7f ? 1 : (point <= 0x7ff ? 2 : (point <= 0xffff ? 3 : 4));
+    }
+    return length;
+  }
+
+  function clipboardHTMLFormat(html) {
+    const startMarker = '<!--StartFragment-->';
+    const endMarker = '<!--EndFragment-->';
+    const prefix = '<!doctype html><html><body>' + startMarker;
+    const content = clipboardHTMLBody(html);
+    const suffix = endMarker + '</body></html>';
+    const body = prefix + content + suffix;
+    const placeholder = [
+      'Version:1.0',
+      'StartHTML:0000000000',
+      'EndHTML:0000000000',
+      'StartFragment:0000000000',
+      'EndFragment:0000000000',
+      ''
+    ].join('\r\n');
+    const startHTML = utf8ByteLength(placeholder);
+    const startFragment = startHTML + utf8ByteLength(prefix);
+    const endFragment = startFragment + utf8ByteLength(content);
+    const endHTML = startHTML + utf8ByteLength(body);
+    const field = (value) => String(value).padStart(10, '0');
+    const header = [
+      'Version:1.0',
+      'StartHTML:' + field(startHTML),
+      'EndHTML:' + field(endHTML),
+      'StartFragment:' + field(startFragment),
+      'EndFragment:' + field(endFragment),
+      ''
+    ].join('\r\n');
+    return header + body;
   }
 
   function clipboardPieceSeparator(left, right) {
@@ -3671,8 +5562,11 @@
       const prefix = documentObject.createRange();
       prefix.setStart(range.startContainer, range.startOffset);
       try { prefix.setEndBefore(endRoot); } catch (_error) { return null; }
-      const serialized = serializeRangePayloadWithMath(prefix, settings, pageWindow) || rawRangePayload(prefix);
-      if (serialized) pieces.push(serialized);
+      if (!prefix.collapsed) {
+        const serialized = serializeRangePayloadWithMath(prefix, settings, pageWindow) || safeCompanionRangePayload(prefix, false);
+        if (!serialized) return null;
+        pieces.push(serialized);
+      }
     } else {
       const partial = boundaryMathPayload(startRoot, range, 'start', settings, pageWindow);
       if (!partial) return null;
@@ -3688,8 +5582,9 @@
         return null;
       }
       if (!middle.collapsed) {
-        const serialized = serializeRangePayloadWithMath(middle, settings, pageWindow) || rawRangePayload(middle);
-        if (serialized) pieces.push(serialized);
+        const serialized = serializeRangePayloadWithMath(middle, settings, pageWindow) || safeCompanionRangePayload(middle, false);
+        if (!serialized) return null;
+        pieces.push(serialized);
       }
     }
 
@@ -3701,21 +5596,30 @@
       const suffix = documentObject.createRange();
       try { suffix.setStartAfter(startRoot); } catch (_error) { return null; }
       suffix.setEnd(range.endContainer, range.endOffset);
-      const serialized = serializeRangePayloadWithMath(suffix, settings, pageWindow) || rawRangePayload(suffix);
-      if (serialized) pieces.push(serialized);
+      if (!suffix.collapsed) {
+        const serialized = serializeRangePayloadWithMath(suffix, settings, pageWindow) || safeCompanionRangePayload(suffix, false);
+        if (!serialized) return null;
+        pieces.push(serialized);
+      }
     }
     return combineClipboardPayloads(pieces);
   }
 
-  function serializeRangePayloadWithMath(range, settings, pageWindow) {
-    const originalRoots = rootsForRange(range);
+  function serializeRangePayloadWithMath(range, settings, pageWindow, rootDiscoveryInput) {
+    const rootDiscovery = rootDiscoveryInput || mathRootDiscoveryForRange(range);
+    if (rootDiscovery.overBudget) return null;
+    const originalRoots = rootDiscovery.roots;
     if (!originalRoots.length) return null;
     const startRoot = outermostMathAncestor(range.startContainer);
     const endRoot = outermostMathAncestor(range.endContainer);
     if (originalRoots.length === 1 && startRoot && startRoot === endRoot &&
         nodeInside(startRoot, range.startContainer) && nodeInside(startRoot, range.endContainer)) {
-      const semanticSelection = semanticMathSelectionPayload(startRoot, range, settings);
+      const semanticSelection = semanticMathSelectionPayload(startRoot, range, settings, pageWindow);
       if (semanticSelection.kind === 'payload') return semanticSelection.payload;
+      if (semanticSelection.kind === 'whole') {
+        const whole = wholeMathRootPayload(startRoot, settings, pageWindow);
+        if (whole) return whole;
+      }
       // An exact but unrecognized partial selection must remain exact. Native
       // copying is preferable to silently adding the rest of the equation.
       if (semanticSelection.kind === 'unmatched') return null;
@@ -3724,15 +5628,24 @@
       return serializePartialBoundaryRange(range, startRoot, endRoot, settings, pageWindow);
     }
     const expanded = expandedMathRange(range, originalRoots);
+    if (!rangeDOMWithinBudget(
+      expanded,
+      MAX_RICH_SELECTION_NODES,
+      MAX_RICH_SELECTION_DEPTH,
+      MAX_ORDINARY_SELECTION_MARKUP_LENGTH
+    ) || ordinaryComputedLayoutRisk(expanded, expanded.startContainer.ownerDocument || null)) return null;
     const values = originalRoots.map((root) => {
       const sourceMath = getMathElement(root);
       const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
+      const sourceOnlyAgreement = sourceMath || sourceOnlyMathAgreesWithVisible(root, pageWindow);
       return {
-        text: sourceMath && !safeMath
+        text: !sourceOnlyAgreement || (sourceMath && !safeMath)
           ? ''
-          : (safeMath && settings.outputMode !== 'latex'
-          ? mathMLFragmentText(safeMath, settings.outputMode)
-          : extractMathText(root, settings.outputMode, pageWindow)),
+          : (settings.outputMode === 'faithful' && safeMath
+            ? faithfulRenderedMathText(root, safeMath, pageWindow)
+            : (safeMath && settings.outputMode !== 'latex'
+              ? mathMLFragmentText(safeMath, settings.outputMode)
+              : extractMathText(root, settings.outputMode, pageWindow))),
         display: isDisplayMath(root),
         root,
         safeMath
@@ -3740,20 +5653,22 @@
     });
     if (values.some((value) => !value.text || !value.text.trim())) return null;
 
-    const textFragment = expanded.cloneContents();
+    const documentObject = expanded.startContainer.ownerDocument || null;
+    const textFragment = cloneOrdinaryRangeWithContext(expanded, documentObject);
+    if (!textFragment) return null;
     canonicalMathRoots(textFragment).forEach((root, index) => {
       const value = values[index] || {
         text: extractMathText(root, settings.outputMode, pageWindow),
         display: isDisplayMath(root)
       };
       const replacement = root.ownerDocument.createElement('span');
-      replacement.setAttribute('data-clean-math-copy-value', value.text);
-      replacement.setAttribute('data-clean-math-copy-display', String(value.display));
+      TRUSTED_TEXT_PLACEHOLDERS.set(replacement, { text: value.text, display: Boolean(value.display) });
       root.replaceWith(replacement);
     });
-    const text = serializeDomFragment(textFragment);
+    const text = serializeOrdinaryFragment(textFragment).text;
 
-    const richFragment = expanded.cloneContents();
+    const richFragment = cloneOrdinaryRangeWithContext(expanded, documentObject);
+    if (!richFragment) return null;
     canonicalMathRoots(richFragment).forEach((root, index) => {
       const value = values[index];
       root.replaceWith(value && value.safeMath
@@ -3847,12 +5762,7 @@
         foldedFlags.push(false);
         continue;
       }
-      let normalized = trimmed;
-      try {
-        normalized = normalized.normalize('NFKC');
-      } catch (_error) {
-        // Preserve the styled source if compatibility normalization is absent.
-      }
+      let normalized = normalizeOfficeGlyphs(trimmed);
       normalized = normalized.replace(/^(\p{L})(\d+)$/u, (_match, letter, digits) =>
         letter + toScript(digits, SUBSCRIPTS, '_')
       );
@@ -3895,7 +5805,7 @@
     if (/(?:^|\.)(?:officeapps\.live\.com|office\.com|microsoft365\.com|cloud\.microsoft)$/.test(host) ||
         host === 'word.cloud.microsoft') return true;
     return Boolean(documentObject && documentObject.querySelector && documentObject.querySelector(
-      '#WACViewPanel_EditingElement, #WACViewPanel_ClipboardElement, .WACPageImg, .react-pdf__Page__textContent.textLayer'
+      '#WACViewPanel_EditingElement, #WACViewPanel_ClipboardElement, .WACPageImg'
     ));
   }
 
@@ -3990,6 +5900,11 @@
     }
 
     const marker = 'data-clean-math-copy-office-index';
+    // Clipboard HTML is untrusted. Remove page-authored lookalike markers
+    // before marking the exact semantic roots discovered in this operation.
+    for (const forged of Array.from((parsed.body || parsed).querySelectorAll('[' + marker + ']'))) {
+      forged.removeAttribute(marker);
+    }
     values.forEach((value, index) => value.root.setAttribute(marker, String(index)));
     const cloneBody = () => {
       const fragment = documentObject.createDocumentFragment();
@@ -4003,11 +5918,10 @@
       const value = values[Number(placeholder.getAttribute(marker))];
       if (!value) continue;
       const replacement = documentObject.createElement('span');
-      replacement.setAttribute('data-clean-math-copy-value', value.payload.text);
-      replacement.setAttribute('data-clean-math-copy-display', String(value.display));
+      TRUSTED_TEXT_PLACEHOLDERS.set(replacement, { text: value.payload.text, display: Boolean(value.display) });
       placeholder.replaceWith(replacement);
     }
-    const text = finalizeRewrittenText(serializeDomFragment(textFragment));
+    const text = finalizeRewrittenText(serializeOrdinaryFragment(textFragment).text);
 
     const richFragment = cloneBody();
     for (const placeholder of Array.from(richFragment.querySelectorAll('[' + marker + ']'))) {
@@ -4141,11 +6055,23 @@
     return true;
   }
 
-  function rangeDOMWithinBudget(range, nodeLimit, depthLimit) {
+  function rangeDOMWithinBudget(range, nodeLimit, depthLimit, characterLimit) {
     if (!range || !range.commonAncestorContainer) return false;
     const root = range.commonAncestorContainer;
     const stack = [{ node: root, depth: 0 }];
     let inspected = 1;
+    let characters = 0;
+    const countNode = (node) => {
+      if (!characterLimit || !node) return true;
+      if (node.nodeType === 3) characters += String(node.nodeValue || '').length;
+      if (node.nodeType === 1) {
+        for (const attribute of Array.from(node.attributes || [])) {
+          characters += String(attribute.name || '').length + String(attribute.value || '').length;
+        }
+      }
+      return characters <= characterLimit;
+    };
+    if (!countNode(root)) return false;
     while (stack.length) {
       const current = stack.pop();
       if (!current || !current.node) continue;
@@ -4162,7 +6088,10 @@
         } catch (_error) {
           return false;
         }
-        if (intersects) stack.push({ node: child, depth: current.depth + 1 });
+        if (intersects) {
+          if (!countNode(child)) return false;
+          stack.push({ node: child, depth: current.depth + 1 });
+        }
         child = previous;
       }
     }
@@ -4214,9 +6143,23 @@
     };
   }
 
-  function selectionRanges(documentObject, selection) {
+  function boundedSelectionRangeCount(selection) {
+    if (!selection) return 0;
+    try {
+      const count = Number(selection.rangeCount);
+      if (!Number.isFinite(count) || count < 0 || count > MAX_SELECTION_RANGES) return -1;
+      return Math.floor(count);
+    } catch (_error) {
+      return -1;
+    }
+  }
+
+  function selectionRanges(documentObject, selection, capturedRangeCount) {
     const ranges = [];
-    if (!selection) return ranges;
+    const reportedRangeCount = Number.isInteger(capturedRangeCount)
+      ? capturedRangeCount
+      : boundedSelectionRangeCount(selection);
+    if (reportedRangeCount < 0) return ranges;
     try {
       if (typeof selection.getComposedRanges === 'function') {
         const shadowRoots = [];
@@ -4226,6 +6169,7 @@
         }
         const staticRanges = selection.getComposedRanges({ shadowRoots });
         for (const staticRange of staticRanges) {
+          if (ranges.length >= MAX_SELECTION_RANGES) return [];
           const range = documentObject.createRange();
           range.setStart(staticRange.startContainer, staticRange.startOffset);
           range.setEnd(staticRange.endContainer, staticRange.endOffset);
@@ -4235,11 +6179,665 @@
       }
     } catch (_error) {
       // Older browsers expose getComposedRanges with a different signature.
+      // Discard any partial composed result before trying native ranges.
+      ranges.length = 0;
     }
-    for (let index = 0; index < selection.rangeCount; index += 1) {
-      ranges.push(selection.getRangeAt(index).cloneRange());
+    try {
+      for (let index = 0; index < reportedRangeCount; index += 1) {
+        ranges.push(selection.getRangeAt(index).cloneRange());
+      }
+    } catch (_error) {
+      return [];
     }
     return ranges;
+  }
+
+  function cleanOrdinaryCharacters(input) {
+    return String(input == null ? '' : input)
+      .replace(/\r\n?/g, '\n')
+      // U+200D is intentionally absent: it joins emoji and several writing
+      // systems. Bidi controls and combining marks are also meaningful text.
+      .replace(/[\u00ad\u200b\u2060\ufeff]/g, '')
+      .replace(/\u00a0/g, ' ');
+  }
+
+  function ordinaryWhitespaceMode(element, inheritedMode) {
+    if (!element || element.nodeType !== 1) return inheritedMode || 'normal';
+    const tag = (element.localName || '').toLowerCase();
+    if (tag === 'pre' || tag === 'code' || tag === 'textarea') return 'preserve';
+    const style = String(element.getAttribute && element.getAttribute('style') || '');
+    const declaration = style.match(/(?:^|;)\s*white-space\s*:\s*([^;!]+)/i);
+    if (!declaration) return inheritedMode || 'normal';
+    const value = declaration[1].trim().toLowerCase();
+    if (/^(?:pre|pre-wrap|break-spaces)$/.test(value)) return 'preserve';
+    if (value === 'pre-line') return 'pre-line';
+    if (/^(?:normal|nowrap)$/.test(value)) return 'normal';
+    return inheritedMode || 'normal';
+  }
+
+  function ordinaryModeledListStyle(element) {
+    if (!element || element.nodeType !== 1) return null;
+    let list = element;
+    let tag = (list.localName || '').toLowerCase();
+    if (tag === 'li') {
+      list = element.parentElement;
+      tag = (list && list.localName || '').toLowerCase();
+    }
+    if (!list || !['ul', 'ol'].includes(tag)) return null;
+    if (tag === 'ul') return { type: 'disc', authoredType: false };
+    const authored = list.hasAttribute && list.hasAttribute('type');
+    const type = String(list.getAttribute && list.getAttribute('type') || '1');
+    return {
+      type: ({ '1': 'decimal', a: 'lower-alpha', A: 'upper-alpha', i: 'lower-roman', I: 'upper-roman' })[type] || 'decimal',
+      authoredType: Boolean(authored)
+    };
+  }
+
+  function ordinaryComputedLayoutRisk(range, documentObject) {
+    const view = documentObject && documentObject.defaultView;
+    if (!range || !view || typeof view.getComputedStyle !== 'function') return true;
+    const root = range.commonAncestorContainer && range.commonAncestorContainer.nodeType === 1
+      ? range.commonAncestorContainer
+      : range.commonAncestorContainer && range.commonAncestorContainer.parentElement;
+    if (!root) return true;
+    const stack = [root];
+    let inspected = 0;
+    while (stack.length) {
+      const element = stack.pop();
+      if (!element || element.nodeType !== 1 || !rangeIntersects(range, element)) continue;
+      inspected += 1;
+      if (inspected > MAX_RICH_SELECTION_NODES) return true;
+      const tag = (element.localName || '').toLowerCase();
+      // Semantic MathML is replaced from a separately sanitized clone before
+      // ordinary prose is serialized. Its renderer-internal layout is not a
+      // prose signal, and some DOM engines cannot compute MathML CSS at all.
+      if (element.namespaceURI === MATHML_NAMESPACE) continue;
+      if (ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag) || isVisuallyHiddenElement(element)) continue;
+      try {
+        const computed = view.getComputedStyle(element);
+        const visibility = String(computed && computed.visibility || '').toLowerCase();
+        const display = String(computed && computed.display || '').toLowerCase();
+        const contentVisibility = String(computed && computed.contentVisibility || '').toLowerCase();
+        if (display === 'none' || contentVisibility === 'hidden' || visibility === 'hidden' || visibility === 'collapse') return true;
+
+        const opacity = Number.parseFloat(String(computed && computed.opacity || '1'));
+        const fontSize = Number.parseFloat(String(computed && computed.fontSize || ''));
+        const color = String(computed && computed.color || '').replace(/\s+/g, '').toLowerCase();
+        const textFill = String(computed && (computed.webkitTextFillColor || computed.getPropertyValue &&
+          computed.getPropertyValue('-webkit-text-fill-color')) || '').replace(/\s+/g, '').toLowerCase();
+        if ((Number.isFinite(opacity) && opacity <= 0) || (Number.isFinite(fontSize) && fontSize <= 0) ||
+            color === 'transparent' || /rgba\([^)]*,0(?:\.0+)?\)$/u.test(color) ||
+            textFill === 'transparent' || /rgba\([^)]*,0(?:\.0+)?\)$/u.test(textFill)) return true;
+
+        const clip = String(computed && computed.clip || '').trim().toLowerCase();
+        const clipPath = String(computed && (computed.clipPath || computed.webkitClipPath) || '').trim().toLowerCase();
+        const filter = String(computed && computed.filter || '').trim().toLowerCase();
+        const transform = String(computed && computed.transform || '').trim().toLowerCase();
+        const position = String(computed && computed.position || '').trim().toLowerCase();
+        const floatValue = String(computed && (computed.cssFloat || computed.float) || '').trim().toLowerCase();
+        if ((clip && clip !== 'auto') || (clipPath && clipPath !== 'none') ||
+            (filter && filter !== 'none') || (transform && transform !== 'none') ||
+            /^(?:absolute|fixed)$/u.test(position) || (floatValue && floatValue !== 'none')) return true;
+
+        const textTransform = String(computed && computed.textTransform || '').toLowerCase();
+        if (textTransform && textTransform !== 'none') return true;
+        const textSecurity = String(computed && (computed.webkitTextSecurity || computed.getPropertyValue &&
+          computed.getPropertyValue('-webkit-text-security')) || '').trim().toLowerCase();
+        const fontVariant = String(computed && computed.fontVariant || '').trim().toLowerCase();
+        const fontVariantCaps = String(computed && computed.fontVariantCaps || '').trim().toLowerCase();
+        if ((textSecurity && textSecurity !== 'none') ||
+            (fontVariant && fontVariant !== 'normal' && fontVariant !== 'none') ||
+            (fontVariantCaps && fontVariantCaps !== 'normal')) return true;
+
+        const whiteSpace = String(computed && computed.whiteSpace || '').toLowerCase();
+        const computedMode = /^(?:pre|pre-wrap|break-spaces)$/.test(whiteSpace)
+          ? 'preserve'
+          : (whiteSpace === 'pre-line' ? 'pre-line' : (/^(?:normal|nowrap)$/.test(whiteSpace) ? 'normal' : ''));
+        const modeledMode = ordinaryWhitespaceMode(element, 'normal');
+        if (computedMode && computedMode !== modeledMode) return true;
+
+        const modeledList = ordinaryModeledListStyle(element);
+        if (modeledList) {
+          if (tag === 'li' && display && display !== 'list-item') return true;
+          const listStyleImage = String(computed && computed.listStyleImage || '').trim().toLowerCase();
+          if (listStyleImage && listStyleImage !== 'none') return true;
+          const listStyleType = String(computed && computed.listStyleType || '').trim().toLowerCase();
+          const compatibleBullet = modeledList.type === 'disc' && ['disc', 'circle', 'square'].includes(listStyleType);
+          if (listStyleType && listStyleType !== modeledList.type && !compatibleBullet) {
+            // jsdom and a few older engines do not reflect HTML <ol type> in
+            // computed style and report the default decimal. Non-default CSS
+            // values are still distinguishable and must defer to native copy.
+            if (!(modeledList.authoredType && listStyleType === 'decimal')) return true;
+          }
+        }
+
+        if (/^(?:flex|inline-flex|grid|inline-grid)$/.test(display)) return true;
+
+        if (!['html', 'body', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th'].includes(tag) && display) {
+          const computedBlock = /^(?:block|flex|grid|list-item|table)$/.test(display);
+          const modeledBlock = BLOCK_TAGS.has(tag) || /display\s*:\s*(?:block|flex|grid|list-item|table)/i.test(
+            String(element.getAttribute && element.getAttribute('style') || '')
+          );
+          if (computedBlock !== modeledBlock && display !== 'contents') return true;
+          if (display === 'contents' && modeledBlock) return true;
+        }
+      } catch (_error) {
+        // Layout is part of the copied meaning; an inspection failure must
+        // leave the operation native instead of guessing from source markup.
+        return true;
+      }
+      for (let child = element.lastElementChild; child; child = child.previousElementSibling) {
+        stack.push(child);
+      }
+    }
+    return false;
+  }
+
+  function cloneOrdinaryRangeWithContext(range, documentObject) {
+    if (!rangeDOMWithinBudget(
+      range,
+      MAX_RICH_SELECTION_NODES,
+      MAX_RICH_SELECTION_DEPTH,
+      MAX_ORDINARY_SELECTION_MARKUP_LENGTH
+    ) || ordinaryComputedLayoutRisk(range, documentObject)) return null;
+    let contents;
+    try {
+      contents = range.cloneContents();
+    } catch (_error) {
+      return null;
+    }
+    const common = range.commonAncestorContainer && range.commonAncestorContainer.nodeType === 1
+      ? range.commonAncestorContainer
+      : range.commonAncestorContainer && range.commonAncestorContainer.parentElement;
+    const tag = common && (common.localName || '').toLowerCase();
+    if (!common || !tag || ['html', 'body'].includes(tag)) return contents;
+    try {
+      const safeContextTag = ORDINARY_RICH_TAGS.has(tag) || ['area', 'hr', 'img'].includes(tag) ? tag : 'span';
+      const context = documentObject.createElement(safeContextTag);
+      for (const name of ['start', 'value', 'type', 'dir', 'lang', 'alt']) {
+        if (common.hasAttribute && common.hasAttribute(name)) context.setAttribute(name, common.getAttribute(name));
+      }
+      if (common.hasAttribute && common.hasAttribute('reversed')) context.setAttribute('reversed', '');
+      const sourceStyle = String(common.getAttribute && common.getAttribute('style') || '');
+      const retainedStyle = [];
+      const whitespace = sourceStyle.match(/(?:^|;)\s*white-space\s*:\s*([^;!]+)/i);
+      const display = sourceStyle.match(/(?:^|;)\s*display\s*:\s*([^;!]+)/i);
+      if (whitespace && /^(?:normal|nowrap|pre|pre-wrap|pre-line|break-spaces)$/i.test(whitespace[1].trim())) {
+        retainedStyle.push('white-space:' + whitespace[1].trim().toLowerCase());
+      }
+      if (display && /^(?:block|flex|grid|list-item|table)$/i.test(display[1].trim())) {
+        retainedStyle.push('display:' + display[1].trim().toLowerCase());
+      }
+      if (retainedStyle.length) context.setAttribute('style', retainedStyle.join(';'));
+      context.appendChild(contents);
+      const fragment = documentObject.createDocumentFragment();
+      let outerContext = context;
+      if (tag === 'tr') {
+        const table = documentObject.createElement('table');
+        const body = documentObject.createElement('tbody');
+        body.appendChild(context);
+        table.appendChild(body);
+        outerContext = table;
+      } else if (['thead', 'tbody', 'tfoot', 'caption', 'colgroup'].includes(tag)) {
+        const table = documentObject.createElement('table');
+        table.appendChild(context);
+        outerContext = table;
+      } else if (tag === 'td' || tag === 'th') {
+        const table = documentObject.createElement('table');
+        const body = documentObject.createElement('tbody');
+        const row = documentObject.createElement('tr');
+        row.appendChild(context);
+        body.appendChild(row);
+        table.appendChild(body);
+        outerContext = table;
+      }
+      fragment.appendChild(outerContext);
+      return fragment;
+    } catch (_error) {
+      return contents;
+    }
+  }
+
+  function ordinaryRows(table) {
+    if ((table && table.localName || '').toLowerCase() === 'tr') return [table];
+    const rows = [];
+    const collect = (container) => {
+      for (const child of Array.from(container.children || [])) {
+        const tag = (child.localName || '').toLowerCase();
+        if (tag === 'tr') rows.push(child);
+        else if (['thead', 'tbody', 'tfoot'].includes(tag)) collect(child);
+      }
+    };
+    collect(table);
+    return rows;
+  }
+
+  function ordinaryOrderedListMarker(number, type) {
+    const value = Math.trunc(Number(number));
+    const style = String(type || '1');
+    if (!Number.isFinite(value) || value <= 0 || style === '1') return String(value);
+    if (style === 'A' || style === 'a') {
+      let current = value;
+      let letters = '';
+      while (current > 0) {
+        current -= 1;
+        letters = String.fromCharCode(65 + (current % 26)) + letters;
+        current = Math.floor(current / 26);
+      }
+      return style === 'a' ? letters.toLowerCase() : letters;
+    }
+    if ((style === 'I' || style === 'i') && value <= 3999) {
+      const numerals = [
+        [1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'], [100, 'C'],
+        [90, 'XC'], [50, 'L'], [40, 'XL'], [10, 'X'], [9, 'IX'], [5, 'V'],
+        [4, 'IV'], [1, 'I']
+      ];
+      let current = value;
+      let roman = '';
+      for (const [amount, glyph] of numerals) {
+        while (current >= amount) {
+          roman += glyph;
+          current -= amount;
+        }
+      }
+      return style === 'i' ? roman.toLowerCase() : roman;
+    }
+    return String(value);
+  }
+
+  function serializeOrdinaryFragment(fragment) {
+    let output = '';
+    let pendingSpace = false;
+    let pendingBlockBreak = 0;
+    let displayBoundaryPending = false;
+    const evidence = {
+      artifacts: false,
+      collapsibleWhitespace: false,
+      hiddenOrAlternate: false,
+      structure: false
+    };
+
+    const ensureNewlines = (count) => {
+      pendingSpace = false;
+      const existing = (output.match(/\n*$/) || [''])[0].length;
+      if (existing < count) output += '\n'.repeat(count - existing);
+    };
+    const flushBlock = () => {
+      if (pendingBlockBreak && output) ensureNewlines(pendingBlockBreak);
+      pendingBlockBreak = 0;
+    };
+    const flushSpace = () => {
+      if (!pendingSpace) return;
+      flushBlock();
+      if (output && !/[\s]$/u.test(output)) output += ' ';
+      pendingSpace = false;
+    };
+    const appendNormal = (raw) => {
+      const source = String(raw == null ? '' : raw);
+      const cleaned = cleanOrdinaryCharacters(source);
+      if (cleaned !== source) evidence.artifacts = true;
+      const parts = cleaned.split(/([\t\n\f ]+)/);
+      for (const part of parts) {
+        if (!part) continue;
+        if (/^[\t\n\f ]+$/.test(part)) {
+          if (part !== ' ' || pendingSpace) evidence.collapsibleWhitespace = true;
+          pendingSpace = true;
+          continue;
+        }
+        flushSpace();
+        flushBlock();
+        output += part;
+        displayBoundaryPending = false;
+      }
+    };
+    const appendPreserved = (raw) => {
+      const value = String(raw == null ? '' : raw);
+      if (!value) return;
+      flushSpace();
+      flushBlock();
+      output += value;
+      displayBoundaryPending = false;
+    };
+    const appendGenerated = (value) => {
+      pendingSpace = false;
+      flushBlock();
+      output += String(value == null ? '' : value);
+      displayBoundaryPending = false;
+    };
+    const appendPreLine = (raw) => {
+      const source = String(raw == null ? '' : raw);
+      const cleaned = cleanOrdinaryCharacters(source);
+      if (cleaned !== source) evidence.artifacts = true;
+      const lines = cleaned.split('\n');
+      lines.forEach((line, index) => {
+        if (index) {
+          pendingSpace = false;
+          flushBlock();
+          output += '\n';
+          evidence.structure = true;
+        }
+        appendNormal(line);
+      });
+    };
+    const appendSeparator = (separator) => {
+      pendingSpace = false;
+      pendingBlockBreak = 0;
+      output += separator;
+      evidence.structure = true;
+    };
+    const enterBlock = (separation) => {
+      if (output) pendingBlockBreak = Math.max(pendingBlockBreak, displayBoundaryPending ? 1 : separation);
+    };
+
+    const visitChildren = (node, context) => {
+      for (const child of Array.from(node.childNodes || [])) visit(child, context);
+    };
+    const visitList = (element, context, tag) => {
+      evidence.structure = true;
+      enterBlock(1);
+      const items = Array.from(element.children || []).filter((item) =>
+        (item.localName || '').toLowerCase() === 'li');
+      const reversed = tag === 'ol' && element.hasAttribute('reversed');
+      const hasStart = element.hasAttribute('start');
+      let number = Number(hasStart ? element.getAttribute('start') : (reversed ? items.length : 1));
+      if (!Number.isFinite(number)) number = 1;
+      const numberType = element.getAttribute('type') || '1';
+      let itemIndex = 0;
+      for (const item of items) {
+        if (itemIndex) appendSeparator('\n');
+        const explicitValue = item.hasAttribute('value') ? Number(item.getAttribute('value')) : NaN;
+        if (tag === 'ol' && Number.isFinite(explicitValue)) number = explicitValue;
+        const prefix = '  '.repeat(context.listDepth || 0) +
+          (tag === 'ol' ? ordinaryOrderedListMarker(number, numberType) + '. ' : '• ');
+        appendGenerated(prefix);
+        visitChildren(item, {
+          ...context,
+          listDepth: (context.listDepth || 0) + 1,
+          inListItem: true,
+          listParagraphs: 0
+        });
+        itemIndex += 1;
+        number += reversed ? -1 : 1;
+      }
+      pendingBlockBreak = Math.max(pendingBlockBreak, 1);
+    };
+    const visitTable = (element, context) => {
+      evidence.structure = true;
+      enterBlock(1);
+      const caption = Array.from(element.children || []).find((child) =>
+        (child.localName || '').toLowerCase() === 'caption');
+      if (caption) {
+        visitChildren(caption, context);
+        appendSeparator('\n');
+      }
+      let spanningColumns = [];
+      ordinaryRows(element).forEach((row, rowIndex) => {
+        if (rowIndex) appendSeparator('\n');
+        const cells = Array.from(row.children || []).filter((cell) =>
+          ['td', 'th'].includes((cell.localName || '').toLowerCase()));
+        const newSpans = [];
+        let column = 0;
+        let lastWrittenColumn = -1;
+        let furthestColumn = spanningColumns.reduce((furthest, remaining, index) =>
+          remaining > 0 ? Math.max(furthest, index) : furthest, -1);
+        cells.forEach((cell) => {
+          const colspan = Math.max(1, Math.min(1000, Number(cell.getAttribute('colspan')) || 1));
+          const rowspan = Math.max(1, Math.min(1000, Number(cell.getAttribute('rowspan')) || 1));
+          while (true) {
+            let available = true;
+            for (let offset = 0; offset < colspan; offset += 1) {
+              if ((spanningColumns[column + offset] || 0) > 0) {
+                available = false;
+                break;
+              }
+            }
+            if (available) break;
+            column += 1;
+          }
+          const tabsBefore = lastWrittenColumn < 0 ? column : column - lastWrittenColumn;
+          if (tabsBefore > 0) appendSeparator('\t'.repeat(tabsBefore));
+          visitChildren(cell, { ...context, inTableCell: true, tableBlocks: 0 });
+          pendingSpace = false;
+          pendingBlockBreak = 0;
+          for (let offset = 0; offset < colspan; offset += 1) {
+            if (rowspan > 1) newSpans[column + offset] = Math.max(newSpans[column + offset] || 0, rowspan - 1);
+          }
+          lastWrittenColumn = column;
+          furthestColumn = Math.max(furthestColumn, column + colspan - 1);
+          column += colspan;
+        });
+        const trailingTabs = lastWrittenColumn < 0 ? furthestColumn : furthestColumn - lastWrittenColumn;
+        if (trailingTabs > 0) appendSeparator('\t'.repeat(trailingTabs));
+        const nextSpans = [];
+        const spanWidth = Math.max(spanningColumns.length, newSpans.length);
+        for (let index = 0; index < spanWidth; index += 1) {
+          nextSpans[index] = Math.max(Math.max(0, (spanningColumns[index] || 0) - 1), newSpans[index] || 0);
+        }
+        spanningColumns = nextSpans;
+      });
+      pendingBlockBreak = Math.max(pendingBlockBreak, 1);
+    };
+    const visit = (node, context) => {
+      if (!node) return;
+      if (node.nodeType === 3) {
+        if (context.mode === 'preserve') appendPreserved(node.nodeValue || '');
+        else if (context.mode === 'pre-line') appendPreLine(node.nodeValue || '');
+        else appendNormal(node.nodeValue || '');
+        return;
+      }
+      if (node.nodeType !== 1 && node.nodeType !== 11) return;
+      if (node.nodeType === 11) {
+        visitChildren(node, context);
+        return;
+      }
+      const element = node;
+      const tag = (element.localName || '').toLowerCase();
+      const trustedPlaceholder = TRUSTED_TEXT_PLACEHOLDERS.get(element);
+      if (trustedPlaceholder) {
+        if (trustedPlaceholder.display) {
+          enterBlock(1);
+          pendingSpace = false;
+          flushBlock();
+          output += trustedPlaceholder.text || '';
+          pendingBlockBreak = Math.max(pendingBlockBreak, 1);
+          displayBoundaryPending = true;
+        } else {
+          flushSpace();
+          flushBlock();
+          output += trustedPlaceholder.text || '';
+          displayBoundaryPending = false;
+        }
+        return;
+      }
+      if (ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag) || isVisuallyHiddenElement(element)) {
+        evidence.hiddenOrAlternate = true;
+        return;
+      }
+      if (tag === 'img' || tag === 'area') {
+        const alt = element.getAttribute('alt') || '';
+        if (alt) appendNormal(alt);
+        evidence.hiddenOrAlternate = true;
+        return;
+      }
+      if (tag === 'wbr') return;
+      if (tag === 'br') {
+        pendingSpace = false;
+        flushBlock();
+        output += '\n';
+        evidence.structure = true;
+        return;
+      }
+      if (tag === 'hr') {
+        pendingSpace = false;
+        flushBlock();
+        ensureNewlines(2);
+        evidence.structure = true;
+        return;
+      }
+      const mode = ordinaryWhitespaceMode(element, context.mode);
+      const nextContext = { ...context, mode };
+      if (tag === 'ul' || tag === 'ol') {
+        visitList(element, nextContext, tag);
+        return;
+      }
+      if (tag === 'table' || ['thead', 'tbody', 'tfoot', 'tr'].includes(tag)) {
+        visitTable(element, nextContext);
+        return;
+      }
+      if (tag === 'li') {
+        visitChildren(element, nextContext);
+        return;
+      }
+
+      const style = String(element.getAttribute('style') || '').toLowerCase();
+      const block = BLOCK_TAGS.has(tag) || /display\s*:\s*(?:block|flex|grid|list-item|table)/.test(style);
+      if (!block) {
+        visitChildren(element, nextContext);
+        return;
+      }
+      evidence.structure = true;
+      let separation = tag === 'p' || /^h[1-6]$/.test(tag) ? 2 : 1;
+      if (context.inListItem || context.inTableCell) separation = 1;
+      enterBlock(separation);
+      visitChildren(element, nextContext);
+      pendingBlockBreak = Math.max(pendingBlockBreak, separation);
+    };
+
+    visit(fragment, { mode: 'normal', listDepth: 0, inListItem: false, inTableCell: false });
+    // Collapsible trailing whitespace and structural breaks generated after the
+    // final block are not part of the user's visible selection. Preserved code
+    // text was appended directly and is therefore left untouched.
+    pendingSpace = false;
+    pendingBlockBreak = 0;
+    return { text: output, evidence };
+  }
+
+  function safeOrdinaryRichHTML(fragments, documentObject) {
+    const destination = documentObject.createDocumentFragment();
+    const state = { lastCollapsibleSpace: false };
+
+    const copySafeAttributes = (source, target) => {
+      const dir = String(source.getAttribute('dir') || '').toLowerCase();
+      if (['ltr', 'rtl', 'auto'].includes(dir)) target.setAttribute('dir', dir);
+      const lang = String(source.getAttribute('lang') || '');
+      if (/^[A-Za-z0-9-]{1,35}$/.test(lang)) target.setAttribute('lang', lang);
+      for (const name of ['colspan', 'rowspan', 'start', 'value']) {
+        const value = String(source.getAttribute(name) || '');
+        if (/^-?\d{1,6}$/.test(value)) target.setAttribute(name, value);
+      }
+      if ((source.localName || '').toLowerCase() === 'ol' && source.hasAttribute('reversed')) {
+        target.setAttribute('reversed', '');
+      }
+      const type = String(source.getAttribute('type') || '');
+      if (/^(?:1|a|A|i|I)$/.test(type)) target.setAttribute('type', type);
+    };
+    const cleanNormalRichText = (raw) => {
+      let value = cleanOrdinaryCharacters(raw).replace(/[\t\n\f ]+/g, ' ');
+      if (state.lastCollapsibleSpace) value = value.replace(/^ /, '');
+      state.lastCollapsibleSpace = / $/.test(value);
+      return value;
+    };
+    const rebuild = (node, inheritedMode) => {
+      if (!node) return null;
+      if (node.nodeType === 3) {
+        if (inheritedMode === 'preserve') return documentObject.createTextNode(node.nodeValue || '');
+        let value;
+        if (inheritedMode === 'pre-line') {
+          value = cleanOrdinaryCharacters(node.nodeValue || '')
+            .split('\n').map((line) => line.replace(/[\t\f ]+/g, ' ')).join('\n');
+          state.lastCollapsibleSpace = / $/.test(value);
+        } else value = cleanNormalRichText(node.nodeValue || '');
+        return value ? documentObject.createTextNode(value) : null;
+      }
+      if (node.nodeType !== 1 && node.nodeType !== 11) return null;
+      if (node.nodeType === 11) {
+        const result = documentObject.createDocumentFragment();
+        for (const child of Array.from(node.childNodes || [])) {
+          const rebuilt = rebuild(child, inheritedMode);
+          if (rebuilt) result.appendChild(rebuilt);
+        }
+        return result;
+      }
+      const tag = (node.localName || '').toLowerCase();
+      if (ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag) || isVisuallyHiddenElement(node)) return null;
+      if (tag === 'img' || tag === 'area') return documentObject.createTextNode(node.getAttribute('alt') || '');
+      const mode = ordinaryWhitespaceMode(node, inheritedMode);
+      if (tag === 'br' || BLOCK_TAGS.has(tag) || ['li', 'table', 'tr', 'td', 'th', 'ul', 'ol'].includes(tag)) {
+        state.lastCollapsibleSpace = false;
+      }
+      const container = ORDINARY_RICH_TAGS.has(tag)
+        ? documentObject.createElement(tag)
+        : documentObject.createDocumentFragment();
+      if (container.nodeType === 1) {
+        copySafeAttributes(node, container);
+        // This style is generated from an enumerated whitespace mode, never
+        // copied from page CSS. It keeps intentional preformatted selections
+        // intact when an inline element supplied their whitespace semantics.
+        if (!['pre', 'code'].includes(tag) && mode !== inheritedMode && mode !== 'normal') {
+          container.setAttribute('style', 'white-space:' + (mode === 'preserve' ? 'pre-wrap' : 'pre-line') + ';');
+        }
+      }
+      for (const child of Array.from(node.childNodes || [])) {
+        const rebuilt = rebuild(child, mode);
+        if (rebuilt) container.appendChild(rebuilt);
+      }
+      if (tag === 'br' || BLOCK_TAGS.has(tag) || ['li', 'table', 'tr', 'td', 'th', 'ul', 'ol'].includes(tag)) {
+        state.lastCollapsibleSpace = false;
+      }
+      return container;
+    };
+
+    fragments.forEach((fragment, index) => {
+      if (index) destination.appendChild(documentObject.createElement('br'));
+      const rebuilt = rebuild(fragment, 'normal');
+      if (rebuilt) destination.appendChild(rebuilt);
+    });
+    const wrapper = documentObject.createElement('div');
+    wrapper.appendChild(destination);
+    return '<!--StartFragment-->' + wrapper.innerHTML + '<!--EndFragment-->';
+  }
+
+  function ordinarySelectionPayload(documentObject, selection, pageWindow, target, capturedRanges) {
+    if (!documentObject || !selection || selection.isCollapsed || isTextControl(target)) return null;
+    const suppliedRanges = Array.isArray(capturedRanges) ? capturedRanges : null;
+    const rangeCount = suppliedRanges ? suppliedRanges.length : boundedSelectionRangeCount(selection);
+    if (rangeCount <= 0 || rangeCount > MAX_SELECTION_RANGES) return null;
+    if (isMicrosoftOfficeWebPage(documentObject, pageWindow) ||
+        isContentEditableSelection(documentObject, target, selection) ||
+        isRawLatexProtected(target, selection, false)) return null;
+    const ranges = suppliedRanges || selectionRanges(documentObject, selection, rangeCount);
+    if (!ranges.length) return null;
+    const nativeText = ranges.map((range) => range.toString()).join('\n');
+    if (!nativeText) return null;
+
+    const values = [];
+    for (const range of ranges) {
+      const fragment = cloneOrdinaryRangeWithContext(range, documentObject);
+      if (!fragment) {
+        // A null clone means the selection was over budget, its computed
+        // layout contained semantics our bounded serializer cannot model, or
+        // cloning failed. Range#toString can include CSS-hidden text, so even
+        // character-only cleanup would risk copying content the user never
+        // saw. Leave the clipboard completely native in every such case.
+        return null;
+      }
+      const serialized = serializeOrdinaryFragment(fragment);
+      values.push({ fragment, ...serialized });
+    }
+    const text = values.map((value) => value.text).join('\n');
+    if (!text.trim() || text === nativeText) return null;
+    const confidentlyBetter = values.some((value) =>
+      value.evidence.artifacts || value.evidence.collapsibleWhitespace ||
+      value.evidence.hiddenOrAlternate || value.evidence.structure);
+    if (!confidentlyBetter) return null;
+    const onlyInvisibleArtifacts = hasCleanableArtifacts(nativeText) && cleanOrdinaryCharacters(nativeText) === text;
+    return {
+      text,
+      html: safeOrdinaryRichHTML(values.map((value) => value.fragment), documentObject),
+      mathML: '',
+      reason: onlyInvisibleArtifacts ? 'invisible-artifacts' : 'ordinary-text-cleanup',
+      mathRanges: 0
+    };
   }
 
   function positionedStyleNumber(element, property) {
@@ -4285,7 +6883,9 @@
   function normalizeOfficeGlyphs(input) {
     let value = cleanClipboardText(String(input == null ? '' : input));
     try {
-      value = value.normalize('NFKC');
+      value = Array.from(value, (character) =>
+        OFFICE_SEMANTIC_LETTERLIKE.has(character) ? character : character.normalize('NFKC')
+      ).join('');
     } catch (_error) {
       // Use the original characters on engines without compatibility normalization.
     }
@@ -4297,28 +6897,65 @@
     if (outputMode === 'calculator') return kind === 'sub' ? '_(' + normalized + ')' : '^(' + normalized + ')';
     if (outputMode === 'latex') return kind === 'sub' ? '_{' + normalized + '}' : '^{' + normalized + '}';
     if (outputMode === 'ascii') return kind === 'sub' ? '_' + normalized : '^' + normalized;
+    if (outputMode === 'faithful') {
+      return toFaithfulScript(normalized, kind === 'sub' ? SUBSCRIPTS : SUPERSCRIPTS, kind === 'sub' ? '_' : '^');
+    }
     return toScript(normalized, kind === 'sub' ? SUBSCRIPTS : SUPERSCRIPTS, kind === 'sub' ? '_' : '^');
   }
 
-  function serializePositionedOfficeRange(range, settings, documentObject) {
-    const container = range.commonAncestorContainer.nodeType === 1
+  function positionedTokenElementsForRange(range, documentObject) {
+    const container = range && range.commonAncestorContainer && range.commonAncestorContainer.nodeType === 1
       ? range.commonAncestorContainer
-      : range.commonAncestorContainer.parentElement;
-    const page = container && container.closest && container.closest('.react-pdf__Page, .textLayer');
-    const searchRoot = page || documentObject;
-    const tokenElements = Array.from(searchRoot.querySelectorAll(
+      : range && range.commonAncestorContainer && range.commonAncestorContainer.parentElement;
+    if (!container || !container.matches) return [];
+    const contextSelector = '.react-pdf__Page, .react-pdf__Page__textContent.textLayer, .textLayer';
+    const inPositionedContext = container.matches(contextSelector) ||
+      Boolean(container.closest && container.closest(contextSelector)) ||
+      Boolean(container.querySelector && container.querySelector(contextSelector));
+    if (!inPositionedContext) return [];
+
+    const tokenSelector =
       '.react-pdf__Page__textContent.textLayer .markedContent span[role="presentation"] > span[tabindex], ' +
-      '.textLayer .markedContent span[role="presentation"] > span[tabindex]'
-    ));
+      '.textLayer .markedContent span[role="presentation"] > span[tabindex]';
+    const candidates = [];
+    const collect = (element) => {
+      if (!element || !element.matches || !element.matches(tokenSelector)) return true;
+      candidates.push(element);
+      return candidates.length <= MAX_POSITIONED_TOKEN_CANDIDATES;
+    };
+
+    // querySelectorAll must traverse an entire page before its length can be
+    // inspected. A bounded TreeWalker can abandon a hostile or accidental
+    // text layer as soon as either the node or token ceiling is reached.
+    if (documentObject && typeof documentObject.createTreeWalker === 'function') {
+      const walker = documentObject.createTreeWalker(container, 1);
+      let inspected = 1;
+      if (!collect(container)) return POSITIONED_OVER_BUDGET;
+      for (let element = walker.nextNode(); element; element = walker.nextNode()) {
+        inspected += 1;
+        if (inspected > MAX_POSITIONED_DISCOVERY_NODES || !collect(element)) return POSITIONED_OVER_BUDGET;
+      }
+      return candidates;
+    }
+
+    const fallback = Array.from(container.querySelectorAll ? container.querySelectorAll(tokenSelector) : []);
+    return fallback.length <= MAX_POSITIONED_TOKEN_CANDIDATES ? fallback : POSITIONED_OVER_BUDGET;
+  }
+
+  function serializePositionedOfficeRange(range, settings, documentObject) {
+    const tokenElements = positionedTokenElementsForRange(range, documentObject);
+    if (tokenElements === POSITIONED_OVER_BUDGET) return POSITIONED_OVER_BUDGET;
+    if (!tokenElements || tokenElements.length < 2) return null;
     const items = [];
-    tokenElements.forEach((element, order) => {
+    for (let order = 0; order < tokenElements.length; order += 1) {
+      const element = tokenElements[order];
       const selected = selectedTokenText(range, element, documentObject);
-      if (!selected) return;
+      if (!selected) continue;
       const positioned = element.parentElement;
       const size = positionedStyleNumber(positioned, 'font-size');
       const left = positionedStyleNumber(positioned, 'left');
       const top = positionedStyleNumber(positioned, 'top');
-      if (![size, left, top].every(Number.isFinite)) return;
+      if (![size, left, top].every(Number.isFinite)) continue;
       const width = positionedStyleNumber(positioned, 'width');
       items.push({
         element,
@@ -4333,17 +6970,23 @@
         script: null,
         attachedTo: null
       });
-    });
+      if (items.length > MAX_POSITIONED_SELECTED_TOKENS) return POSITIONED_OVER_BUDGET;
+    }
     if (items.length < 2) return null;
 
+    const styledMath = items.some((item) => hasMathematicalStyledCharacter(item.text));
+    const mathSignal = styledMath || items.some((item) => /[=≠≈≤≥∝×÷Ωμ]/u.test(item.text));
+    if (!mathSignal) return null;
+
     let scriptCount = 0;
+    const recentByMarkedContent = new Map();
+    const scriptsByBase = new Map();
     for (const item of items) {
-      const possibleBases = items.filter((base) =>
-        base !== item && base.marked === item.marked && base.order < item.order &&
-        item.size / base.size <= 0.82 && item.size / base.size >= 0.55
-      );
-      possibleBases.sort((left, right) => right.order - left.order);
-      for (const base of possibleBases) {
+      const recent = recentByMarkedContent.get(item.marked) || [];
+      for (let index = recent.length - 1; index >= 0; index -= 1) {
+        const base = recent[index];
+        const ratio = item.size / base.size;
+        if (ratio > 0.82 || ratio < 0.55) continue;
         const gap = item.left - (base.left + base.width);
         const delta = (item.top - base.top) / base.size;
         if (gap < -0.25 * base.size || gap > 0.65 * base.size) continue;
@@ -4351,16 +6994,19 @@
         else if (delta <= -0.08) item.script = 'sup';
         else continue;
         item.attachedTo = base;
+        const scripts = scriptsByBase.get(base) || [];
+        scripts.push(item);
+        scriptsByBase.set(base, scripts);
         scriptCount += 1;
         break;
       }
+      recent.push(item);
+      if (recent.length > MAX_POSITIONED_BASE_LOOKBACK) recent.shift();
+      recentByMarkedContent.set(item.marked, recent);
     }
     if (!scriptCount) return null;
-    const styledMath = items.some((item) => hasMathematicalStyledCharacter(item.text));
-    const mathSignal = styledMath || items.some((item) => /[=≠≈≤≥∝×÷Ωμ]/u.test(item.text));
-    if (!mathSignal) return null;
 
-    const baseItems = items.filter((item) => !item.attachedTo).sort((left, right) => left.order - right.order);
+    const baseItems = items.filter((item) => !item.attachedTo);
     let plain = '';
     let previous = null;
     const rich = documentObject.createDocumentFragment();
@@ -4385,7 +7031,7 @@
       if (spacing) { plain += spacing; richWrapper.appendChild(documentObject.createTextNode(spacing)); }
       plain += value;
       richWrapper.appendChild(documentObject.createTextNode(richValue));
-      const scripts = items.filter((candidate) => candidate.attachedTo === item).sort((left, right) => left.order - right.order);
+      const scripts = scriptsByBase.get(item) || [];
       for (const script of scripts) {
         plain += officeScriptText(script.normalized, script.script, settings.outputMode);
         const scriptNode = documentObject.createElement(script.script === 'sub' ? 'sub' : 'sup');
@@ -4409,8 +7055,9 @@
     return { text: plain, html: sanitizeRichFragment(rich), mathML: '' };
   }
 
-  function positionedOfficePayload(ranges, settings, documentObject) {
+  function positionedOfficePayload(ranges, settings, documentObject, reportOverBudget) {
     const payloads = ranges.map((range) => serializePositionedOfficeRange(range, settings, documentObject));
+    if (payloads.includes(POSITIONED_OVER_BUDGET)) return reportOverBudget ? POSITIONED_OVER_BUDGET : null;
     if (!payloads.some(Boolean)) return null;
     if (payloads.some((payload) => !payload)) return null;
     const text = finalizeRewrittenText(payloads.map((payload) => payload.text).join('\n'));
@@ -4430,6 +7077,26 @@
     return tag === 'textarea' || (tag === 'input' && !['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'color', 'range'].includes((target.type || 'text').toLowerCase()));
   }
 
+  function selectedNativeClipboardText(selection, target) {
+    if (isTextControl(target)) {
+      const type = String(target.type || '').toLowerCase();
+      // Browsers intentionally protect password values from ordinary copy;
+      // an async replay must not weaken that boundary.
+      if (type === 'password') return '';
+      const start = Number(target.selectionStart);
+      const end = Number(target.selectionEnd);
+      if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+        return String(target.value || '').slice(start, end);
+      }
+      return '';
+    }
+    try {
+      return selection ? String(selection.toString()) : '';
+    } catch (_error) {
+      return '';
+    }
+  }
+
   function isContentEditableSelection(documentObject, target, selection) {
     if (documentObject && String(documentObject.designMode || '').toLowerCase() === 'on') return true;
     const endpoints = [target, selection && selection.anchorNode, selection && selection.focusNode];
@@ -4445,46 +7112,89 @@
     return false;
   }
 
-  function isRawLatexProtected(target, selection) {
-    const element = target && target.nodeType === 1 ? target : target && target.parentElement;
-    if (element && element.closest && element.closest('pre, code, textarea, input, [data-clean-math-copy-preserve]')) return true;
-    const anchor = selection && selection.anchorNode;
-    const anchorElement = anchor && anchor.nodeType === 1 ? anchor : anchor && anchor.parentElement;
-    return Boolean(anchorElement && anchorElement.closest && anchorElement.closest('pre, code, textarea, input, [data-clean-math-copy-preserve]'));
+  function isRawLatexProtected(target, selection, inspectSelectedRanges, capturedRanges) {
+    const selector = 'pre, code, textarea, input, [data-clean-math-copy-preserve]';
+    for (const endpoint of [target, selection && selection.anchorNode, selection && selection.focusNode]) {
+      const element = endpoint && endpoint.nodeType === 1 ? endpoint : endpoint && endpoint.parentElement;
+      if (element && element.closest && element.closest(selector)) return true;
+    }
+    if (inspectSelectedRanges === false) return false;
+    let ranges = Array.isArray(capturedRanges) ? capturedRanges : null;
+    if (!ranges) {
+      const rangeCount = boundedSelectionRangeCount(selection);
+      if (rangeCount < 0) return true;
+      if (!rangeCount) return false;
+      ranges = [];
+      try {
+        for (let index = 0; index < rangeCount; index += 1) ranges.push(selection.getRangeAt(index));
+      } catch (_error) {
+        return true;
+      }
+    }
+    for (const range of ranges) {
+      const common = range.commonAncestorContainer && range.commonAncestorContainer.nodeType === 1
+        ? range.commonAncestorContainer
+        : range.commonAncestorContainer && range.commonAncestorContainer.parentElement;
+      if (!common || !common.querySelectorAll) continue;
+      try {
+        if (common.matches && common.matches(selector) && rangeIntersects(range, common)) return true;
+        for (const protectedNode of common.querySelectorAll(selector)) {
+          if (rangeIntersects(range, protectedNode)) return true;
+        }
+      } catch (_error) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function getCopyPayload(documentObject, selection, settingsInput, pageWindow, target) {
     const settings = normalizeSettings(settingsInput);
-    if (!selection || selection.isCollapsed || selection.rangeCount === 0 || isTextControl(target)) return null;
-    const ranges = selectionRanges(documentObject, selection);
+    if (!selection || selection.isCollapsed || isTextControl(target)) return null;
+    const rangeCount = boundedSelectionRangeCount(selection);
+    if (rangeCount <= 0) return null;
+    const ranges = selectionRanges(documentObject, selection, rangeCount);
     if (!ranges.length) return null;
-    if (!ranges.some((range) => rootsForRange(range).length)) {
-      const positioned = positionedOfficePayload(ranges, settings, documentObject);
-      if (positioned) return positioned;
-    }
-    const rewritten = [];
-    const rich = [];
-    const mathMLPayloads = [];
-    let mathRanges = 0;
+    const positioned = positionedOfficePayload(ranges, settings, documentObject, true);
+    if (positioned === POSITIONED_OVER_BUDGET) return null;
+    if (positioned) return positioned;
+    // An adversarial or document-wide selection with hundreds of independent
+    // formulas is safer left to the browser than synchronously rewriting it.
+    const rootDiscoveries = [];
+    let totalMathRoots = 0;
     for (const range of ranges) {
-      const serialized = serializeRangePayloadWithMath(range, settings, pageWindow);
-      if (serialized != null) {
+      const discovery = mathRootDiscoveryForRange(range);
+      if (discovery.overBudget) return null;
+      totalMathRoots += discovery.roots.length;
+      if (totalMathRoots > MAX_MATH_ROOTS_PER_SELECTION) return null;
+      rootDiscoveries.push(discovery);
+    }
+    const hasRenderedMath = rootDiscoveries.some((discovery) => discovery.roots.length);
+    if (hasRenderedMath) {
+      const rewritten = [];
+      const rich = [];
+      const mathMLPayloads = [];
+      let mathRanges = 0;
+      for (let index = 0; index < ranges.length; index += 1) {
+        const range = ranges[index];
+        const discovery = rootDiscoveries[index];
+        const serialized = discovery.roots.length
+          ? serializeRangePayloadWithMath(range, settings, pageWindow, discovery)
+          : safeCompanionRangePayload(range);
+        // A failed math rewrite, over-budget companion, or computed layout we
+        // cannot faithfully model must make the entire multi-range operation
+        // native. Raw Range#toString can include CSS-hidden text.
+        if (!serialized) return null;
         rewritten.push(serialized.text);
         rich.push(serialized.html);
         if (serialized.mathML) mathMLPayloads.push(serialized.mathML);
-        mathRanges += 1;
-      } else {
-        const nativeRangeText = range.toString();
-        rewritten.push(nativeRangeText);
-        rich.push(escapeClipboardHTML(nativeRangeText));
+        mathRanges += serialized.mathRanges || (discovery.roots.length ? 1 : 0);
       }
-    }
-    if (mathRanges > 0) {
       const finalized = finalizeRewrittenText(rewritten.join('\n'));
-      if (!finalized.trim()) return null;
+      if (!finalized.trim() || !mathRanges) return null;
       return {
         text: finalized,
-        html: rich.join('<br>'),
+        html: '<!--StartFragment-->' + rich.map(clipboardHTMLBody).join('<br>') + '<!--EndFragment-->',
         mathML: ranges.length === 1 && mathMLPayloads.length === 1 ? mathMLPayloads[0] : '',
         reason: 'rendered-math',
         mathRanges
@@ -4492,24 +7202,21 @@
     }
 
     const nativeText = ranges.map((range) => range.toString()).join('\n');
-    if (settings.convertDelimitedLatex && !isRawLatexProtected(target, selection)) {
+    const rawLatexProtected = isRawLatexProtected(target, selection, true, ranges);
+    if (settings.convertDelimitedLatex && !rawLatexProtected) {
       const converted = convertDelimitedLatexText(nativeText, settings.outputMode);
       const finalized = finalizeRewrittenText(converted.text);
       if (converted.converted > 0 && finalized.trim()) return { text: finalized, reason: 'delimited-latex', mathRanges: 0 };
     }
     const shouldDeferStandaloneMath = isMicrosoftOfficeWebPage(documentObject, pageWindow) ||
       isContentEditableSelection(documentObject, target, selection);
-    if (!shouldDeferStandaloneMath && !isRawLatexProtected(target, selection)) {
+    if (!shouldDeferStandaloneMath && !rawLatexProtected) {
       const unicodeMath = standaloneUnicodeMathPayload(nativeText, ranges, settings, documentObject);
       if (unicodeMath) return unicodeMath;
     }
-    if (settings.cleanInvisibleArtifacts && hasCleanableArtifacts(nativeText)) {
-      const cleaned = cleanClipboardText(nativeText);
-      // Editors such as Word for the web populate their real clipboard payload
-      // in their own copy handler even though Selection.toString() is only an
-      // NBSP placeholder. Never preempt that handler with an empty clipboard.
-      if (!cleaned.trim()) return null;
-      return { text: cleaned, reason: 'invisible-artifacts', mathRanges: 0 };
+    if (settings.cleanInvisibleArtifacts) {
+      const ordinary = ordinarySelectionPayload(documentObject, selection, pageWindow, target, ranges);
+      if (ordinary) return ordinary;
     }
     return null;
   }
@@ -4580,11 +7287,28 @@
     return Promise.resolve(false);
   }
 
-  function writeClipboardPayload(payload, pageWindow, isCurrentInput) {
-    const isCurrent = typeof isCurrentInput === 'function' ? isCurrentInput : () => true;
+  let clipboardWriteTail = Promise.resolve();
+  let pendingClipboardWrites = 0;
+
+  function enqueueClipboardWrite(operation) {
+    pendingClipboardWrites += 1;
+    const previous = clipboardWriteTail;
+    const result = previous.then(operation, operation);
+    clipboardWriteTail = result.then(
+      () => { pendingClipboardWrites -= 1; },
+      () => { pendingClipboardWrites -= 1; }
+    );
+    return result.then((value) => value, () => false);
+  }
+
+  function hasPendingClipboardWrite() {
+    return pendingClipboardWrites > 0;
+  }
+
+  function writeClipboardPayloadNow(payload, pageWindow, isCurrent) {
     if (!payload || !payload.text || !payload.text.trim() || !isCurrent()) return Promise.resolve(false);
     const writePlainFallback = () => isCurrent()
-      ? setClipboardFromMenu(payload.text)
+      ? setClipboardFromMenu(payload.text).then((written) => Boolean(written && isCurrent()))
       : Promise.resolve(false);
     try {
       const ClipboardItemConstructor = pageWindow && pageWindow.ClipboardItem;
@@ -4599,7 +7323,7 @@
         if (payload.mathML) representations['application/mathml+xml'] = new BlobConstructor([payload.mathML], { type: 'application/mathml+xml' });
         const write = (formats) => Promise.resolve().then(() => {
           if (!isCurrent()) return false;
-          return Promise.resolve(clipboard.write([new ClipboardItemConstructor(formats)])).then(() => true);
+          return Promise.resolve(clipboard.write([new ClipboardItemConstructor(formats)])).then(() => Boolean(isCurrent()));
         });
         return write(representations).then(
           (written) => written,
@@ -4618,6 +7342,25 @@
       // Fall through to the userscript/plain-text clipboard helper.
     }
     return writePlainFallback();
+  }
+
+  function enqueueClipboardPayload(resolvePayload, pageWindow, isCurrentInput) {
+    const isCurrent = typeof isCurrentInput === 'function' ? isCurrentInput : () => true;
+    return enqueueClipboardWrite(() => {
+      if (!isCurrent()) return false;
+      let payload;
+      try {
+        payload = typeof resolvePayload === 'function' ? resolvePayload() : resolvePayload;
+      } catch (_error) {
+        return false;
+      }
+      return writeClipboardPayloadNow(payload, pageWindow, isCurrent);
+    });
+  }
+
+  function writeClipboardPayload(payload, pageWindow, isCurrentInput) {
+    if (!payload || !payload.text || !payload.text.trim()) return Promise.resolve(false);
+    return enqueueClipboardPayload(payload, pageWindow, isCurrentInput);
   }
 
   function payloadFromOfficeStagingElement(element, settings, documentObject) {
@@ -4705,7 +7448,13 @@
       state.lastSemanticMathML = false;
     }
     write('text/plain', payload.text);
-    if (payload.html) write('text/html', payload.html);
+    if (payload.html) {
+      write('text/html', payload.html);
+      // Windows/Office exposes CF_HTML as "HTML Format" and some consumers
+      // prefer it over text/html. Never leave a page-authored unsafe flavor
+      // beside the sanitized representation.
+      write('HTML Format', clipboardHTMLFormat(payload.html));
+    }
     if (payload.mathML) {
       for (const type of mathTypes) write(type, payload.mathML);
       state.lastSemanticMathML = true;
@@ -4791,7 +7540,10 @@
         state.semanticPriority = semantic.semanticScope === 'mixed' ? 30 : 20;
         if (!applyOfficePayloadDirect(event.clipboardData, state, semantic)) {
           event.clipboardData.setData('text/plain', semantic.text);
-          if (semantic.html) event.clipboardData.setData('text/html', semantic.html);
+          if (semantic.html) {
+            event.clipboardData.setData('text/html', semantic.html);
+            event.clipboardData.setData('HTML Format', clipboardHTMLFormat(semantic.html));
+          }
         }
         if (state.recovery) state.recovery.stop();
         event.preventDefault();
@@ -4820,6 +7572,7 @@
     Object.defineProperty(documentObject, '__cleanMathCopyInstalled', { value: true, configurable: true });
     const pageWindow = getPageWindow(userscriptGlobal || global);
     let settings = loadSettings();
+    let settingsGeneration = 0;
     const handledEvents = new WeakSet();
     const officeCopyStates = new WeakMap();
     let activeOfficeState = null;
@@ -4828,8 +7581,12 @@
 
     try {
       if (global.GM && typeof global.GM.getValue === 'function') {
+        const loadGeneration = settingsGeneration;
         Promise.resolve(global.GM.getValue(STORAGE_KEY, DEFAULT_SETTINGS)).then((stored) => {
-          settings = normalizeSettings(stored);
+          // A menu command can run while an asynchronous manager read is
+          // pending. Never let that stale startup value overwrite the newer
+          // in-memory choice the user has already made and persisted.
+          if (settingsGeneration === loadGeneration) settings = normalizeSettings(stored);
         }, () => {});
       }
     } catch (_error) {
@@ -4841,7 +7598,8 @@
       handledEvents.add(event);
       // Any newer keyboard/context-menu copy invalidates an in-flight manual
       // Clipboard API retry just as another manual command would.
-      manualClipboardGeneration += 1;
+      const replayAfterPendingWrite = hasPendingClipboardWrite();
+      const clipboardGeneration = ++manualClipboardGeneration;
       let officeState = null;
       if (isMicrosoftOfficeWebPage(documentObject, pageWindow)) {
         if (activeOfficeState && activeOfficeState.recovery) activeOfficeState.recovery.stop();
@@ -4868,6 +7626,25 @@
       }
       const selection = documentObject.getSelection ? documentObject.getSelection() : null;
       const payload = getCopyPayload(documentObject, selection, settings, pageWindow, event.target);
+      if (replayAfterPendingWrite) {
+        const selectedNativeText = selectedNativeClipboardText(selection, event.target);
+        const isReplayCurrent = () => manualClipboardGeneration === clipboardGeneration;
+        // A Clipboard API call that already started cannot be cancelled. Queue
+        // a replay behind it so its late completion cannot become the final
+        // clipboard state. Resolve Office/site data only when the replay runs,
+        // after the rest of this copy event has had a chance to populate it.
+        enqueueClipboardPayload(() => {
+          if (officeState && officeState.semanticPayload) return officeState.semanticPayload;
+          if (payload && payload.text && payload.text.trim()) return payload;
+          const types = clipboardTypes(event.clipboardData);
+          const plainType = types.find((type) => /^(?:text\/plain|text|unicode)$/i.test(type)) || 'text/plain';
+          const eventText = clipboardGet(event.clipboardData, plainType);
+          const text = eventText || (officeState && officeState.nativePlain) || selectedNativeText;
+          return text && text.trim()
+            ? { text, html: '', mathML: '', reason: 'pending-copy-replay', mathRanges: 0 }
+            : null;
+        }, pageWindow, isReplayCurrent);
+      }
       if (!payload || !payload.text || !payload.text.trim() || !event.clipboardData) return;
       try {
         if (typeof event.clipboardData.clearData === 'function') event.clipboardData.clearData();
@@ -4916,15 +7693,22 @@
         ? global.GM.registerMenuCommand.bind(global.GM)
         : null);
     if (registerMenuCommand) {
-      const setMode = (mode) => {
-        settings = saveSettings({ ...settings, outputMode: mode });
+      const updateSettings = (nextSettings) => {
+        settingsGeneration += 1;
+        settings = saveSettings(nextSettings);
       };
-      registerMenuCommand('Clean Math Copy: calculator-safe output (recommended)', () => setMode('calculator'));
-      registerMenuCommand('Clean Math Copy: readable Unicode output', () => setMode('unicode'));
+      const setMode = (mode) => {
+        updateSettings({ ...settings, outputMode: mode });
+      };
+      registerMenuCommand('Clean Math Copy: faithful readable output (recommended)', () => setMode('faithful'));
+      registerMenuCommand('Clean Math Copy: calculator-safe output', () => setMode('calculator'));
       registerMenuCommand('Clean Math Copy: original LaTeX output', () => setMode('latex'));
       registerMenuCommand('Clean Math Copy: ASCII-only output', () => setMode('ascii'));
       registerMenuCommand('Clean Math Copy: toggle raw $...$ conversion', () => {
-        settings = saveSettings({ ...settings, convertDelimitedLatex: !settings.convertDelimitedLatex });
+        updateSettings({ ...settings, convertDelimitedLatex: !settings.convertDelimitedLatex });
+      });
+      registerMenuCommand('Clean Math Copy: toggle ordinary-text cleanup', () => {
+        updateSettings({ ...settings, cleanInvisibleArtifacts: !settings.cleanInvisibleArtifacts });
       });
       registerMenuCommand('Clean Math Copy: copy current selection now', () => {
         // A manual copy is newer than any pending Office staging recovery.
@@ -4939,12 +7723,14 @@
         const payload = getCopyPayload(documentObject, selection, settings, pageWindow, selection && selection.anchorNode);
         if (payload) return writeClipboardPayload(payload, pageWindow, isCurrent);
         const text = cleanClipboardText(selection ? selection.toString() : '');
-        return text && isCurrent() ? setClipboardFromMenu(text) : Promise.resolve(false);
+        return text && isCurrent()
+          ? writeClipboardPayload({ text, html: '', mathML: '', reason: 'manual-plain', mathRanges: 0 }, pageWindow, isCurrent)
+          : Promise.resolve(false);
       });
       registerMenuCommand('Clean Math Copy: show current settings', () => {
         const message = 'Clean Math Copy v' + VERSION + '\nOutput: ' + settings.outputMode +
           '\nConvert selected $...$ / \\(...\\): ' + (settings.convertDelimitedLatex ? 'on' : 'off') +
-          '\nClean invisible copy artifacts: ' + (settings.cleanInvisibleArtifacts ? 'on' : 'off');
+          '\nClean ordinary copied text: ' + (settings.cleanInvisibleArtifacts ? 'on' : 'off');
         if (typeof global.alert === 'function') global.alert(message);
       });
     }
@@ -4965,11 +7751,14 @@
     hasCleanableArtifacts,
     install,
     latexToCalculator,
+    latexToFaithful,
     latexToUnicode,
     mathMLToCalculator,
+    mathMLToFaithful,
     mathMLToLatex: mathMLToLatexNode,
     mathMLToUnicode,
     normalizeSettings,
+    ordinarySelectionPayload,
     ommlToMathML,
     positionedOfficePayload,
     rootsForRange,

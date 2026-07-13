@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.0.0 — 2026-07-13
+
+- Changed the default plain-text mode from calculator syntax to faithful readable math. Rendered structure now pastes with real primes, superscripts/subscripts, roots, bars, norms, authored multiplication, and minimally grouped fractions; calculator-safe output remains a persistent menu option.
+- Added exact end-to-end regressions for `(y′)² = 20x′`, `F_g = G((m₁m₂)/r²)`, and `r ∝ √(m/|q|)` across raw LaTeX and real KaTeX MathML/visual pairs.
+- Added role-aware faithful MathML and LaTeX serialization for functions, invisible products, relations, aggregates, limits, matrices, cases, scientific notation, and exact partial selections without changing the proven calculator serializer.
+- Added canonical TeX symbol variants, mathematical alphabets, prescripts, combining accents, cancellation/boxes, binomial and generic zero-line stacks, evaluation bars, and relation-aware aligned/gathered rows, with matching safe rich HTML where browsers support it.
+- Added DOM-aware ordinary-text cleanup for accidental source wraps and repeated collapsible spaces while preserving paragraphs, explicit breaks, nested and ordered lists, table cells, preformatted islands, code spacing, emoji, combining marks, and bidirectional text.
+- Added sanitized rich HTML for cleaned ordinary selections, with executable/hidden markup removal and pre-clone markup, node, and depth budgets. Clean, editable, code, and over-budget selections retain fail-safe native behavior.
+- Bounded nested LaTeX parsing, partial-selection matching, positioned Word token discovery, total disjoint selection ranges, and per-range/cross-range math-root discovery so hostile page DOM and metadata cannot trigger runaway recursion or multiplied quadratic scans.
+- Made visual rendering authoritative over stale or forged hidden MathML/TeX when their identifiers, stable operators, or grouping disagree, while preserving verified whole-surface source-only MathJax output and KaTeX's browser-re-namespaced nested operator structures.
+- Serialized asynchronous clipboard writes across manual and Office paths, replayed a newer native keyboard copy when an already-started older write finishes late, and prevented a deferred settings read from overwriting a newer menu choice.
+- Kept exact-selection, nonempty-payload, MathML/OMML, Word duplicate recovery, cross-pipeline newest-copy-wins, and rich clipboard security guarantees from the 1.x line.
+- Added version 2 install/update metadata for `github.com/atharvj/clean-math-copy`, moved persistent settings to `cleanMathCopy.settings.v3`, and made faithful output the clean-upgrade default.
+- Updated the manual fixture, browser smoke, validation matrix, research notes, package metadata, and install documentation for the faithful-default and ordinary-cleanup release.
+
 ## 1.2.2 — 2026-07-13
 
 - Added a conservative standalone-Unicode math path, so exact selections such as `0.666 × 10⁻²⁵`, `|q|`, and `r ∝ √(m/|q|)` convert even without renderer metadata while ordinary symbol-bearing prose, code, ambiguous bars, and editor-owned semantic selections remain native.

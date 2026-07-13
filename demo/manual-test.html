@@ -3,22 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Clean Math Copy — manual test</title>
+  <title>Clean Math Copy 2.0 — manual test</title>
   <style>
     :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
-    body { max-width: 980px; margin: 0 auto; padding: 32px 20px 80px; line-height: 1.55; }
+    body { max-width: 1050px; margin: 0 auto; padding: 32px 20px 80px; line-height: 1.55; }
     h1 { line-height: 1.1; }
     .note { border-left: 4px solid #667eea; padding: 10px 14px; background: color-mix(in srgb, #667eea 10%, transparent); }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin: 24px 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin: 24px 0; }
     .card { border: 1px solid #8886; border-radius: 12px; padding: 16px; overflow: auto; }
     .fixture { padding: 12px; border-radius: 8px; background: color-mix(in srgb, #28a745 10%, transparent); }
     .expected { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .9rem; white-space: pre-wrap; }
-    .katex-mathml, mjx-assistive-mml { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(1px, 1px, 1px, 1px); }
-    .katex-html, mjx-container { font-family: Georgia, serif; font-style: italic; font-size: 1.12em; }
-    .katex-display { display: block; text-align: center; margin: 12px 0; }
+    .a11y-mathml { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(1px, 1px, 1px, 1px); }
+    .visual-layout, [data-latex] { font-family: Cambria Math, STIX Two Math, Georgia, serif; font-size: 1.12em; }
     table { border-collapse: collapse; }
     th, td { border: 1px solid #8888; padding: 5px 10px; }
-    textarea { width: 100%; min-height: 140px; font: inherit; }
+    textarea { width: 100%; min-height: 150px; font: inherit; }
     code, pre { background: color-mix(in srgb, #888 14%, transparent); border-radius: 6px; }
     pre { padding: 12px; }
     button { font: inherit; padding: 7px 12px; margin-right: 8px; cursor: pointer; }
@@ -28,147 +27,93 @@
   </style>
 </head>
 <body>
-  <h1>Clean Math Copy manual test</h1>
-  <p class="note">Install and enable the userscript, select the green fixture text, copy normally, and paste into the inspector at the bottom. The hidden MathML in these fixtures intentionally mirrors real renderer output.</p>
+  <h1>Clean Math Copy 2.0 manual test</h1>
+  <p class="note">Install version 2.0, reload this page, and leave the userscript in its default <strong>faithful readable</strong> mode. Select only the green content, copy normally, and paste into the inspector. Switch to calculator-safe mode only for the alternate outputs shown.</p>
 
   <div class="grid">
     <section class="card">
-      <h2>KaTeX-style duplicate tree</h2>
-      <p class="fixture">Einstein wrote
-        <span class="katex">
-          <span class="katex-mathml"><math><semantics><mrow><mi>E</mi><mo>=</mo><mi>m</mi><msup><mi>c</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">E=mc^2</annotation></semantics></math></span>
-          <span class="katex-html" aria-hidden="true">E = mc² [visual tree]</span>
-        </span>.
-      </p>
-      <p>Expected calculator text:</p><div class="expected">Einstein wrote E=m*c^(2).</div>
+      <h2>Prime target</h2>
+      <div class="fixture"><span data-latex="(y')^2=20x'">(y′)² = 20x′</span></div>
+      <p>Faithful default:</p><div class="expected">(y′)² = 20x′</div>
+      <p>Calculator mode:</p><div class="expected">(y')^(2)=20*x'</div>
     </section>
 
     <section class="card">
-      <h2>Fraction and root</h2>
-      <div class="fixture katex-display">
-        <span class="katex">
-          <span class="katex-mathml"><math display="block"><semantics><mfrac><mrow><mo>−</mo><mi>b</mi><mo>±</mo><msqrt><mrow><msup><mi>b</mi><mn>2</mn></msup><mo>−</mo><mn>4</mn><mi>a</mi><mi>c</mi></mrow></msqrt></mrow><mrow><mn>2</mn><mi>a</mi></mrow></mfrac><annotation encoding="application/x-tex">\frac{-b \pm \sqrt{b^2-4ac}}{2a}</annotation></semantics></math></span>
-          <span class="katex-html" aria-hidden="true">rendered quadratic formula</span>
-        </span>
-      </div>
-      <p>Expected calculator text:</p><div class="expected">(-b+/-sqrt(b^(2)-4*a*c))/(2*a)</div>
+      <h2>Gravity target</h2>
+      <div class="fixture"><span data-latex="F_g=G\left(\frac{m_1m_2}{r^2}\right)">F<sub>g</sub> = G((m₁m₂)/r²)</span></div>
+      <p>Faithful default:</p><div class="expected">F_g = G((m₁m₂)/r²)</div>
+      <p>Calculator mode:</p><div class="expected">F_(g)=G(((m_(1)*m_(2))/(r^(2))))</div>
     </section>
 
     <section class="card">
-      <h2>MathJax-style metadata</h2>
-      <p class="fixture">Integral:
-        <mjx-container data-latex="\int_0^1 x^2\,dx"><svg aria-hidden="true"><text>∫₀¹ x² dx</text></svg></mjx-container>
-      </p>
-      <p>Expected calculator text:</p><div class="expected">Integral: integral(x^(2),x,0,1)</div>
-    </section>
-
-    <section class="card">
-      <h2>Native MathML matrix</h2>
-      <div class="fixture"><math><mtable><mtr><mtd><mi>a</mi></mtd><mtd><mi>b</mi></mtd></mtr><mtr><mtd><mi>c</mi></mtd><mtd><mi>d</mi></mtd></mtr></mtable></math></div>
-      <p>Expected calculator text:</p><div class="expected">[[a,b],[c,d]]</div>
-    </section>
-
-    <section class="card">
-      <h2>Delimited LaTeX and currency</h2>
-      <p class="fixture">The item costs $5, while $x^2 + \alpha \leq 3$ is mathematics.</p>
-      <p>Expected calculator text:</p><div class="expected">The item costs $5, while x^(2)+alpha&lt;=3 is mathematics.</div>
-    </section>
-
-    <section class="card">
-      <h2>Reported ChatGPT root/fraction case</h2>
+      <h2>Reported ChatGPT root</h2>
       <div class="fixture">
         <span class="opaque-renderer">
-          <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)"><math><mrow><mi>r</mi><mo>∝</mo><msqrt><mfrac><mi>m</mi><mrow><mo>|</mo><mi>q</mi><mo>|</mo></mrow></mfrac></msqrt></mrow></math></span>
+          <span class="a11y-mathml"><math><mrow><mi>r</mi><mo>∝</mo><msqrt><mfrac><mi>m</mi><mrow><mo fence="true">|</mo><mi>q</mi><mo fence="true">|</mo></mrow></mfrac></msqrt></mrow></math></span>
           <span class="visual-layout">r∝∣q∣m​</span>
         </span>
       </div>
-      <p>Expected calculator text:</p><div class="expected">r ∝ sqrt(m/abs(q))</div>
+      <p>Faithful default:</p><div class="expected">r ∝ √(m/|q|)</div>
+      <p>Calculator mode:</p><div class="expected">r ∝ sqrt(m/abs(q))</div>
     </section>
 
     <section class="card">
-      <h2>Reported nested numeric radical</h2>
+      <h2>Exact partial selection</h2>
+      <p>Select only <strong>0.666×10−25</strong>, not the full green line.</p>
       <div class="fixture">
         <span class="opaque-renderer">
-          <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)"><math><mrow><mi>r</mi><mo>=</mo><mfrac><mn>1</mn><mn>0.452</mn></mfrac><msqrt><mfrac><mrow><mn>2</mn><mo>(</mo><mn>0.666</mn><mo>×</mo><msup><mn>10</mn><mrow><mo>−</mo><mn>25</mn></mrow></msup><mo>)</mo><mo>(</mo><mn>2464</mn><mo>)</mo></mrow><mrow><mn>1.602</mn><mo>×</mo><msup><mn>10</mn><mrow><mo>−</mo><mn>19</mn></mrow></msup></mrow></mfrac></msqrt></mrow></math></span>
-          <span class="visual-layout">r=0.4521​1.602×10−192(0.666×10−25)(2464)​</span>
-        </span>
-      </div>
-      <p>Expected calculator text:</p><div class="expected">r=(1/0.452)*sqrt((2*(0.666*10^(-25))*(2464))/(1.602*10^(-19)))</div>
-    </section>
-
-    <section class="card">
-      <h2>Exact partial equation selection</h2>
-      <p>Select only <strong>0.666×10−25</strong> in the green expression—not the whole expression.</p>
-      <div class="fixture">
-        <span class="opaque-renderer">
-          <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)"><math><mrow><mi>m</mi><mo>=</mo><mn>0.666</mn><mo>×</mo><msup><mn>10</mn><mrow><mo>−</mo><mn>25</mn></mrow></msup><mtext> </mtext><mrow><mi mathvariant="normal">k</mi><mi mathvariant="normal">g</mi></mrow></mrow></math></span>
+          <span class="a11y-mathml"><math><mrow><mi>m</mi><mo>=</mo><mn>0.666</mn><mo>×</mo><msup><mn>10</mn><mrow><mo>−</mo><mn>25</mn></mrow></msup><mtext> </mtext><mi mathvariant="normal">kg</mi></mrow></math></span>
           <span class="visual-layout">m = 0.666×10−25 kg</span>
         </span>
       </div>
-      <p>Expected calculator text:</p><div class="expected">0.666*10^(-25)</div>
+      <p>Faithful default:</p><div class="expected">0.666 × 10⁻²⁵</div>
+      <p>Calculator mode:</p><div class="expected">0.666*10^(-25)</div>
     </section>
 
     <section class="card">
-      <h2>Standalone Unicode math</h2>
-      <p>Select the whole first line, or only the bold numeric fragment on the second line.</p>
-      <div class="fixture">r ∝ √(m/|q|)<br>m = <strong>0.666 × 10⁻²⁵</strong> kg</div>
-      <p>Expected whole first line:</p><div class="expected">r ∝ sqrt(m/abs(q))</div>
-      <p>Expected numeric fragment:</p><div class="expected">0.666*10^(-25)</div>
-    </section>
-
-    <section class="card">
-      <h2>Styled identifiers and prose guard</h2>
-      <p>Select each green line separately. The first is raw LaTeX and should be rewritten; the second is ordinary comparative prose and should use native copy.</p>
-      <div class="fixture">$\mathrm{speed}=2\mathrm{time}$</div>
-      <p>Expected calculator text:</p><div class="expected">speed=2*time</div>
-      <div class="fixture">Plan A ≠ Plan B</div>
-      <p>Expected native text:</p><div class="expected">Plan A ≠ Plan B</div>
-    </section>
-
-    <section class="card">
-      <h2>Rendered functions and powers</h2>
+      <h2>Functions, powers, and bars</h2>
       <div class="fixture">
         <span class="opaque-renderer">
-          <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)"><math><mrow><mi>sin</mi><mo>⁡</mo><mrow><mo>(</mo><mo>|</mo><mi>x</mi><mo>|</mo><mo>)</mo></mrow><mo>+</mo><msup><mi>cos</mi><mn>2</mn></msup><mo>⁡</mo><mrow><mo>(</mo><mi>y</mi><mo>)</mo></mrow></mrow></math></span>
-          <span class="visual-layout">sin(|x|) + cos²(y)</span>
+          <span class="a11y-mathml"><math><mrow><mi mathvariant="normal">sin</mi><mo>⁡</mo><mo fence="true">|</mo><mi>x</mi><mo fence="true">|</mo><mo>+</mo><msup><mi mathvariant="normal">cos</mi><mn>2</mn></msup><mo>⁡</mo><mo>(</mo><mi>y</mi><mo>)</mo></mrow></math></span>
+          <span class="visual-layout">sin|x|+cos²(y)</span>
         </span>
       </div>
-      <p>Expected calculator text:</p><div class="expected">sin(abs(x))+cos(y)^(2)</div>
+      <p>Faithful default:</p><div class="expected">sin |x| + cos²(y)</div>
+      <p>Calculator mode:</p><div class="expected">sin(abs(x))+cos(y)^(2)</div>
     </section>
 
     <section class="card">
-      <h2>Rendered bounded aggregate</h2>
-      <div class="fixture">
-        <span class="opaque-renderer">
-          <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)"><math><mrow><munderover><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi>n</mi></munderover><msup><mi>i</mi><mn>2</mn></msup></mrow></math></span>
-          <span class="visual-layout">∑ᵢ₌₁ⁿ i²</span>
-        </span>
-      </div>
-      <p>Expected calculator text:</p><div class="expected">sum(i^(2),i,1,n)</div>
+      <h2>Aggregate and matrix</h2>
+      <div class="fixture"><span data-latex="\sum_{i=1}^n i^2">∑ᵢ₌₁ⁿ i²</span></div>
+      <p>Faithful sum:</p><div class="expected">∑ᵢ₌₁ⁿ i²</div>
+      <div class="fixture"><span data-latex="\begin{bmatrix}a&amp;b\\c&amp;d\end{bmatrix}">[a, b; c, d]</span></div>
+      <p>Faithful matrix:</p><div class="expected">[a, b; c, d]</div>
     </section>
 
     <section class="card">
-      <h2>Absolute versus relational bars</h2>
-      <p>Select either green expression separately.</p>
+      <h2>Ordinary wrap cleanup</h2>
+      <p>Select the green paragraph. Its source contains accidental wraps and repeated collapsible spaces.</p>
+      <p class="fixture"><span>This   is </span><span>a
+soft</span> <span> wrapped</span> paragraph with emoji 👩‍💻 and symbols ≤ ≥.</p>
+      <p>Expected:</p><div class="expected">This is a soft wrapped paragraph with emoji 👩‍💻 and symbols ≤ ≥.</div>
+    </section>
+
+    <section class="card">
+      <h2>Document structure</h2>
       <div class="fixture">
-        <span class="opaque-renderer">
-          <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)"><math><mrow><mo fence="true">|</mo><mi>q</mi><mo fence="true">|</mo></mrow></math></span>
-          <span class="visual-layout">|q|</span>
-        </span>
+        <p>First paragraph.</p>
+        <p>Second<br>line.</p>
+        <ul><li>Alpha</li><li>Beta<ul><li>Nested</li></ul></li></ul>
+        <ol start="3"><li>Third</li><li value="7">Seventh</li></ol>
+        <table><tr><th>Variable</th><th>Value</th></tr><tr><td>x</td><td>x²</td></tr></table>
+        <pre>  keep
+    indentation</pre>
       </div>
-      <p>Expected paired-fence text:</p><div class="expected">abs(q)</div>
-      <div class="fixture">
-        <span class="opaque-renderer">
-          <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)"><math><mrow><mi>a</mi><mo fence="false">∣</mo><mi>b</mi></mrow></math></span>
-          <span class="visual-layout">a ∣ b</span>
-        </span>
-      </div>
-      <p>Expected relational-bar text:</p><div class="expected">a | b</div>
+      <p>Expected: paragraph and break boundaries, nested bullets, `3.` then `7.`, tab-separated table cells, and exact preformatted indentation.</p>
     </section>
 
     <section class="card">
       <h2>Word for the web positioned equation</h2>
-      <p>Select the full green line or only its first R and lowered 1.</p>
       <div class="fixture react-pdf__Page">
         <div class="react-pdf__Page__textContent textLayer" style="--scale-factor:1">
           <span class="markedContent">
@@ -181,32 +126,18 @@
           </span>
         </div>
       </div>
-      <p>Expected calculator text:</p><div class="expected">R_(1), R_(2)=4.7*kOmega, 10*kOmega and C=220*muF</div>
-      <p>Readable Unicode mode (and the rich paste appearance):</p><div class="expected">R₁, R₂ = 4.7kΩ, 10kΩ and C = 220μF</div>
+      <p>Faithful default:</p><div class="expected">R₁, R₂ = 4.7kΩ, 10kΩ and C = 220μF</div>
+      <p>Calculator mode:</p><div class="expected">R_(1), R_(2)=4.7*kOmega, 10*kOmega and C=220*muF</div>
     </section>
 
     <section class="card">
-      <h2>Ordinary text stays native</h2>
-      <div class="fixture">Keep  two spaces, emoji 👨‍👩‍👧‍👦, accents café, symbols © ™ ≤ →, and this line break.<br>Second line.</div>
-      <p>Expected: exactly what the browser normally copies, including the emoji joiners and line break.</p>
-    </section>
-
-    <section class="card">
-      <h2>Code protection</h2>
+      <h2>Native-path guards</h2>
+      <p class="fixture">Already clean prose 👨‍👩‍👧‍👦, café, ©, ™, ≤, →, and שלום stays native.</p>
       <pre class="fixture"><code>function square(x) {
   // $x^2$ stays source code here
   return x ** 2;
 }</code></pre>
-      <p>Expected: unchanged source with indentation.</p>
-    </section>
-
-    <section class="card">
-      <h2>List and table structure</h2>
-      <div class="fixture">
-        <ul><li>first</li><li>second</li></ul>
-        <table><tr><th>Variable</th><th>Value</th></tr><tr><td>x</td><td><span data-latex="x^2">x² visual</span></td></tr></table>
-      </div>
-      <p>Expected: bullets on lines and table cells separated by tabs.</p>
+      <p>Expected: ordinary browser copy with code indentation and emoji joiners unchanged.</p>
     </section>
   </div>
 

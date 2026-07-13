@@ -86,13 +86,13 @@ test('regression: recognizes the ChatGPT square-root layout outside the MathML b
     instance.window,
     visual
   );
-  assert.equal(payload.text, 'r ∝ sqrt(m/abs(q))');
+  assert.equal(payload.text, 'r ∝ √(m/|q|)');
   assert.equal(/[\s\u200b\u2060]$/.test(payload.text), false);
   assert.match(payload.html, /border-top:1px solid currentColor/);
   assert.match(payload.mathML, /^<math/);
 });
 
-test('regression: preserves nested fraction/root order as executable calculator text', () => {
+test('regression: preserves nested fraction/root order in faithful and calculator modes', () => {
   const markup = [
     '<mrow><mi>r</mi><mo>=</mo><mfrac><mn>1</mn><mn>0.452</mn></mfrac><msqrt><mfrac>',
     '<mrow><mn>2</mn><mo>(</mo><mn>0.666</mn><mo>×</mo>',
@@ -105,10 +105,21 @@ test('regression: preserves nested fraction/root order as executable calculator 
   const brokenVisualOrder = 'r=0.4521\u200b1.602×10−192(0.666×10−25)(2464)\u200b\n';
   const instance = dom(rendererWithSeparateAccessibilityTree(markup, brokenVisualOrder));
   const visual = instance.window.document.querySelector('.visual-layout');
-  const payload = cleanCopy.getCopyPayload(
+  const faithfulPayload = cleanCopy.getCopyPayload(
     instance.window.document,
     selectContents(instance.window, visual),
     cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    visual
+  );
+  assert.equal(
+    faithfulPayload.text,
+    'r = (1/0.452)√(2(0.666 × 10⁻²⁵)(2464)/(1.602 × 10⁻¹⁹))'
+  );
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, visual),
+    { ...cleanCopy.DEFAULT_SETTINGS, outputMode: 'calculator' },
     instance.window,
     visual
   );
@@ -198,6 +209,147 @@ test('partial matching collapses zero-surface MathML nodes instead of exploring 
   }
 });
 
+test('an exact direct MathML token selection never widens to its flat math root', () => {
+  const instance = dom('<math id="formula">' + '<mi>x</mi>'.repeat(100) + '</math>');
+  const tokens = instance.window.document.querySelectorAll('#formula > mi');
+  const selected = tokens[57];
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, selected),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    selected
+  );
+  assert.equal(payload.text, 'x');
+  assert.doesNotMatch(payload.mathML, /<mi>x<\/mi><mi>x<\/mi>/);
+});
+
+test('repeated-token partial matching uses the visual offset with bounded cloning', () => {
+  for (const tokenCount of [500, 1000, 2000]) {
+    const mathML = '<mrow>' + '<mi>x</mi>'.repeat(tokenCount) + '</mrow>';
+    const visual = '<span>x</span>'.repeat(tokenCount);
+    const instance = dom([
+      '<span class="katex">',
+      '<span class="katex-mathml"><math><semantics>', mathML,
+      '<annotation encoding="application/x-tex">x</annotation>',
+      '</semantics></math></span>',
+      '<span class="katex-html" aria-hidden="true">', visual, '</span>',
+      '</span>'
+    ].join(''));
+    const tokens = instance.window.document.querySelectorAll('.katex-html > span');
+    const selected = tokens[Math.floor(tokenCount * 0.75)];
+    const originalClone = instance.window.Node.prototype.cloneNode;
+    let cloneCalls = 0;
+    instance.window.Node.prototype.cloneNode = function countedClone(...args) {
+      cloneCalls += 1;
+      return originalClone.apply(this, args);
+    };
+    try {
+      const payload = cleanCopy.getCopyPayload(
+        instance.window.document,
+        selectContents(instance.window, selected),
+        cleanCopy.DEFAULT_SETTINGS,
+        instance.window,
+        selected
+      );
+      if (tokenCount > 1000) assert.equal(payload, null, String(tokenCount));
+      else assert.equal(payload.text, 'x', String(tokenCount));
+      assert.ok(cloneCalls < 12, tokenCount + ' repeated tokens used ' + cloneCalls + ' clones');
+    } finally {
+      instance.window.Node.prototype.cloneNode = originalClone;
+    }
+  }
+});
+
+test('math-root discovery is linear-ish, reused once, and safely budgets document-wide selections', () => {
+  const instance = dom('<div id="target">' +
+    '<span role="math"><math><mi>x</mi></math></span>'.repeat(120) + '</div>');
+  const target = instance.window.document.querySelector('#target');
+  const range = instance.window.document.createRange();
+  range.selectNodeContents(target);
+  const originalContains = instance.window.Node.prototype.contains;
+  const originalQuery = instance.window.Element.prototype.querySelector;
+  let containsCalls = 0;
+  let sharedAccessibilityScans = 0;
+  instance.window.Node.prototype.contains = function countedContains(...args) {
+    containsCalls += 1;
+    return originalContains.apply(this, args);
+  };
+  instance.window.Element.prototype.querySelector = function countedQuery(selector) {
+    if (this === target && selector === ':scope > [aria-hidden="true"]') {
+      sharedAccessibilityScans += 1;
+    }
+    return originalQuery.call(this, selector);
+  };
+  try {
+    assert.equal(cleanCopy.rootsForRange(range).length, 120);
+    assert.ok(containsCalls < 2500, 'root discovery made ' + containsCalls + ' contains() calls');
+    assert.equal(sharedAccessibilityScans, 1);
+  } finally {
+    instance.window.Node.prototype.contains = originalContains;
+    instance.window.Element.prototype.querySelector = originalQuery;
+  }
+
+  const single = dom('<div id="target"><span role="math"><math><mi>x</mi></math></span></div>');
+  const singleTarget = single.window.document.querySelector('#target');
+  const originalQueryAll = single.window.Element.prototype.querySelectorAll;
+  let connectedDiscoveryScans = 0;
+  single.window.Element.prototype.querySelectorAll = function countedQueryAll(selector) {
+    if (this.isConnected && String(selector).includes('[data-testid*="formula"]')) {
+      connectedDiscoveryScans += 1;
+    }
+    return originalQueryAll.call(this, selector);
+  };
+  try {
+    assert.equal(cleanCopy.getCopyPayload(
+      single.window.document,
+      selectContents(single.window, singleTarget),
+      cleanCopy.DEFAULT_SETTINGS,
+      single.window,
+      singleTarget
+    ).text, 'x');
+    assert.equal(connectedDiscoveryScans, 1);
+  } finally {
+    single.window.Element.prototype.querySelectorAll = originalQueryAll;
+  }
+
+  const overBudget = dom('<div id="target">' +
+    '<span role="math"><math><mi>x</mi></math></span>'.repeat(129) + '</div>');
+  const overBudgetTarget = overBudget.window.document.querySelector('#target');
+  assert.equal(cleanCopy.getCopyPayload(
+    overBudget.window.document,
+    selectContents(overBudget.window, overBudgetTarget),
+    cleanCopy.DEFAULT_SETTINGS,
+    overBudget.window,
+    overBudgetTarget
+  ), null);
+
+  const acrossRanges = dom('<div id="first">' +
+    '<span role="math"><math><mi>x</mi></math></span>'.repeat(65) +
+    '</div><div id="second">' +
+    '<span role="math"><math><mi>y</mi></math></span>'.repeat(65) + '</div>');
+  const firstRange = acrossRanges.window.document.createRange();
+  const secondRange = acrossRanges.window.document.createRange();
+  firstRange.selectNodeContents(acrossRanges.window.document.querySelector('#first'));
+  secondRange.selectNodeContents(acrossRanges.window.document.querySelector('#second'));
+  let rangeReads = 0;
+  assert.equal(cleanCopy.getCopyPayload(
+    acrossRanges.window.document,
+    {
+      isCollapsed: false,
+      rangeCount: 2,
+      getRangeAt(index) {
+        rangeReads += 1;
+        return index === 0 ? firstRange : secondRange;
+      }
+    },
+    cleanCopy.DEFAULT_SETTINGS,
+    acrossRanges.window,
+    acrossRanges.window.document.body
+  ), null);
+  assert.equal(rangeReads, 2);
+});
+
 test('serializes native MathML fractions, roots, scripts, and tables', () => {
   const instance = dom([
     '<div id="target"><math><mrow>',
@@ -216,6 +368,215 @@ test('serializes native MathML fractions, roots, scripts, and tables', () => {
   assert.equal(cleanCopy.mathMLToUnicode(instance.window.document.querySelector('#matrix')), '[a, b; c, d]');
 });
 
+test('faithful MathML preserves compound scope, text punctuation, accents, and parallel versus norm', () => {
+  const render = (markup) => {
+    const instance = dom('<math>' + markup + '</math>');
+    return cleanCopy.mathMLToFaithful(instance.window.document.querySelector('math'));
+  };
+  assert.equal(render('<mfrac><mn>1</mn><mrow><mn>2</mn><mi>a</mi><mi>b</mi></mrow></mfrac>'), '1/(2ab)');
+  assert.equal(render('<msup><mrow><mi>a</mi><mo>+</mo><mi>b</mi></mrow><mn>2</mn></msup>'), '(a + b)²');
+  assert.equal(render('<msup><mrow><mi>a</mi><mi>b</mi></mrow><mn>2</mn></msup>'), '(ab)²');
+  assert.equal(render('<msup><mfrac><mi>a</mi><mi>b</mi></mfrac><mn>2</mn></msup>'), '(a/b)²');
+  assert.equal(render('<msup><msqrt><mi>x</mi></msqrt><mn>2</mn></msup>'), '(√x)²');
+  assert.equal(render('<msqrt><msup><mi>x</mi><mn>2</mn></msup></msqrt>'), '√(x²)');
+  assert.equal(render('<msqrt><msup><mi>x</mi><mo>′</mo></msup></msqrt>'), '√(x′)');
+  assert.equal(render('<msqrt><msub><mi>x</mi><mn>1</mn></msub></msqrt>'), '√x₁');
+  assert.equal(render('<mrow><msqrt><mi>x</mi></msqrt><mi>y</mi></mrow>'), '√(x)y');
+  assert.equal(render('<mfrac><mn>1</mn><mrow><msqrt><mi>x</mi></msqrt><mi>y</mi></mrow></mfrac>'), '1/(√(x)y)');
+  assert.equal(render('<mfrac><mrow><mi>sin</mi><mo>⁡</mo><mi>x</mi></mrow><mi>x</mi></mfrac>'), '(sin x)/x');
+  assert.equal(render('<mrow><mi>sin</mi><mo>⁡</mo><mrow><mi>x</mi><mo>+</mo><mi>y</mi></mrow></mrow>'), 'sin(x + y)');
+  assert.equal(render('<mrow><mi>sin</mi><mo>⁡</mo><mi>x</mi></mrow>'), 'sin x');
+  assert.equal(render("<mtext>time-dependent; don&apos;t</mtext>"), "time-dependent; don't");
+  assert.equal(render('<mrow><mi>a</mi><mo fence="false">∥</mo><mi>b</mi></mrow>'), 'a ∥ b');
+  assert.equal(render('<mrow><mo fence="true">∥</mo><mi>x</mi><mo fence="true">∥</mo></mrow>'), '‖x‖');
+  assert.equal(render('<mover><mrow><mi>a</mi><mo>+</mo><mi>b</mi></mrow><mo>‾</mo></mover>'), 'overline(a + b)');
+  assert.equal(render('<mover><mrow><mi>x</mi><mi>y</mi></mrow><mo>^</mo></mover>'), 'hat(xy)');
+});
+
+test('faithful MathML preserves explicit alphabets while leaving unstyled identifiers plain', () => {
+  const render = (markup) => {
+    const instance = dom('<math>' + markup + '</math>');
+    return cleanCopy.mathMLToFaithful(instance.window.document.querySelector('math'));
+  };
+  assert.equal(render('<mi>x</mi>'), 'x');
+  assert.equal(render('<mi mathvariant="normal">x</mi>'), 'x');
+  assert.equal(render('<mi mathvariant="normal">ϰ</mi>'), 'ϰ');
+  assert.equal(render('<mi mathvariant="bold">x</mi>'), '𝐱');
+  assert.equal(render('<mi mathvariant="bold-italic">α</mi>'), '𝜶');
+  assert.equal(render('<mi mathvariant="script">B</mi>'), 'ℬ');
+  assert.equal(render('<mi mathvariant="fraktur">C</mi>'), 'ℭ');
+  assert.equal(render('<mi mathvariant="sans-serif">x</mi>'), '𝗑');
+  assert.equal(render('<mi mathvariant="monospace">x</mi>'), '𝚡');
+  assert.equal(render('<mi mathvariant="double-struck">R</mi>'), 'ℝ');
+  assert.equal(render('<mi mathvariant="script">α</mi>'), 'script(α)');
+  assert.equal(render('<mstyle mathvariant="bold"><mi>x</mi><mi>α</mi></mstyle>'), '𝐱𝛂');
+  assert.equal(render('<mstyle mathvariant="bold"><mi>x</mi><mo>+</mo><mn>1</mn></mstyle>'), '𝐱 + 𝟏');
+});
+
+test('faithful MathML retains enclosures and orders pre- and post-scripts correctly', () => {
+  const render = (markup) => {
+    const instance = dom('<math>' + markup + '</math>');
+    return cleanCopy.mathMLToFaithful(instance.window.document.querySelector('math'));
+  };
+  assert.equal(render('<menclose notation="updiagonalstrike"><mi>x</mi></menclose>'), 'cancel(x)');
+  assert.equal(render('<menclose notation="downdiagonalstrike"><mi>x</mi></menclose>'), 'bcancel(x)');
+  assert.equal(render('<menclose notation="updiagonalstrike downdiagonalstrike"><mi>x</mi></menclose>'), 'xcancel(x)');
+  assert.equal(render('<menclose notation="box"><mi>x</mi></menclose>'), 'boxed(x)');
+  assert.equal(render('<menclose notation="box updiagonalstrike"><mi>x</mi></menclose>'), 'boxed(cancel(x))');
+  assert.equal(render('<menclose notation="circle"><mi>x</mi></menclose>'), 'enclose(circle, x)');
+  assert.equal(
+    render('<mmultiscripts><mi>C</mi><mn>2</mn><mn>3</mn><mprescripts></mprescripts><mn>6</mn><mn>14</mn></mmultiscripts>'),
+    '¹⁴₆C₂³'
+  );
+  assert.equal(render('<msubsup><mrow></mrow><mn>6</mn><mn>14</mn></msubsup><mi>C</mi>'), '¹⁴₆C');
+  assert.equal(render('<mover accent="false"><mo>=</mo><mo>!</mo></mover>'), 'overset(!, =)');
+  assert.equal(render('<munder><mi>x</mi><mi>i</mi></munder>'), 'underset(i, x)');
+  assert.equal(
+    render('<munderover><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi>n</mi></munderover>'),
+    '∑ᵢ₌₁ⁿ'
+  );
+});
+
+test('faithful MathML distinguishes binomial and generic zero-line stacks from fractions', () => {
+  const render = (markup) => {
+    const instance = dom('<math>' + markup + '</math>');
+    return cleanCopy.mathMLToFaithful(instance.window.document.querySelector('math'));
+  };
+  assert.equal(
+    render('<mrow><mo>(</mo><mfrac linethickness="0"><mi>n</mi><mi>k</mi></mfrac><mo>)</mo></mrow>'),
+    'C(n, k)'
+  );
+  assert.equal(render('<mfrac linethickness="0px"><mi>n</mi><mi>k</mi></mfrac>'), 'stack(n, k)');
+  assert.equal(
+    render('<mrow><mo>[</mo><mfrac linethickness="0.0em"><mi>n</mi><mi>k</mi></mfrac><mo>]</mo></mrow>'),
+    '[stack(n, k)]'
+  );
+});
+
+test('faithful MathML recognizes real renderer accent glyphs', () => {
+  const render = (markup) => {
+    const instance = dom('<math>' + markup + '</math>');
+    return cleanCopy.mathMLToFaithful(instance.window.document.querySelector('math'));
+  };
+  assert.equal(render('<mover accent="true"><mi>v</mi><mo>⃗</mo></mover>'), 'v⃗');
+  assert.equal(render('<mover accent="true"><mi>x</mi><mo>ˉ</mo></mover>'), 'x̅');
+  assert.equal(render('<mover accent="true"><mi>x</mi><mo>ˊ</mo></mover>'), 'x́');
+  assert.equal(render('<mover accent="true"><mi>x</mi><mo>ˋ</mo></mover>'), 'x̀');
+  assert.equal(render('<mover accent="true"><mi>x</mi><mo>˘</mo></mover>'), 'x̆');
+  assert.equal(render('<mover accent="true"><mi>x</mi><mo>ˇ</mo></mover>'), 'x̌');
+  assert.equal(render('<mover accent="true"><mi>x</mi><mo>˚</mo></mover>'), 'x̊');
+  assert.equal(render('<munder accentunder="true"><mi>x</mi><mo>‾</mo></munder>'), 'x̲');
+  assert.equal(render('<mover><mi>x</mi><mo>⏞</mo></mover>'), 'overset(⏞, x)');
+  assert.equal(render('<munder><mi>x</mi><mo>⏟</mo></munder>'), 'underset(⏟, x)');
+});
+
+test('faithful MathML linearizes alignment tables as equation rows, not matrices', () => {
+  const render = (markup) => {
+    const instance = dom('<math>' + markup + '</math>');
+    return cleanCopy.mathMLToFaithful(instance.window.document.querySelector('math'));
+  };
+  const alignedRows = [
+    '<mtr><mtd><mi>x</mi></mtd><mtd><mo>=</mo><mn>1</mn></mtd></mtr>',
+    '<mtr><mtd><mi>y</mi></mtd><mtd><mo>=</mo><mn>2</mn></mtd></mtr>'
+  ].join('');
+  assert.equal(
+    render('<mtable columnalign="right left" columnspacing="0em">' + alignedRows + '</mtable>'),
+    'x = 1; y = 2'
+  );
+  const gatheredRows = [
+    '<mtr><mtd><mi>x</mi><mo>=</mo><mn>1</mn></mtd></mtr>',
+    '<mtr><mtd><mi>y</mi><mo>=</mo><mn>2</mn></mtd></mtr>'
+  ].join('');
+  assert.equal(
+    render('<mtable columnalign="center" columnspacing="0em">' + gatheredRows + '</mtable>'),
+    'x = 1; y = 2'
+  );
+  assert.equal(
+    render('<mtable columnalign="center center" columnspacing="1em">' + alignedRows + '</mtable>'),
+    '[x, = 1; y, = 2]'
+  );
+});
+
+test('faithful MathML spaces annotated relation wrappers between operands', () => {
+  const instance = dom(
+    '<math><mrow><mi>A</mi><mover accent="false"><mrow><mo>⟶</mo></mrow><mi>f</mi></mover><mi>B</mi></mrow></math>'
+  );
+  assert.equal(
+    cleanCopy.mathMLToFaithful(instance.window.document.querySelector('math')),
+    'A overset(f, ⟶) B'
+  );
+});
+
+test('faithful whole-math copy trusts sanitized rendering over a divergent TeX annotation', () => {
+  const instance = dom([
+    '<span id="root" class="katex"><span class="katex-mathml"><math><semantics>',
+    '<mrow><mi>x</mi></mrow><annotation encoding="application/x-tex">y</annotation>',
+    '</semantics></math></span><span class="katex-html" aria-hidden="true">x</span></span>'
+  ].join(''));
+  const visual = instance.window.document.querySelector('.katex-html');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, visual),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    visual
+  );
+  assert.equal(payload.text, 'x');
+});
+
+test('whole-math copy declines stale hidden semantics that disagree with the visible formula', () => {
+  const instance = dom([
+    '<span class="katex"><span class="katex-mathml"><math><semantics>',
+    '<mi>x</mi><annotation encoding="application/x-tex">x</annotation>',
+    '</semantics></math></span><span class="katex-html" aria-hidden="true">y</span></span>'
+  ].join(''));
+  const visual = instance.window.document.querySelector('.katex-html');
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, visual),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    visual
+  ), null);
+});
+
+test('faithful whole-math copy preserves rendered grouping against contradictory annotations', () => {
+  const copy = (presentation, annotation, visualText = 'abc') => {
+    const instance = dom([
+      '<span class="katex"><span class="katex-mathml"><math><semantics>',
+      presentation,
+      '<annotation encoding="application/x-tex">', annotation, '</annotation>',
+      '</semantics></math></span><span class="katex-html" aria-hidden="true">', visualText, '</span></span>'
+    ].join(''));
+    const visual = instance.window.document.querySelector('.katex-html');
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, visual),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      visual
+    ).text;
+  };
+  assert.equal(
+    copy(
+      '<mrow><mrow><mfrac><mi>a</mi><mi>b</mi></mfrac></mrow><mi>c</mi></mrow>',
+      String.raw`\frac{a}{bc}`
+    ),
+    '(a/b)c'
+  );
+  assert.equal(
+    copy(
+      '<mfrac><mi>a</mi><mrow><mi>b</mi><mi>c</mi></mrow></mfrac>',
+      String.raw`\frac ab c`
+    ),
+    'a/(bc)'
+  );
+  assert.equal(
+    copy('<msqrt><mrow><mi>x</mi><mi>y</mi></mrow></msqrt>', String.raw`\sqrt{x}y`, '√xy'),
+    '√(xy)'
+  );
+});
+
 test('preserves supported Content MathML operators and declines unsupported structures without truncating them', () => {
   const instance = dom([
     '<math id="sum"><apply><plus></plus><ci>x</ci><cn>1</cn></apply></math>',
@@ -232,7 +593,7 @@ test('preserves supported Content MathML operators and declines unsupported stru
     instance.window,
     sum
   );
-  assert.equal(sumPayload.text, 'x+1');
+  assert.equal(sumPayload.text, 'x + 1');
   assert.match(sumPayload.html, />x \+ 1</);
   assert.equal(cleanCopy.getCopyPayload(
     instance.window.document,
@@ -240,7 +601,7 @@ test('preserves supported Content MathML operators and declines unsupported stru
     cleanCopy.DEFAULT_SETTINGS,
     instance.window,
     power
-  ).text, 'x^(2)');
+  ).text, 'x²');
   assert.equal(cleanCopy.getCopyPayload(
     instance.window.document,
     selectContents(instance.window, stack),
@@ -337,6 +698,23 @@ test('an empty recognized equation never replaces the clipboard with whitespace'
   );
 });
 
+test('oversized hidden LaTeX metadata falls back to bounded visible text', () => {
+  const instance = dom('<span id="target" role="math">x</span>');
+  const target = instance.window.document.querySelector('#target');
+  target.setAttribute('data-latex', String.raw`\text{` + 'z'.repeat(50001) + '}');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, 'x');
+  assert.equal(payload.reason, 'rendered-math');
+  assert.doesNotMatch(payload.text, /z|\\text/u);
+  assert.equal(cleanCopy.extractMathText(target, 'faithful', instance.window), 'x');
+});
+
 test('places display equations on their own line without renderer whitespace', () => {
   const instance = dom('<div id="target"><p>Before</p>' +
     katex('<mrow><mi>x</mi><mo>=</mo><mn>1</mn></mrow>', 'x=1', true) +
@@ -349,7 +727,10 @@ test('places display equations on their own line without renderer whitespace', (
 });
 
 test('uses MathJax original TeX when no assistive MathML is present', () => {
-  const instance = dom('<p id="target">Result: <mjx-container><svg><text>visual</text></svg></mjx-container></p>');
+  // MathJax's SVG surface can flatten script geometry, but its visible token
+  // anchors must still agree with the MathItem source before source metadata
+  // is allowed to replace the selection.
+  const instance = dom('<p id="target">Result: <mjx-container><svg><text>∫01x2dx</text></svg></mjx-container></p>');
   const target = instance.window.document.querySelector('#target');
   const mathRoot = instance.window.document.querySelector('mjx-container');
   const pageWindow = {
@@ -368,6 +749,73 @@ test('uses MathJax original TeX when no assistive MathML is present', () => {
     cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'unicode' }, pageWindow, target).text,
     'Result: ∫₀¹ x² dx'
   );
+});
+
+test('source-only MathJax rewrites exact visual drags but never widens a partial', () => {
+  const instance = dom('<mjx-container id="math"><svg><text>∫01x2dx</text></svg></mjx-container>');
+  const root = instance.window.document.querySelector('#math');
+  const svg = root.querySelector('svg');
+  const textElement = root.querySelector('text');
+  const textNode = textElement.firstChild;
+  const pageWindow = {
+    MathJax: {
+      startup: {
+        document: {
+          getMathItemsWithin(candidate) {
+            return candidate === root ? [{ math: String.raw`\int_0^1 x^2\,dx` }] : [];
+          }
+        }
+      }
+    }
+  };
+  const copyRange = (range) => {
+    const selection = instance.window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selection,
+      { outputMode: 'unicode' },
+      pageWindow,
+      textElement
+    );
+  };
+  for (const element of [root, svg, textElement]) {
+    const range = instance.window.document.createRange();
+    range.selectNodeContents(element);
+    assert.equal(copyRange(range).text, '∫₀¹ x² dx');
+  }
+  const completeText = instance.window.document.createRange();
+  completeText.setStart(textNode, 0);
+  completeText.setEnd(textNode, textNode.nodeValue.length);
+  assert.equal(copyRange(completeText).text, '∫₀¹ x² dx');
+
+  const partial = instance.window.document.createRange();
+  partial.setStart(textNode, 0);
+  partial.setEnd(textNode, 3);
+  assert.equal(copyRange(partial), null);
+});
+
+test('source-only math metadata must agree with visible anchors in surrounding prose', () => {
+  const copy = (source, visible) => {
+    const instance = dom('<p id="target">before <span data-latex="' +
+      source.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '">' + visible + '</span> after</p>');
+    const target = instance.window.document.querySelector('#target');
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    );
+  };
+  assert.equal(copy('y', 'x'), null);
+  assert.equal(copy(String.raw`\foo+1`, 'x² + 1'), null);
+  assert.equal(copy('x+y', 'x−y'), null);
+  assert.equal(copy('a=b', 'a≠b'), null);
+  assert.equal(copy(String.raw`a\times b`, 'a÷b'), null);
+  assert.equal(copy(String.raw`\frac{a}{b}`, 'ba').text, 'before a/b after');
+  assert.equal(copy(String.raw`\sqrt{x}`, 'x').text, 'before √x after');
 });
 
 test('falls back to the MathJax MathItem list when container lookup rejects rendered roots', () => {
@@ -412,11 +860,441 @@ test('preserves semantic blocks, lists, tables, image alt text, and preformatted
   ].join('\n'));
 });
 
-test('ordinary text stays on the native browser copy path, even under a generic formula class', () => {
+test('ordinary prose collapses accidental source wraps and repeated spacing without math false positives', () => {
   const instance = dom('<p id="target" class="formula">Keep  spacing,\nemoji 👨‍👩‍👧‍👦, and symbols ≤ exactly.</p>');
   const target = instance.window.document.querySelector('#target');
   const selection = selectContents(instance.window, target);
-  assert.equal(cleanCopy.getCopyPayload(instance.window.document, selection, {}, instance.window, target), null);
+  const payload = cleanCopy.getCopyPayload(instance.window.document, selection, {}, instance.window, target);
+  assert.equal(payload.reason, 'ordinary-text-cleanup');
+  assert.equal(payload.text, 'Keep spacing, emoji 👨‍👩‍👧‍👦, and symbols ≤ exactly.');
+  assert.equal(payload.html, '<!--StartFragment--><p>Keep spacing, emoji 👨‍👩‍👧‍👦, and symbols ≤ exactly.</p><!--EndFragment-->');
+});
+
+test('cleans hard-wrapped inline prose across uneven spans while preserving complex Unicode', () => {
+  const instance = dom([
+    '<p id="target"><span>This   is </span><span>a\nsoft</span> ',
+    '<span> wrapped</span> paragraph in שלום with e\u0301 and 👩‍💻.</p>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.ordinarySelectionPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, 'This is a soft wrapped paragraph in שלום with e\u0301 and 👩‍💻.');
+  assert.match(payload.html, /<span>This is <\/span><span>a soft<\/span> <span>wrapped<\/span>/);
+  assert.match(payload.html, /שלום with e\u0301 and 👩‍💻/);
+});
+
+test('preserves intentional paragraphs, breaks, headings, lists, tables, and preformatted islands', () => {
+  const instance = dom([
+    '<div id="target">',
+    '<p>First paragraph.</p>',
+    '<p>Second<br>line.<br><br>Still the same paragraph.</p>',
+    '<h2>Heading</h2>',
+    '<ul><li>Alpha</li><li>Beta<ul><li>Nested</li></ul></li></ul>',
+    '<ol start="3"><li>Third</li><li value="7">Seventh</li></ol>',
+    '<ol reversed type="A"><li>Top</li><li>Bottom</li></ol>',
+    '<table><tbody><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></tbody></table>',
+    '<pre>  keep\n    indentation</pre>',
+    '<code>x  y</code>',
+    '</div>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    {},
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, [
+    'First paragraph.',
+    '',
+    'Second',
+    'line.',
+    '',
+    'Still the same paragraph.',
+    '',
+    'Heading',
+    '',
+    '• Alpha',
+    '• Beta',
+    '  • Nested',
+    '3. Third',
+    '7. Seventh',
+    'B. Top',
+    'A. Bottom',
+    'A\tB',
+    '1\t2',
+    '  keep',
+    '    indentation',
+    'x  y'
+  ].join('\n'));
+  assert.match(payload.html, /<p>Second<br>line\.<br><br>Still the same paragraph\.<\/p>/);
+  assert.match(payload.html, /<ol start="3"><li>Third<\/li><li value="7">Seventh<\/li><\/ol>/);
+  assert.match(payload.html, /<table><tbody><tr><th>A<\/th><th>B<\/th><\/tr>/);
+  assert.match(payload.html, /<pre>  keep\n    indentation<\/pre><code>x  y<\/code>/);
+});
+
+test('honors explicit pre-line whitespace without flattening its real newlines', () => {
+  const instance = dom('<div id="target"><span style="white-space:pre-line">a  b\nc   d</span></div>');
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    {},
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, 'a b\nc d');
+  assert.match(payload.html, /style="white-space:pre-line;">a b\nc d<\/span>/);
+});
+
+test('defers to native copy when computed CSS makes whitespace or layout significant', () => {
+  const instance = dom([
+    '<style>.poem{white-space:pre-wrap}.inline-paragraph{display:inline}</style>',
+    '<div id="poem" class="poem">first  line\n  indented second</div>',
+    '<p id="inline" class="inline-paragraph">first   second</p>'
+  ].join(''));
+  for (const id of ['poem', 'inline']) {
+    const target = instance.window.document.querySelector('#' + id);
+    assert.equal(
+      cleanCopy.ordinarySelectionPayload(
+        instance.window.document,
+        selectContents(instance.window, target),
+        instance.window,
+        target
+      ),
+      null,
+      id
+    );
+  }
+});
+
+test('generic react-pdf pages still receive ordinary cleanup without Word clipboard recovery', () => {
+  const instance = dom(
+    '<div class="react-pdf__Page__textContent textLayer"><p id="target">ordinary   wrapped\ntext</p></div>',
+    'https://example.com/document.pdf'
+  );
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(payload.reason, 'ordinary-text-cleanup');
+  assert.equal(payload.text, 'ordinary wrapped text');
+});
+
+test('declines oversized positioned text layers before geometry or quadratic association work', () => {
+  const tokens = Array.from({ length: 600 }, (_value, index) =>
+    positionedWordToken(index * 7, 10, 11, 'a')).join('');
+  const instance = dom(
+    '<div id="target" class="react-pdf__Page__textContent textLayer"><span class="markedContent">' +
+    tokens + '</span></div>'
+  );
+  const target = instance.window.document.querySelector('#target');
+  const originalRect = instance.window.Element.prototype.getBoundingClientRect;
+  let geometryCalls = 0;
+  instance.window.Element.prototype.getBoundingClientRect = function countedRect(...args) {
+    geometryCalls += 1;
+    return originalRect.apply(this, args);
+  };
+  try {
+    assert.equal(cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    ), null);
+    assert.equal(geometryCalls, 0);
+  } finally {
+    instance.window.Element.prototype.getBoundingClientRect = originalRect;
+  }
+});
+
+test('declines pathological multi-range selections before touching individual ranges', () => {
+  const instance = dom('<p id="target">ordinary text</p>');
+  const target = instance.window.document.querySelector('#target');
+  let rangeReads = 0;
+  const selection = {
+    isCollapsed: false,
+    rangeCount: 10000,
+    getRangeAt() {
+      rangeReads += 1;
+      throw new Error('individual ranges must not be inspected');
+    }
+  };
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  ), null);
+  assert.equal(rangeReads, 0);
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    {
+      isCollapsed: false,
+      get rangeCount() { throw new Error('hostile Selection-like getter'); }
+    },
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  ), null);
+
+  target.textContent = 'ordinary   text';
+  const stableRange = instance.window.document.createRange();
+  stableRange.selectNodeContents(target);
+  let countReads = 0;
+  const stableSelection = {
+    isCollapsed: false,
+    anchorNode: target.firstChild,
+    focusNode: target.firstChild,
+    get rangeCount() {
+      countReads += 1;
+      return countReads === 1 ? 1 : 10000;
+    },
+    getRangeAt() { return stableRange; }
+  };
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    stableSelection,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  ).text, 'ordinary text');
+  assert.equal(countReads, 1);
+});
+
+test('joins multiple ordinary selection ranges predictably without merging their words', () => {
+  const instance = dom('<p id="first">First   range</p><p id="second">Second\nrange</p>');
+  const first = instance.window.document.querySelector('#first');
+  const second = instance.window.document.querySelector('#second');
+  const firstRange = instance.window.document.createRange();
+  const secondRange = instance.window.document.createRange();
+  firstRange.selectNodeContents(first);
+  secondRange.selectNodeContents(second);
+  const selection = {
+    isCollapsed: false,
+    rangeCount: 2,
+    anchorNode: first.firstChild,
+    focusNode: second.firstChild,
+    getRangeAt(index) { return index === 0 ? firstRange : secondRange; }
+  };
+  const payload = cleanCopy.ordinarySelectionPayload(
+    instance.window.document,
+    selection,
+    instance.window,
+    first
+  );
+  assert.equal(payload.text, 'First range\nSecond range');
+  assert.match(payload.html, /<p>First range<\/p><br><p>Second range<\/p>/);
+});
+
+test('mixed Firefox-style ranges decline instead of copying computed-hidden companion text', () => {
+  const instance = dom([
+    '<style>.hidden-companion { display:none }</style>',
+    '<p id="math"><span role="math"><math><mi>x</mi></math></span></p>',
+    '<p id="prose">A&nbsp;<span class="hidden-companion">SECRET</span>B</p>'
+  ].join(''));
+  const math = instance.window.document.querySelector('#math');
+  const prose = instance.window.document.querySelector('#prose');
+  const mathRange = instance.window.document.createRange();
+  const proseRange = instance.window.document.createRange();
+  mathRange.selectNodeContents(math);
+  proseRange.selectNodeContents(prose);
+  const selection = {
+    isCollapsed: false,
+    rangeCount: 2,
+    anchorNode: math.firstChild,
+    focusNode: prose.lastChild,
+    getRangeAt(index) { return index === 0 ? mathRange : proseRange; }
+  };
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    math
+  ), null);
+});
+
+test('ordinary rich cleanup drops executable markup and untrusted attributes', () => {
+  const instance = dom([
+    '<div id="target">',
+    '<svg onload="steal()"><text>SVG PAYLOAD</text></svg>',
+    '<p onclick="steal()" style="background:url(javascript:steal())">Safe   words</p>',
+    '<custom-widget onmouseover="steal()">kept   text</custom-widget>',
+    '<iframe srcdoc="SCRIPT PAYLOAD">FRAME PAYLOAD</iframe>',
+    '<span hidden>HIDDEN PAYLOAD</span>',
+    '</div>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    {},
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, 'Safe words\n\nkept text');
+  assert.match(payload.html, /<p>Safe words<\/p>kept text/);
+  assert.doesNotMatch(payload.html, /svg|iframe|onclick|onmouseover|javascript|style=|PAYLOAD|custom-widget/i);
+});
+
+test('ordinary cleanup leaves over-budget ranges entirely native without cloning', () => {
+  for (const shape of ['deep', 'wide', 'attribute']) {
+    const instance = dom('<div id="target"></div>');
+    const target = instance.window.document.querySelector('#target');
+    if (shape === 'deep') {
+      let current = target;
+      for (let depth = 0; depth < 140; depth += 1) {
+        const child = instance.window.document.createElement('span');
+        current.appendChild(child);
+        current = child;
+      }
+      current.textContent = 'A\u200bB';
+    } else if (shape === 'wide') {
+      for (let count = 0; count < 1100; count += 1) target.appendChild(instance.window.document.createElement('span'));
+      target.appendChild(instance.window.document.createTextNode('A\u200bB'));
+    } else {
+      target.setAttribute('data-hostile-padding', 'x'.repeat(1024 * 1024 + 1));
+      target.textContent = 'A\u200bB';
+    }
+    const originalClone = instance.window.Range.prototype.cloneContents;
+    let cloneCalls = 0;
+    instance.window.Range.prototype.cloneContents = function countedCloneContents() {
+      cloneCalls += 1;
+      return originalClone.call(this);
+    };
+    try {
+      const payload = cleanCopy.ordinarySelectionPayload(
+        instance.window.document,
+        selectContents(instance.window, target),
+        instance.window,
+        target
+      );
+      assert.equal(payload, null, shape);
+      assert.equal(cloneCalls, 0, shape);
+    } finally {
+      instance.window.Range.prototype.cloneContents = originalClone;
+    }
+  }
+});
+
+test('ordinary cleanup never exposes text hidden only by computed CSS', () => {
+  const instance = dom([
+    '<style>.hidden-by-css { display: none }</style>',
+    '<div id="target">Visible <span class="hidden-by-css">SECRET</span>text</div>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const selection = selectContents(instance.window, target);
+  assert.equal(cleanCopy.ordinarySelectionPayload(
+    instance.window.document,
+    selection,
+    instance.window,
+    target
+  ), null);
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  ), null);
+});
+
+test('ordinary cleanup defers to native for rendered text transforms and unmodeled list markers', () => {
+  const instance = dom([
+    '<style>',
+    '.caps { text-transform: uppercase }',
+    '.letters { list-style-type: lower-alpha }',
+    '.markerless { list-style-type: none }',
+    '.images { list-style-image: url("marker.png") }',
+    '</style>',
+    '<p id="caps" class="caps">Mixed&nbsp;case</p>',
+    '<ol id="letters" class="letters"><li>Alpha&nbsp;item</li></ol>',
+    '<ul id="markerless" class="markerless"><li>Hidden&nbsp;marker</li></ul>',
+    '<ul id="images" class="images"><li>Image&nbsp;marker</li></ul>'
+  ].join(''));
+  for (const id of ['caps', 'letters', 'markerless', 'images']) {
+    const target = instance.window.document.querySelector('#' + id);
+    assert.equal(cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    ), null, id);
+  }
+});
+
+test('ordinary cleanup keeps visible text that is only hidden from accessibility APIs', () => {
+  const instance = dom('<p id="target">Visible <span aria-hidden="true">kept&nbsp;text</span> <span class="sr-only">and&nbsp;class</span></p>');
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, 'Visible kept text and class');
+  assert.match(payload.html, /Visible <span>kept text<\/span> <span>and class<\/span>/);
+});
+
+test('ordinary cleanup defers when CSS can hide, transform, or visually reorder selected text', () => {
+  const instance = dom([
+    '<p id="opacity">Visible <span style="opacity:0">SECRET</span>&nbsp; text</p>',
+    '<p id="zero">Visible <span style="font-size:0">SECRET</span>&nbsp; text</p>',
+    '<p id="transparent">Visible <span style="color:transparent">SECRET</span>&nbsp; text</p>',
+    '<p id="clipped">Visible <span style="clip-path:inset(100%)">SECRET</span>&nbsp; text</p>',
+    '<p id="absolute">Visible <span style="position:absolute;left:0">moved</span>&nbsp; text</p>',
+    '<p id="caps" style="font-variant:small-caps">Mixed&nbsp; case</p>'
+  ].join(''));
+  for (const id of ['opacity', 'zero', 'transparent', 'clipped', 'absolute', 'caps']) {
+    const target = instance.window.document.querySelector('#' + id);
+    assert.equal(cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    ), null, id);
+  }
+});
+
+test('clean ordinary text and editable or code selections remain on their native copy paths', () => {
+  const clean = dom('<p id="target">Clean prose 👩‍💻 שלום e\u0301.</p>');
+  const cleanTarget = clean.window.document.querySelector('#target');
+  assert.equal(cleanCopy.ordinarySelectionPayload(
+    clean.window.document,
+    selectContents(clean.window, cleanTarget),
+    clean.window,
+    cleanTarget
+  ), null);
+
+  for (const markup of [
+    '<div id="target" contenteditable="true">Uneven   editable text</div>',
+    '<pre id="target">  exact\n    code</pre>',
+    '<code id="target">x   y</code>'
+  ]) {
+    const instance = dom(markup);
+    const target = instance.window.document.querySelector('#target');
+    assert.equal(cleanCopy.ordinarySelectionPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      instance.window,
+      target
+    ), null, markup);
+  }
 });
 
 test('a generic formula ancestor never swallows prose around a nested renderer', () => {
@@ -431,7 +1309,104 @@ test('a generic formula ancestor never swallows prose around a nested renderer',
     instance.window,
     target
   );
-  assert.equal(payload.text, 'Intro x=1 outro and unrelated text.');
+  assert.equal(payload.text, 'Intro x = 1 outro and unrelated text.');
+});
+
+test('mixed math cleanup ignores forged placeholders and unwraps unknown rich elements', () => {
+  const instance = dom('<p id="target"><x-trigger data-clean-math-copy-value="FORGED">visible<!--EndFragment--></x-trigger> ' +
+    katex('<mrow><mi>x</mi><mo>=</mo><mn>1</mn></mrow>', 'x=1') + '</p>');
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, 'visible x = 1');
+  assert.match(payload.html, /visible/);
+  assert.doesNotMatch(payload.html, /x-trigger|FORGED|data-clean-math-copy/i);
+  assert.equal((payload.html.match(/<!--EndFragment-->/g) || []).length, 1);
+});
+
+test('mixed math keeps visually rendered aria-hidden prose', () => {
+  const instance = dom('<p id="target">Visible <span aria-hidden="true">kept</span> ' +
+    '<span role="math"><math><mi>x</mi></math></span></p>');
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, 'Visible kept x');
+  assert.match(payload.html, /Visible <span>kept<\/span>/);
+});
+
+test('mixed math preserves preformatted, code, list, and table selection context', () => {
+  const cases = [
+    ['<pre id="target">  before  <span role="math"><math><mi>x</mi></math></span>  after  \n</pre>', '  before  x  after', /<pre>  before/],
+    ['<code id="target">a  <span role="math"><math><mi>x</mi></math></span>  b</code>', 'a  x  b', /<code>a  /],
+    ['<ul id="target"><li>first <span role="math"><math><mi>x</mi></math></span></li><li>second</li></ul>', '• first x\n• second', /<ul><li>first/],
+    ['<ol id="target" start="3"><li>first <span role="math"><math><mi>x</mi></math></span></li><li>second</li></ol>', '3. first x\n4. second', /<ol start="3">/],
+    ['<table id="target"><tbody><tr><td>A <span role="math"><math><mi>x</mi></math></span></td><td>B</td></tr></tbody></table>', 'A x\tB', /<table><tbody><tr><td>/]
+  ];
+  for (const [markup, expected, richPattern] of cases) {
+    const instance = dom(markup);
+    const target = instance.window.document.querySelector('#target');
+    const payload = cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    );
+    assert.equal(payload.text, expected, target.localName);
+    assert.match(payload.html, richPattern, target.localName);
+  }
+
+  const partial = dom('<table><tr><td id="start">A <span role="math"><math><mi>x</mi></math></span></td><td id="end">B</td></tr></table>');
+  const start = partial.window.document.querySelector('#start');
+  const end = partial.window.document.querySelector('#end');
+  const range = partial.window.document.createRange();
+  range.setStart(start.firstChild, 0);
+  range.setEnd(end.firstChild, end.firstChild.length);
+  const selection = partial.window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  const payload = cleanCopy.getCopyPayload(
+    partial.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    partial.window,
+    start
+  );
+  assert.equal(payload.text, 'A x\tB');
+  assert.match(payload.html, /<table><tbody><tr><td>A /);
+});
+
+test('a cross-boundary math selection declines when its prose prefix has computed-hidden text', () => {
+  const instance = dom([
+    '<style>.hidden-prefix { display:none }</style>',
+    '<p id="target">Visible <span class="hidden-prefix">SECRET</span>',
+    '<span role="math"><math><mi>x</mi></math></span></p>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const mathText = target.querySelector('mi').firstChild;
+  const range = instance.window.document.createRange();
+  range.setStart(target.firstChild, 0);
+  range.setEnd(mathText, mathText.nodeValue.length);
+  const selection = instance.window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  ), null);
 });
 
 test('raw delimited LaTeX converts in prose but remains literal in code and text controls', () => {
@@ -445,6 +1420,39 @@ test('raw delimited LaTeX converts in prose but remains literal in code and text
   assert.equal(cleanCopy.getCopyPayload(instance.window.document, selectContents(instance.window, code), {}, instance.window, code), null);
   const input = instance.window.document.querySelector('#input');
   assert.equal(cleanCopy.getCopyPayload(instance.window.document, selectContents(instance.window, input), {}, instance.window, input), null);
+
+  const mixed = dom('<p id="start">Keep </p><code id="end">$x^2$</code>');
+  const start = mixed.window.document.querySelector('#start');
+  const end = mixed.window.document.querySelector('#end');
+  const range = mixed.window.document.createRange();
+  range.setStart(start.firstChild, 0);
+  range.setEnd(end.firstChild, end.firstChild.length);
+  const reversedLikeSelection = {
+    isCollapsed: false,
+    rangeCount: 1,
+    anchorNode: start.firstChild,
+    focusNode: end.firstChild,
+    getRangeAt() { return range; }
+  };
+  assert.equal(
+    cleanCopy.getCopyPayload(mixed.window.document, reversedLikeSelection, {}, mixed.window, start),
+    null
+  );
+});
+
+test('currency arithmetic is never paired into fake dollar-delimited LaTeX', () => {
+  for (const source of ['$5 + $10 = $15', '$5 - $3 = $2', '$5 × 2 = $10']) {
+    const instance = dom('<p id="target"></p>');
+    const target = instance.window.document.querySelector('#target');
+    target.textContent = source;
+    assert.equal(cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    ), null, source);
+  }
 });
 
 test('converts compact standalone Unicode math and exact numeric partials while preserving rich symbols', () => {
@@ -461,7 +1469,7 @@ test('converts compact standalone Unicode math and exact numeric partials while 
     root
   );
   assert.equal(rootPayload.reason, 'unicode-math');
-  assert.equal(rootPayload.text, 'r ∝ sqrt(m/abs(q))');
+  assert.equal(rootPayload.text, 'r ∝ √(m/|q|)');
   assert.equal(/\s$/.test(rootPayload.text), false);
   assert.match(rootPayload.html, /√\(m\/\|q\|\)/);
   assert.doesNotMatch(rootPayload.html, /sqrt\(/);
@@ -470,7 +1478,7 @@ test('converts compact standalone Unicode math and exact numeric partials while 
   const massPayload = cleanCopy.getCopyPayload(
     instance.window.document,
     selectContents(instance.window, mass),
-    cleanCopy.DEFAULT_SETTINGS,
+    { ...cleanCopy.DEFAULT_SETTINGS, outputMode: 'calculator' },
     instance.window,
     mass
   );
@@ -480,7 +1488,7 @@ test('converts compact standalone Unicode math and exact numeric partials while 
   const numericPayload = cleanCopy.getCopyPayload(
     instance.window.document,
     selectContents(instance.window, numeric),
-    cleanCopy.DEFAULT_SETTINGS,
+    { ...cleanCopy.DEFAULT_SETTINGS, outputMode: 'calculator' },
     instance.window,
     numeric
   );
@@ -535,10 +1543,17 @@ test('standalone Unicode detection rejects compact and comparative prose but acc
   assert.equal(cleanCopy.looksLikeStandaloneUnicodeMath('dx/dt²'), true);
   const instance = dom('<p id="target">speed = 2 × time</p>');
   const target = instance.window.document.querySelector('#target');
-  const payload = cleanCopy.getCopyPayload(
+  assert.equal(cleanCopy.getCopyPayload(
     instance.window.document,
     selectContents(instance.window, target),
     cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  ), null);
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    { ...cleanCopy.DEFAULT_SETTINGS, outputMode: 'calculator' },
     instance.window,
     target
   );
@@ -557,7 +1572,7 @@ test('standalone rich HTML strips forged style trust and falls back before cloni
   const forgedPayload = cleanCopy.getCopyPayload(
     forged.window.document,
     selectContents(forged.window, forgedTarget),
-    cleanCopy.DEFAULT_SETTINGS,
+    { ...cleanCopy.DEFAULT_SETTINGS, outputMode: 'calculator' },
     forged.window,
     forgedTarget
   );
@@ -590,7 +1605,7 @@ test('standalone rich HTML strips forged style trust and falls back before cloni
       const payload = cleanCopy.getCopyPayload(
         instance.window.document,
         selectContents(instance.window, target),
-        cleanCopy.DEFAULT_SETTINGS,
+        { ...cleanCopy.DEFAULT_SETTINGS, outputMode: 'calculator' },
         instance.window,
         target
       );
@@ -651,7 +1666,7 @@ test('standalone Unicode fallback defers to contenteditable and Office semantic 
   });
   officeTarget.dispatchEvent(officeEvent);
   assert.equal(officeHandlerCalled, true);
-  assert.equal(officeClipboard.get('text/plain'), 'sqrt(x)');
+  assert.equal(officeClipboard.get('text/plain'), '√x');
   assert.match(officeClipboard.get('text/html'), /role="math"/);
 });
 
@@ -708,6 +1723,10 @@ test('reconstructs Word for the web positioned subscripts without copying its la
     cleanCopy.getCopyPayload(instance.window.document, selectContents(instance.window, line), { outputMode: 'calculator' }, instance.window, line).text,
     'R_(1), R_(2)=4.7*kOmega, 10*kOmega and C=220*muF'
   );
+  assert.equal(
+    cleanCopy.getCopyPayload(instance.window.document, selectContents(instance.window, line), { outputMode: 'faithful' }, instance.window, line).text,
+    'R₁, R₂ = 4.7kΩ, 10kΩ and C = 220μF'
+  );
 
   const tokens = instance.window.document.querySelectorAll('#word-line [tabindex]');
   const range = instance.window.document.createRange();
@@ -749,7 +1768,8 @@ test('folds only Word native mathematical-alphanumeric duplicate runs', () => {
   assert.equal(cleanCopy.cleanOfficeClipboardText('𝑥\nx\n'), 'x');
   assert.equal(cleanCopy.cleanOfficeClipboardText('𝛼\nα\n'), 'α');
   assert.equal(cleanCopy.cleanOfficeClipboardText('ℎ\nh\n'), 'h');
-  assert.equal(cleanCopy.cleanOfficeClipboardText('ℂ\nC\n'), 'C');
+  assert.equal(cleanCopy.cleanOfficeClipboardText('ℂ\nC\n'), 'ℂ');
+  assert.equal(cleanCopy.cleanOfficeClipboardText('ℝ1\nR\n1\n'), 'ℝ₁');
   assert.equal(cleanCopy.cleanOfficeClipboardText('R1\nR\n1\nordinary'), 'R1\nR\n1\nordinary');
   assert.equal(cleanCopy.cleanOfficeClipboardText('𝑅1\nR\n2\nmismatch'), '𝑅1\nR\n2\nmismatch');
   assert.equal(cleanCopy.cleanOfficeClipboardText('𝐀𝐁\nA\nB\nthird'), '𝐀𝐁\nA\nB\nthird');
@@ -845,9 +1865,40 @@ test('prefers semantic MathML that Word adds after its temporary plain-text flav
   const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
   Object.defineProperty(event, 'clipboardData', { value: data });
   target.dispatchEvent(event);
-  assert.equal(clipboard.get('text/plain'), 'sqrt(m/abs(q))');
+  assert.equal(clipboard.get('text/plain'), '√(m/|q|)');
   assert.match(clipboard.get('text/html'), /border-top:1px solid currentColor/);
   assert.match(clipboard.get('MathML'), /^<math/);
+});
+
+test('Office semantic rewriting replaces unsafe CF_HTML and ignores forged equation markers', () => {
+  const instance = dom('<div id="WACViewPanel_EditingElement" contenteditable="true">&nbsp;</div>',
+    'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx');
+  const target = instance.window.document.querySelector('#WACViewPanel_EditingElement');
+  selectContents(instance.window, target);
+  cleanCopy.install(instance.window.document, instance.window);
+  const clipboard = new Map();
+  const data = {
+    get types() { return Array.from(clipboard.keys()); },
+    clearData(type) { if (type) clipboard.delete(type); else clipboard.clear(); },
+    setData(type, value) { clipboard.set(type, value); },
+    getData(type) { return clipboard.get(type) || ''; }
+  };
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData('HTML Format', [
+      '<img src="x" onerror="steal()">',
+      '<span data-clean-math-copy-office-index="0">visible </span>',
+      '<math xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>x</mi><mo>=</mo><mn>1</mn></mrow></math>'
+    ].join(''));
+    event.stopImmediatePropagation();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(event, 'clipboardData', { value: data });
+  target.dispatchEvent(event);
+  assert.equal(clipboard.get('text/plain'), 'visible x = 1');
+  assert.match(clipboard.get('HTML Format'), /^Version:1\.0\r\nStartHTML:\d{10}/);
+  assert.match(clipboard.get('HTML Format'), /visible/);
+  assert.doesNotMatch(clipboard.get('HTML Format'), /onerror|steal|data-clean-math-copy-office-index/i);
+  assert.doesNotMatch(clipboard.get('text/html'), /onerror|steal|data-clean-math-copy-office-index/i);
 });
 
 test('a later Word plain-text write cannot overwrite semantic MathML already recovered', () => {
@@ -872,7 +1923,7 @@ test('a later Word plain-text write cannot overwrite semantic MathML already rec
   const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
   Object.defineProperty(event, 'clipboardData', { value: data });
   target.dispatchEvent(event);
-  assert.equal(clipboard.get('text/plain'), '(a/b)');
+  assert.equal(clipboard.get('text/plain'), 'a/b');
 });
 
 test('preserves prose and every equation in mixed Office HTML even when Word stops propagation', () => {
@@ -904,7 +1955,7 @@ test('preserves prose and every equation in mixed Office HTML even when Word sto
   const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
   Object.defineProperty(event, 'clipboardData', { value: data });
   target.dispatchEvent(event);
-  assert.equal(clipboard.get('text/plain'), 'Before x=1 and sqrt(y) after');
+  assert.equal(clipboard.get('text/plain'), 'Before x = 1 and √y after');
   assert.equal((clipboard.get('text/html').match(/role="math"/g) || []).length, 2);
   assert.equal(clipboard.has('MathML'), false);
 });
@@ -934,7 +1985,7 @@ test('separates multiple equations in an Office oMathPara instead of multiplying
   const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
   Object.defineProperty(event, 'clipboardData', { value: data });
   target.dispatchEvent(event);
-  assert.equal(clipboard.get('text/plain'), 'x=1\ny=2');
+  assert.equal(clipboard.get('text/plain'), 'x = 1\ny = 2');
   assert.equal(clipboard.has('MathML'), false);
 });
 
@@ -1036,7 +2087,7 @@ test('semantic Word staging still wins after Word first writes nonempty plain te
     target.dispatchEvent(event);
     await new Promise((resolve) => instance.window.setTimeout(resolve, 10));
     assert.equal(clipboard.get('text/plain'), 'garbled fraction');
-    assert.equal(recovered, 'sqrt(m/q)');
+    assert.equal(recovered, '√(m/q)');
   } finally {
     if (previous === undefined) delete global.GM_setClipboard;
     else global.GM_setClipboard = previous;
@@ -1118,6 +2169,56 @@ test('a manual copy cancels an older Word staging recovery before it can overwri
   }
 });
 
+test('a deferred settings read cannot overwrite a newer menu choice', async () => {
+  const instance = dom('<p>settings race</p>');
+  const commands = new Map();
+  const saved = [];
+  let resolveInitialRead;
+  const previousGM = global.GM;
+  const previousRegister = global.GM_registerMenuCommand;
+  try {
+    // Exercise the modern asynchronous userscript API specifically. Its
+    // startup read is intentionally left pending until after the user changes
+    // the output mode from the registered menu.
+    delete global.GM_registerMenuCommand;
+    global.GM = {
+      getValue() {
+        return new Promise((resolve) => { resolveInitialRead = resolve; });
+      },
+      setValue(_key, value) {
+        saved.push(value);
+        return Promise.resolve();
+      },
+      registerMenuCommand(name, callback) {
+        commands.set(name, callback);
+      }
+    };
+    const installed = cleanCopy.install(instance.window.document, instance.window);
+    assert.equal(installed.settings.outputMode, 'faithful');
+    commands.get('Clean Math Copy: calculator-safe output')();
+    assert.equal(installed.settings.outputMode, 'calculator');
+    assert.equal(saved.at(-1).outputMode, 'calculator');
+
+    resolveInitialRead({
+      outputMode: 'latex',
+      convertDelimitedLatex: false,
+      cleanInvisibleArtifacts: false
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(installed.settings, {
+      outputMode: 'calculator',
+      convertDelimitedLatex: true,
+      cleanInvisibleArtifacts: true
+    });
+  } finally {
+    if (previousGM === undefined) delete global.GM;
+    else global.GM = previousGM;
+    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
+    else global.GM_registerMenuCommand = previousRegister;
+  }
+});
+
 test('installed capture handler wins over later site handlers only when rewriting is needed', () => {
   const instance = dom('<p id="target">Math: ' + katex('<mrow><mi>x</mi><mo>=</mo><mn>2</mn></mrow>', 'x=2') + '</p>');
   const target = instance.window.document.querySelector('#target');
@@ -1137,7 +2238,7 @@ test('installed capture handler wins over later site handlers only when rewritin
   target.dispatchEvent(event);
   assert.equal(event.defaultPrevented, true);
   assert.equal(siteHandlerCalled, false);
-  assert.equal(clipboard.get('text/plain'), 'Math: x=2');
+  assert.equal(clipboard.get('text/plain'), 'Math: x = 2');
   assert.match(clipboard.get('text/html'), /role="math"/);
 });
 
@@ -1190,7 +2291,7 @@ test('manual copy command preserves plain, rich HTML, and MathML clipboard repre
       Object.keys(writtenItem.representations).sort(),
       ['application/mathml+xml', 'text/html', 'text/plain']
     );
-    assert.equal(await writtenItem.representations['text/plain'].text(), '(1/sqrt(x))');
+    assert.equal(await writtenItem.representations['text/plain'].text(), '1/√x');
     assert.match(await writtenItem.representations['text/html'].text(), /border-top:1px solid currentColor/);
     assert.match(await writtenItem.representations['application/mathml+xml'].text(), /^<math/);
     assert.equal(plainFallbackCalls, 0);
@@ -1245,6 +2346,69 @@ test('manual copy retries plain plus rich HTML when a browser rejects custom Mat
   }
 });
 
+test('serializes overlapping successful manual writes so the newest request remains final', async () => {
+  const instance = dom([
+    '<div id="first">', katex('<mi>x</mi>', 'x'), '</div>',
+    '<div id="second">', katex('<mi>y</mi>', 'y'), '</div>'
+  ].join(''));
+  const firstTarget = instance.window.document.querySelector('#first');
+  const secondTarget = instance.window.document.querySelector('#second');
+  selectContents(instance.window, firstTarget);
+  const commands = new Map();
+  const attempts = [];
+  const completeWrites = [];
+  let finalClipboard = '';
+  class FakeClipboardItem {
+    constructor(representations) { this.representations = representations; }
+  }
+  Object.defineProperty(instance.window, 'Blob', { configurable: true, value: Blob });
+  Object.defineProperty(instance.window, 'ClipboardItem', { configurable: true, value: FakeClipboardItem });
+  Object.defineProperty(instance.window.navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      write(items) {
+        const item = items[0];
+        attempts.push(item);
+        return new Promise((resolve) => {
+          completeWrites.push(async () => {
+            finalClipboard = await item.representations['text/plain'].text();
+            resolve();
+          });
+        });
+      }
+    }
+  });
+  const previousRegister = global.GM_registerMenuCommand;
+  const previousSetClipboard = global.GM_setClipboard;
+  global.GM_registerMenuCommand = (name, callback) => commands.set(name, callback);
+  global.GM_setClipboard = () => { throw new Error('rich clipboard path should win'); };
+  try {
+    cleanCopy.install(instance.window.document, instance.window);
+    const command = commands.get('Clean Math Copy: copy current selection now');
+    const older = command();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(attempts.length, 1);
+
+    selectContents(instance.window, secondTarget);
+    const newer = command();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(attempts.length, 1, 'newer write started before the older write settled');
+
+    await completeWrites[0]();
+    assert.equal(await older, false);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(attempts.length, 2);
+    await completeWrites[1]();
+    assert.equal(await newer, true);
+    assert.equal(finalClipboard, 'y');
+  } finally {
+    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
+    else global.GM_registerMenuCommand = previousRegister;
+    if (previousSetClipboard === undefined) delete global.GM_setClipboard;
+    else global.GM_setClipboard = previousSetClipboard;
+  }
+});
+
 test('a stale manual clipboard rejection cannot retry over a newer manual copy', async () => {
   const instance = dom([
     '<div id="first">', katex('<mi>x</mi>', 'x'), '</div>',
@@ -1286,9 +2450,12 @@ test('a stale manual clipboard rejection cannot retry over a newer manual copy',
     assert.equal(typeof rejectFirst, 'function');
 
     selectContents(instance.window, secondTarget);
-    assert.equal(await command(), true);
+    const newer = command();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(attempts.length, 1);
     rejectFirst(new DOMException('custom representation rejected', 'NotSupportedError'));
     assert.equal(await older, false);
+    assert.equal(await newer, true);
     assert.equal(attempts.length, 2);
     assert.equal(await attempts[0].representations['text/plain'].text(), 'x');
     assert.equal(await attempts[1].representations['text/plain'].text(), 'y');
@@ -1323,7 +2490,10 @@ test('a keyboard copy invalidates an older manual clipboard retry', async () => 
     value: {
       write(items) {
         attempts.push(items[0]);
-        return new Promise((_resolve, reject) => { rejectFirst = reject; });
+        if (attempts.length === 1) {
+          return new Promise((_resolve, reject) => { rejectFirst = reject; });
+        }
+        return Promise.resolve();
       }
     }
   });
@@ -1352,8 +2522,89 @@ test('a keyboard copy invalidates an older manual clipboard retry', async () => 
 
     rejectFirst(new DOMException('custom representation rejected', 'NotSupportedError'));
     assert.equal(await older, false);
-    assert.equal(attempts.length, 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(attempts.length, 2);
+    assert.equal(await attempts[1].representations['text/plain'].text(), 'y');
     assert.equal(plainFallbackCalls, 0);
+  } finally {
+    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
+    else global.GM_registerMenuCommand = previousRegister;
+    if (previousSetClipboard === undefined) delete global.GM_setClipboard;
+    else global.GM_setClipboard = previousSetClipboard;
+  }
+});
+
+test('replays a newer native keyboard copy after an already-started manual write finishes late', async () => {
+  const instance = dom([
+    '<div id="first">', katex('<mi>x</mi>', 'x'), '</div>',
+    '<p id="second">new native text</p>'
+  ].join(''));
+  const firstTarget = instance.window.document.querySelector('#first');
+  const secondTarget = instance.window.document.querySelector('#second');
+  selectContents(instance.window, firstTarget);
+  const commands = new Map();
+  const attempts = [];
+  let completeOlder = null;
+  let finalClipboard = '';
+  class FakeClipboardItem {
+    constructor(representations) { this.representations = representations; }
+  }
+  Object.defineProperty(instance.window, 'Blob', { configurable: true, value: Blob });
+  Object.defineProperty(instance.window, 'ClipboardItem', { configurable: true, value: FakeClipboardItem });
+  Object.defineProperty(instance.window.navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      write(items) {
+        const item = items[0];
+        attempts.push(item);
+        if (attempts.length === 1) {
+          return new Promise((resolve) => {
+            completeOlder = async () => {
+              finalClipboard = await item.representations['text/plain'].text();
+              resolve();
+            };
+          });
+        }
+        return item.representations['text/plain'].text().then((text) => {
+          finalClipboard = text;
+        });
+      }
+    }
+  });
+  const previousRegister = global.GM_registerMenuCommand;
+  const previousSetClipboard = global.GM_setClipboard;
+  global.GM_registerMenuCommand = (name, callback) => commands.set(name, callback);
+  global.GM_setClipboard = () => { throw new Error('ClipboardItem path should win'); };
+  try {
+    cleanCopy.install(instance.window.document, instance.window);
+    const older = commands.get('Clean Math Copy: copy current selection now')();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(typeof completeOlder, 'function');
+
+    selectContents(instance.window, secondTarget);
+    const keyboardEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+    const eventClipboard = new Map();
+    Object.defineProperty(keyboardEvent, 'clipboardData', {
+      value: {
+        get types() { return Array.from(eventClipboard.keys()); },
+        clearData() { eventClipboard.clear(); },
+        setData(type, value) { eventClipboard.set(type, value); },
+        getData(type) { return eventClipboard.get(type) || ''; }
+      }
+    });
+    secondTarget.dispatchEvent(keyboardEvent);
+    assert.equal(keyboardEvent.defaultPrevented, false);
+    // jsdom has no native clipboard implementation, so model the browser's
+    // synchronous native copy before the older async write completes.
+    finalClipboard = secondTarget.textContent;
+
+    await completeOlder();
+    assert.equal(await older, false);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(attempts.length, 2);
+    assert.equal(finalClipboard, 'new native text');
+    assert.equal(await attempts[1].representations['text/plain'].text(), 'new native text');
   } finally {
     if (previousRegister === undefined) delete global.GM_registerMenuCommand;
     else global.GM_registerMenuCommand = previousRegister;

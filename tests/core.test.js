@@ -15,6 +15,195 @@ test('converts common LaTeX structures into readable Unicode math', () => {
   assert.equal(cleanCopy.latexToUnicode(String.raw`\operatorname*{arg\,max}_{x \in \mathbb{R}}`), 'arg max_(x ∈ ℝ)');
 });
 
+test('faithful mode preserves visual notation while making linear structure unambiguous', () => {
+  assert.equal(cleanCopy.latexToFaithful(String.raw`(y')^2=20x'`), '(y′)² = 20x′');
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`F_g=G\left(\frac{m_1m_2}{r^2}\right)`),
+    'F_g = G((m₁m₂)/r²)'
+  );
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`r\propto\sqrt{\frac{m}{\lvert q\rvert}}`),
+    'r ∝ √(m/|q|)'
+  );
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\lVert x\rVert_2`), '‖x‖₂');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\frac{a+b}{c+d}`), '(a + b)/(c + d)');
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`\frac{-b\pm\sqrt{b^2-4ac}}{2a}`),
+    '(−b ± √(b² − 4ac))/(2a)'
+  );
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\frac{\sin x}{x}`), '(sin x)/x');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\frac{1}{2}`), '1/2');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sqrt{x}`), '√x');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sqrt{x^2}`), '√(x²)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sqrt{x'}`), '√(x′)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sqrt{x_1}`), '√x₁');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sqrt{x}y`), '√(x)y');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`y\sqrt{x}`), 'y√x');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sqrt{x}\sqrt{y}`), '√x√y');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\frac1{\sqrt{x}y}`), '1/(√(x)y)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\frac1{y\sqrt{x}}`), '1/(y√x)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\frac1{\sqrt{x}\sqrt{y}}`), '1/(√x√y)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sqrt{\lvert q\rvert}`), '√|q|');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sqrt{xy}`), '√(xy)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sqrt[3]{x}`), '∛x');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sqrt[4]{x+1}`), '∜(x + 1)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`x^y+F_g+x_{out}`), 'x^y + F_g + xₒᵤₜ');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\Delta x=\alpha\times 2`), 'Δx = α × 2');
+});
+
+test('faithful mode preserves invisible TeX group, denominator, function, and script scope', () => {
+  const cases = new Map([
+    [String.raw`\frac1{abcd}`, '1/(abcd)'],
+    [String.raw`\frac1{2ab}`, '1/(2ab)'],
+    [String.raw`\frac1{2(a+b)}`, '1/(2(a + b))'],
+    [String.raw`\frac1{\sin x}`, '1/(sin x)'],
+    [String.raw`{a+b}^2`, '(a + b)²'],
+    [String.raw`{ab}^2`, '(ab)²'],
+    [String.raw`{\frac ab}^2`, '(a/b)²'],
+    [String.raw`{ab}_i`, '(ab)ᵢ'],
+    [String.raw`\sqrt{x}^2`, '(√x)²'],
+    [String.raw`2{a+b}`, '2(a + b)'],
+    [String.raw`{a+b}c`, '(a + b)c'],
+    [String.raw`{a+b}!`, '(a + b)!'],
+    [String.raw`-{a+b}`, '−(a + b)'],
+    [String.raw`\sin{x+y}`, 'sin(x + y)'],
+    [String.raw`\exp{x+1}`, 'exp(x + 1)'],
+    [String.raw`\sin{x}`, 'sin x']
+  ]);
+  for (const [source, expected] of cases) assert.equal(cleanCopy.latexToFaithful(source), expected, source);
+});
+
+test('faithful mode protects prose punctuation, relations, accents, and authored private-use text', () => {
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\text{time-dependent; don't}`), "time-dependent; don't");
+  assert.equal(cleanCopy.latexToFaithful(String.raw`a\parallel b`), 'a ∥ b');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\lVert x\rVert`), '‖x‖');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\overline{a+b}`), 'overline(a + b)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\vec{a+b}`), 'vec(a + b)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\hat{xy}`), 'hat(xy)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\hat{x}`), 'x̂');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`x_{\beta}`), 'xᵦ');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\phi,\varphi,\epsilon,\varepsilon`), 'ϕ, φ, ϵ, ε');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\acute x`), 'x́');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\grave x`), 'x̀');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\breve x`), 'x̆');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\check x`), 'x̌');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\mathring x`), 'x̊');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\underline x`), 'x̲');
+  for (let codePoint = 0xe10a; codePoint <= 0xe10f; codePoint += 1) {
+    const authored = String.fromCodePoint(codePoint);
+    assert.equal(cleanCopy.latexToFaithful('x' + authored + 'y'), 'x' + authored + 'y');
+  }
+});
+
+test('raw TeX symbols follow canonical TeX and KaTeX glyph conventions', () => {
+  const cases = new Map([
+    [String.raw`\varkappa`, 'ϰ'], [String.raw`\nparallel`, '∦'],
+    [String.raw`\nmid`, '∤'], [String.raw`\owns`, '∋'],
+    [String.raw`\subsetneq`, '⊊'], [String.raw`\supsetneq`, '⊋'],
+    [String.raw`\smallsetminus`, '∖'], [String.raw`\land`, '∧'],
+    [String.raw`\lor`, '∨'], [String.raw`\Box`, '□'],
+    [String.raw`\Diamond`, '◊'], [String.raw`\clubsuit`, '♣'],
+    [String.raw`\diamondsuit`, '♢'], [String.raw`\heartsuit`, '♡'],
+    [String.raw`\spadesuit`, '♠'], [String.raw`\cdot`, '⋅'],
+    [String.raw`\bullet`, '∙'], [String.raw`\iff`, '⟺'],
+    [String.raw`\implies`, '⟹'], [String.raw`\impliedby`, '⟸']
+  ]);
+  for (const [source, expected] of cases) assert.equal(cleanCopy.latexToFaithful(source), expected, source);
+  assert.equal(cleanCopy.latexToFaithful(String.raw`a\bullet b`), 'a ∙ b');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`A\smallsetminus B`), 'A ∖ B');
+});
+
+test('faithful mode preserves explicit mathematical alphabets with readable fallbacks', () => {
+  const cases = new Map([
+    [String.raw`\mathbf{ABCxyz123}`, '𝐀𝐁𝐂𝐱𝐲𝐳𝟏𝟐𝟑'],
+    [String.raw`\boldsymbol{x}`, '𝒙'],
+    [String.raw`\mathbf{\alpha}`, '𝛂'],
+    [String.raw`\boldsymbol{\alpha}`, '𝜶'],
+    [String.raw`\mathit{h}`, 'ℎ'],
+    [String.raw`\mathcal{BEgo}`, 'ℬℰℊℴ'],
+    [String.raw`\mathscr{x}`, '𝓍'],
+    [String.raw`\mathfrak{CHIRZxyz}`, 'ℭℌℑℜℨ𝔵𝔶𝔷'],
+    [String.raw`\mathsf{Ab9}`, '𝖠𝖻𝟫'],
+    [String.raw`\mathtt{Ab9}`, '𝙰𝚋𝟿'],
+    [String.raw`\mathbb{CHNPQRZx9}`, 'ℂℍℕℙℚℝℤ𝕩𝟡'],
+    [String.raw`\mathcal{\alpha}`, 'mathcal(α)'],
+    [String.raw`\mathbf{x+1}`, '𝐱 + 𝟏'],
+    [String.raw`\mathcal{F+G}`, 'ℱ + 𝒢'],
+    [String.raw`\boldsymbol{\alpha+\Gamma}`, '𝜶 + 𝜞'],
+    [String.raw`\mathcal{F+\alpha+G}`, 'ℱ + mathcal(α) + 𝒢']
+  ]);
+  for (const [source, expected] of cases) assert.equal(cleanCopy.latexToFaithful(source), expected, source);
+});
+
+test('faithful mode retains cancellation, boxes, and prescript structure', () => {
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\cancel{x}`), 'cancel(x)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\bcancel{x}`), 'bcancel(x)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\xcancel{x}`), 'xcancel(x)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\cancelto{0}{x}`), 'cancelto(0, x)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\boxed{x}`), 'boxed(x)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\prescript{14}{6}{C}`), '¹⁴₆C');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`{}^{14}_{6}C`), '¹⁴₆C');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\binom{n}{k}`), 'C(n, k)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\dbinom{n}{k}`), 'C(n, k)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\tbinom{n}{k}`), 'C(n, k)');
+});
+
+test('faithful mode consumes layout dimensions and distinguishes annotations from scripts', () => {
+  for (const source of [
+    String.raw`x\kern1em y`, String.raw`x\kern-0.2em y`, String.raw`x\kern{1em}y`,
+    String.raw`x\mkern3mu y`, String.raw`x\hskip 1em y`, String.raw`x\mskip3mu y`,
+    String.raw`x\space y`
+  ]) {
+    assert.equal(cleanCopy.latexToFaithful(source), 'x y', source);
+  }
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\overset{!}{=}`), 'overset(!, =)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\stackrel{!}{=}`), 'overset(!, =)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\underset{i}{x}`), 'underset(i, x)');
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`A\underset{f}{\longrightarrow}B`),
+    'A underset(f, ⟶) B'
+  );
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\overset{n}{\sum}`), '∑ⁿ');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\underset{i=1}{\sum}`), '∑ᵢ₌₁');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\int^\infty`), '∫^∞');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\vec v`), 'v⃗');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\bar x`), 'x̅');
+});
+
+test('faithful mode retains functions, aggregates, cases, matrices, and authored multiplication', () => {
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sin\lvert x\rvert`), 'sin |x|');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sin^2(x)`), 'sin²(x)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`\sum_{i=1}^n i^2`), '∑ᵢ₌₁ⁿ i²');
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`\lim_{x\to0}\frac{\sin x}{x}`),
+    'lim_(x → 0) (sin x)/x'
+  );
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`\begin{cases}x^2&x>0\\-x&x\le0\end{cases}`),
+    '{x² if x > 0; −x if x ≤ 0}'
+  );
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`\begin{bmatrix}a&b\\c&d\end{bmatrix}`),
+    '[a, b; c, d]'
+  );
+  assert.equal(cleanCopy.latexToFaithful(String.raw`m_1\,m_2`), 'm₁ m₂');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`m_1\cdot m_2`), 'm₁ ⋅ m₂');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`m_1*m_2`), 'm₁*m₂');
+  assert.equal(/\s$/u.test(cleanCopy.latexToFaithful(String.raw`x^2\quad`)), false);
+});
+
+test('faithful delimited conversion is separate from unchanged calculator conversion', () => {
+  assert.deepEqual(
+    cleanCopy.convertDelimitedLatexText(String.raw`Use $F_g=G\left(\frac{m_1m_2}{r^2}\right)$.`, 'faithful'),
+    { text: 'Use F_g = G((m₁m₂)/r²).', converted: 1 }
+  );
+  const source = String.raw`r=\frac{1}{0.452}\sqrt{\frac{2(0.666\times10^{-25})(2464)}{1.602\times10^{-19}}}`;
+  assert.equal(
+    cleanCopy.latexToCalculator(source),
+    'r=(1/0.452)*sqrt((2*(0.666*10^(-25))*(2464))/(1.602*10^(-19)))'
+  );
+});
+
 test('linearizes matrices, cases, text, accents, and indexed roots without stray lines', () => {
   assert.equal(
     cleanCopy.latexToUnicode(String.raw`\begin{bmatrix}a&b\\c&d\end{bmatrix}`),
@@ -38,6 +227,13 @@ test('converts delimited LaTeX but does not mistake currency for math', () => {
   );
   assert.equal(result.converted, 1);
   assert.equal(result.text, 'Costs $5 and formula x² + 1; another costs $10.');
+  for (const source of ['$5 + $10 = $15', '$5 - $3 = $2', '$5 × 2 = $10']) {
+    assert.deepEqual(cleanCopy.convertDelimitedLatexText(source, 'faithful'), { text: source, converted: 0 });
+  }
+  assert.deepEqual(
+    cleanCopy.convertDelimitedLatexText('$5 + 3$ is a numeric formula.', 'faithful'),
+    { text: '5 + 3 is a numeric formula.', converted: 1 }
+  );
 });
 
 test('preserves delimiters when a LaTeX construct has no visible output', () => {
@@ -183,6 +379,36 @@ test('bounds adversarial LaTeX nesting and preserves the original delimited sour
   assert.deepEqual(cleanCopy.convertDelimitedLatexText(source, 'calculator'), { text: source, converted: 0 });
 });
 
+test('shares budgets across nested LaTeX environments and nested function parsers', () => {
+  const nestedEnvironment = String.raw`\begin{x}`.repeat(1000) + 'a' + String.raw`\end{x}`.repeat(1000);
+  for (const converter of [
+    cleanCopy.latexToFaithful,
+    cleanCopy.latexToCalculator,
+    cleanCopy.latexToUnicode
+  ]) {
+    let result;
+    assert.doesNotThrow(() => { result = converter(nestedEnvironment); });
+    assert.equal(result, '');
+  }
+
+  const nestedFunction = String.raw`\sin(`.repeat(1000) + 'x' + ')'.repeat(1000);
+  let functionResult;
+  assert.doesNotThrow(() => { functionResult = cleanCopy.latexToCalculator(nestedFunction); });
+  assert.equal(functionResult, '');
+
+  const hostileSource = { toString() { throw new Error('page getter failed'); } };
+  assert.equal(cleanCopy.latexToFaithful(hostileSource), '');
+  assert.equal(cleanCopy.latexToCalculator(hostileSource), '');
+  assert.equal(cleanCopy.latexToUnicode(hostileSource), '');
+});
+
+test('bounds hidden or direct LaTeX source length before parsing', () => {
+  const oversized = String.raw`\text{` + 'x'.repeat(50001) + '}';
+  assert.equal(cleanCopy.latexToFaithful(oversized), '');
+  assert.equal(cleanCopy.latexToCalculator(oversized), '');
+  assert.equal(cleanCopy.latexToUnicode(oversized), '');
+});
+
 test('normalizes nested Unicode absolute values without leaking Markdown emphasis', () => {
   assert.equal(cleanCopy.unicodeToCalculator('∣**q**∣'), 'abs(q)');
   assert.equal(cleanCopy.unicodeToCalculator('|x+|y||'), 'abs(x+abs(y))');
@@ -217,7 +443,7 @@ test('cleans copy artifacts without breaking emoji joiners or intentional newlin
 
 test('normalizes invalid settings safely', () => {
   assert.deepEqual(cleanCopy.normalizeSettings({ outputMode: 'bogus' }), {
-    outputMode: 'calculator',
+    outputMode: 'faithful',
     convertDelimitedLatex: true,
     cleanInvisibleArtifacts: true
   });

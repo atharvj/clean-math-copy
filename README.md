@@ -1,153 +1,136 @@
 # Clean Math Copy
 
-Clean Math Copy is a self-contained userscript that reconstructs the structure of selected mathematics instead of copying the visual glyph order. It places calculator-safe text, clean rich HTML, and MathML (when available) on the clipboard, eliminating reversed fractions, missing roots, duplicated accessibility text, and surprise whitespace.
+Clean Math Copy is a self-contained userscript that turns visually rendered equations into faithful, readable text and cleans copy-broken ordinary prose. It reconstructs semantic math structure instead of trusting flattened glyph order, so roots, fractions, scripts, primes, bars, matrices, and exact partial selections paste in the order the user actually selected.
 
-The installable file is [`clean-math-copy.user.js`](./clean-math-copy.user.js). It has no runtime package, CDN, network, analytics, or update dependency.
+Version 2.0 defaults to faithful readable output. Calculator-safe syntax remains one menu click away. The installable artifact is [`clean-math-copy.user.js`](./clean-math-copy.user.js); it has no runtime package, CDN, analytics, network, or `@require` dependency.
 
-## What it does
+## Default output
 
-The default plain-text output is calculator-safe:
+The faithful mode preserves real mathematical notation while adding only the grouping needed to make two-dimensional structures unambiguous:
 
-| Selected content | Pasted text |
+| Selected math | Default pasted text |
 | --- | --- |
-| Rendered `\sqrt{m/\lvert q\rvert}` | `sqrt(m/abs(q))` |
-| Rendered `\frac{1}{0.452}\sqrt{\frac{2(0.666\times10^{-25})(2464)}{1.602\times10^{-19}}}` | `(1/0.452)*sqrt((2*(0.666*10^(-25))*(2464))/(1.602*10^(-19)))` |
-| Only `0.666\times10^{-25}` highlighted inside `m=0.666\times10^{-25}\,kg` | `0.666*10^(-25)` |
-| Plain Unicode `r ∝ √(m/\lvert q\rvert)` with no renderer metadata | `r ∝ sqrt(m/abs(q))` |
-| Only plain Unicode `0.666 × 10⁻²⁵` highlighted | `0.666*10^(-25)` |
-| Rendered `\sin(\lvert x\rvert)+\cos^2(y)` | `sin(abs(x))+cos(y)^(2)` |
-| Rendered `\sum_{i=1}^n i^2` | `sum(i^(2),i,1,n)` |
-| Rendered `\lim_{x\to0}\frac{\sin x}{x}` | `limit((sin(x)/x),x->0)` |
-| Rendered `\begin{cases}x^2&x>0\\-x&x\le0\end{cases}` | `piecewise([x^(2),x>0],[-x,x<=0])` |
-| Raw `$\mathrm{speed}=2\mathrm{time}$` | `speed=2*time` |
-| Raw `$\sum_{i=1}^n i^2$` | `sum(i^(2),i=1,n)` |
-| Word for the web positioned `R_1, R_2 = 4.7kΩ, 10kΩ and C = 220μF` | `R_(1), R_(2)=4.7*kOmega, 10*kOmega and C=220*muF` plus rich `<sub>` formatting |
-| Rendered `\frac{-b \pm \sqrt{b^2-4ac}}{2a}` | `(-b+/-sqrt(b^(2)-4*a*c))/(2*a)` |
-| Prose containing `$x^2 + 1$` | `Prose containing x^(2)+1` |
-| A KaTeX expression with two DOM renderings | One expression, not duplicated text |
+| `(y')^2=20x'` | `(y′)² = 20x′` |
+| `F_g=G\left(\frac{m_1m_2}{r^2}\right)` | `F_g = G((m₁m₂)/r²)` |
+| `r\propto\sqrt{\frac{m}{\lvert q\rvert}}` | `r ∝ √(m/\|q\|)` |
+| Only `0.666×10−25` inside a longer rendered line | `0.666 × 10⁻²⁵` |
+| `\sin^2(x)+\log_2 x` | `sin²(x) + log₂ x` |
+| `\lVert x\rVert_2` | `‖x‖₂` |
+| `\sum_{i=1}^n i^2` | `∑ᵢ₌₁ⁿ i²` |
+| `\begin{bmatrix}a&b\\c&d\end{bmatrix}` | `[a, b; c, d]` |
+| `\binom{n}{k}` | `C(n, k)` |
+| `\vec v,\;\bar x` | `v⃗, x̅` |
+| `\begin{aligned}x&=1\\y&=2\end{aligned}` | `x = 1; y = 2` |
+| Word for the web equation `R_1, R_2 = 4.7kΩ, 10kΩ and C = 220μF` | `R₁, R₂ = 4.7kΩ, 10kΩ and C = 220μF` plus rich `<sub>` formatting |
 
-It understands:
+Primes become real `′`, `″`, and `‴` characters; supported superscripts and subscripts become Unicode scripts; explicit `×`, `·`, roots, absolute-value bars, norms, Greek letters, and relations remain visible. Fractions use `/` with minimal grouping, so `m₁m₂/r²` stays compact while `(a + b)/(c + d)` remains unambiguous.
 
-- KaTeX, including its visual HTML plus hidden MathML pair
-- renderer wrappers whose visual layout and accessibility MathML live in separate sibling branches, including the structure used by current ChatGPT math
-- MathJax 2, 3, and 4 DOM conventions and MathItem metadata
-- native presentation and basic content MathML
-- TeX annotations such as `application/x-tex`
-- common LaTeX structures: fractions, roots, scripts, Greek letters, operators, arrows, sets, accents, matrices, cases, aligned equations, text, font wrappers, and more
-- calculator precedence in raw LaTeX, including grouped and nested fractions, braced bases, styled multi-letter identifiers, nested absolute values, indexed roots, implicit products, conventional and declared functions, inverse trig notation, logarithm bases, postfix factors, piecewise cases, and binomials
-- coherent raw-LaTeX set relations and aggregates, including membership/union/intersection, divisibility, bounded sums/products/integrals, and limits
-- rendered literal operators, scripted groups/fences, norms, functions, inverse functions, bounded operators, limits, and value-condition pairings in cases
-- equations exposed through `data-latex`, `data-tex`, `data-math-source`, `alttext`, ARIA labels, and useful image alt text
-- exact partial selections inside rendered equations, including contiguous MathML subtrees, fractions, roots, powers, repeated-looking scripts, and single-token substrings
-- selections that cross from prose into only part of an equation, without silently adding the unselected remainder
-- Microsoft Word for the web copy staging, MathML and OMML clipboard data, native duplicate-run cleanup, and its PDF.js-style positioned accessibility text layer
-- multiple selection ranges and current open Shadow DOM selection APIs
-- surrounding paragraphs, headings, line breaks, lists, tables, preformatted text, and image descriptions
-- compact standalone Unicode equations and subexpressions when no renderer metadata exists, guarded by a math-specific detector that declines ordinary prose
-- ordinary symbols, emoji sequences, combining marks, right-to-left control characters, code indentation, text fields, and intentional line breaks
+An exact-selection invariant applies before every override: recognized partial math copies only that partial, and an empty or unmatched fragment never widens to the containing line or equation. Selecting only `q`, a radicand, one scientific-number fragment, or one side of a fence cannot silently add the rest. A source-only MathJax/SVG surface is promoted only when the selection covers its complete visible token sequence; every strict partial stays native.
 
-It also removes copy-only artifacts that have no visible pasted meaning: soft hyphens, zero-width spaces, word joiners, stray byte-order marks, CRLF inconsistency, and non-breaking spaces copied as the wrong kind of whitespace. Emoji zero-width joiners are deliberately preserved.
+## Ordinary-text cleanup
 
-For a rewritten equation, the clipboard contains several representations at once:
+Version 2.0 also repairs ordinary copied text when the DOM provides concrete evidence that the browser's raw selection is messy. It can:
 
-- `text/plain`: explicit calculator syntax using `sqrt(...)`, `abs(...)`, `*`, `/`, parentheses, and `10^(-n)`
-- `text/html`: a sanitized rich representation with stacked fractions, radical bars, superscripts, and subscripts
-- MathML clipboard formats when the selection is exactly one MathML-backed equation
+- join accidental source-code or layout wraps inside a visual prose line;
+- collapse repeated collapsible spaces while preserving real paragraph and `<br>` boundaries;
+- retain nested list markers, ordered-list numbering, table rows/cells, headings, and image descriptions;
+- preserve preformatted islands, code spacing, emoji ZWJ sequences, combining marks, and right-to-left text;
+- remove copy-only soft hyphens, zero-width artifacts, word joiners, stray BOMs, and renderer duplicates;
+- generate sanitized rich HTML without copying scripts, event handlers, hostile styles, hidden alternate trees, or custom executable elements.
 
-The destination chooses the representation it supports. A calculator or plain editor receives the executable linear form; a compatible document editor receives structured rich math.
+Clean text stays on the browser-native path. Text controls, editable surfaces, `<pre>`, and `<code>` also stay native unless they are part of a larger safely reconstructed selection. Oversized, over-deep, or layout-ambiguous selections are never cloned or rewritten; they stay on the browser-native copy path.
 
-Rich identifiers use mathematical Unicode characters rather than italic/bold HTML tags. This preserves the mathematical appearance in document editors without causing Markdown-aware paste targets to manufacture literal `*q*` or `**q**` markers.
+## Calculator-safe mode
 
-## Why ordinary text is safe
+Choose **Clean Math Copy: calculator-safe output** from the userscript menu when the destination needs executable syntax. The same structures then become explicit `sqrt(...)`, `abs(...)`, `*`, `/`, and grouped powers:
 
-The script does not serialize every selection indiscriminately. If a selection contains no rendered math, no recognized `$...$`/`\(...\)` expression, no compact Unicode equation, and no known invisible copy artifact, it leaves the browser's native copy behavior completely alone. The Unicode fallback requires a genuinely transformative math glyph, compact math-like tokens, structural equation evidence, and no prose signals; comparisons used as ordinary labels or sentences—such as `Plan A ≠ Plan B`—remain native. Browser-native copying is still the most faithful path for code, rich editors, tables, language-specific spacing, and arbitrary prose.
+| Selected math | Calculator-safe text |
+| --- | --- |
+| `r ∝ √(m/\|q\|)` | `r ∝ sqrt(m/abs(q))` |
+| `0.666 × 10⁻²⁵` | `0.666*10^(-25)` |
+| `\frac{1}{0.452}\sqrt{\frac{2(0.666\times10^{-25})(2464)}{1.602\times10^{-19}}}` | `(1/0.452)*sqrt((2*(0.666*10^(-25))*(2464))/(1.602*10^(-19)))` |
 
-When a rewrite is necessary, the userscript replaces only equation roots and performs structural serialization. It does not globally collapse all whitespace or delete all newlines. Intentional paragraph, list, table, `<br>`, and preformatted boundaries remain; renderer-generated duplication, zero-width glyphs, and trailing spaces/newlines do not.
+A copy event cannot know which application will eventually receive the paste, so one `text/plain` value cannot be both visually faithful and accepted by every calculator. The persistent menu mode makes that tradeoff explicit instead of guessing incorrectly.
 
-An exactness rule applies before every override: a rewritten payload must contain non-whitespace content, and an unrecognized partial equation selection is never widened to a whole equation. Empty visual LaTeX constructs likewise remain on the native path. If a site such as Word has not populated its clipboard staging area yet, the script allows the site's own copy handler to run and postprocesses the resulting data afterward.
+## Supported sources
 
-Vertical bars are interpreted structurally, not by glyph alone. Paired fences around an operand become `abs(...)`; divisibility, conditional-probability, set-builder, and evaluation bars remain relational separators. A lone or ambiguous bar is preserved instead of being guessed into an absolute value. Raw-LaTeX parsing, MathML matching, and rich-selection cloning are all bounded by input, depth, node, and work limits; an over-budget or malformed selection stays on the safe native/source path.
+Clean Math Copy understands:
+
+- KaTeX visual HTML plus hidden MathML, including separate ChatGPT visual/accessibility branches;
+- MathJax 2, 3, and 4 containers, MathItem source, and assistive MathML;
+- native Presentation MathML and supported Content MathML;
+- TeX annotations and `data-latex`, `data-tex`, `data-math-source`, `alttext`, ARIA, and useful image-alt sources;
+- raw `$...$`, `$$...$$`, `\(...\)`, and `\[...\]` selections outside protected code and text controls;
+- Microsoft Word for the web OMML/MathML clipboard data, private staging markup, positioned Accessibility Mode tokens, and high-confidence native duplicate recovery;
+- compact standalone Unicode formulas when no renderer metadata exists;
+- multiple ranges and current open-Shadow-DOM composed selections.
+
+Math structure includes fractions, indexed roots, scripts and prescripts, primes, accents, functions, products, sets, aggregates and limits, absolute values versus relational bars, matrices, cases, aligned equations, text runs, and mathematical alphabet variants. Sanitized rendered structure remains authoritative when hidden MathML or TeX metadata disagrees with stable visible anchors or grouping. Parser, matcher, clipboard-markup, range-count, node, depth, root-total, and candidate budgets keep hostile input bounded.
+
+## Clipboard representations
+
+For rewritten math, the clipboard can carry several representations simultaneously:
+
+- `text/plain`: faithful readable text by default, or the selected alternate mode;
+- `text/html`: newly generated, sanitized rich fractions and zero-line stacks, radicals, scripts/prescripts, accents, cancellation/boxes, matrices, and surrounding document structure;
+- MathML clipboard flavors when the selection is exactly one MathML-backed equation.
+
+Document editors can choose the rich or MathML representation, while plain editors receive the readable linear form. Microsoft 365 documents MathML clipboard support. Google Docs accepts rich HTML but does not document a public clipboard format for constructing a native editable equation, so visual preservation is possible but conversion into a native Docs equation cannot be guaranteed.
 
 ## Install
 
-1. Install a userscript manager such as Tampermonkey, Violentmonkey, or Greasemonkey.
-2. Open [`clean-math-copy.user.js`](./clean-math-copy.user.js) as a raw/local file in the manager, or create a new script and replace its contents with that file.
+1. Install Tampermonkey, Violentmonkey, Greasemonkey, or another compatible userscript manager.
+2. Open the [raw userscript](https://raw.githubusercontent.com/atharvj/clean-math-copy/main/clean-math-copy.user.js), or create a new userscript and paste in [`clean-math-copy.user.js`](./clean-math-copy.user.js).
 3. Save and enable it.
-4. If you want it on local HTML/PDF helper pages, allow the manager access to `file://` URLs in the browser's extension settings.
-5. Reload any already-open ChatGPT tabs after installing or updating the script.
-   For Word for the web, reload the document tab too; its editor frame must receive the updated document-start listener.
-6. Select content normally and use Copy (`Ctrl+C` or `⌘C`).
+4. Reload already-open ChatGPT and Word for the web tabs. Word's editor frame must receive the new document-start listener.
+5. Select normally and copy with `Ctrl+C`, `⌘C`, or the browser context menu.
 
-No page-specific setup is required. The script runs in frames as well as top-level pages when the userscript manager permits them.
+To use local fixtures, allow the userscript manager access to `file://` pages. The script runs in frames when the manager permits them.
 
-## Output modes and controls
+## Menu and settings
 
-Open the userscript manager's menu while viewing any page. Clean Math Copy adds these commands:
+The userscript menu exposes:
 
-- **Calculator-safe output (recommended and default):** explicit `sqrt`, `abs`, multiplication, division, grouping, and powers
-- **Readable Unicode output:** symbols such as `≤`, `α`, `√`, `x²`, and `a₁`
-- **Original LaTeX output:** uses the renderer's original source when available, wrapped in `$...$` or `$$...$$`
-- **ASCII-only output:** substitutes portable forms such as `<=`, `alpha`, `sqrt(x)`, `x^2`, and `a_1`
-- **Toggle raw `$...$` conversion:** controls conversion of delimited LaTeX found in ordinary prose; code, preformatted blocks, and text controls are always protected
-- **Copy current selection now:** an explicit fallback for a page whose own UI does not dispatch a standard copy event; it retains the same plain-text, rich-HTML, and MathML representations as normal copying when the browser permits them
-- **Show current settings:** reports the active persistent settings
+- **Faithful readable output (recommended):** the version 2 default;
+- **Calculator-safe output:** explicit executable linear syntax;
+- **Original LaTeX output:** renderer source wrapped in `$...$` or `$$...$$` when available;
+- **ASCII-only output:** portable approximations such as `<=`, `alpha`, `sqrt(x)`, and `x_2`;
+- **Toggle raw `$...$` conversion**;
+- **Toggle ordinary-text cleanup**;
+- **Copy current selection now** for sites that do not dispatch a standard copy event;
+- **Show current settings**.
 
-Settings are stored through the userscript manager and work with both legacy `GM_*` and modern promise-based `GM.*` APIs. Local storage is a fallback when those APIs are not present.
+Settings use userscript-manager storage, with local storage as a fallback. Version 2 uses a new settings key so upgrades start in faithful mode; users who prefer calculator output can select it once and keep it persistently.
 
-## Resolution pipeline
+## Word, races, and fail-safe behavior
 
-For each equation, the script chooses the strongest available representation:
+Word for the web may expose a page image, positioned accessibility tokens, semantic OMML/MathML, or a delayed private staging element. Clean Math Copy prefers semantic data, reconstructs scripts only when geometry and mathematical evidence agree, and folds only provable duplicate accessibility runs. It never replaces the clipboard with a blank placeholder.
 
-1. Embedded MathML, which preserves the rendered structure without copying the renderer twice
-2. Office Math (OMML) supplied by Microsoft 365 clipboard or staging markup
-3. Original TeX annotations or renderer metadata
-4. Renderer data attributes
-5. Accessible labels or image alt text
-6. High-confidence positioned-script reconstruction for Word's accessibility text layer
-7. Conservative standalone-Unicode equation conversion for source text with no renderer metadata
-8. Guarded native clipboard cleanup as the final, non-destructive fallback
-
-In calculator mode, MathML structure determines operand order and every implicit product is made explicit. In LaTeX output mode, original source takes priority. Unknown LaTeX commands are retained visibly instead of being silently discarded.
-
-## Word, Google Docs, and document editors
-
-The script supplies sanitized rich HTML so document editors can preserve the visible fraction, root, superscript, and subscript structure instead of receiving the flattened renderer order. It also supplies embedded MathML formats for applications that import MathML, including current Microsoft 365.
-
-Word for the web needs special handling on the source side. Its normal page view can be a page image, while Accessibility Mode can expose individually positioned text tokens; its editing surface also uses a private clipboard staging element. Clean Math Copy supports all three usable paths: semantic MathML/OMML when Word provides it, measured subscript/superscript reconstruction for selected positioned tokens, and a late native-copy cleanup that folds only high-confidence mathematical-alphanumeric duplicates. That duplicate recovery turns Word's repeated baseline/script accessibility text into one coherent equation instead of a blank or doubled paste. Semantic data always outranks Word's temporary plain-text flavor—even if Word stops event propagation or fills its staging element afterward—and mixed Office HTML keeps all surrounding prose and equations. Recovery operations and asynchronous clipboard retries are generation-scoped: the newest copy wins, so an older delayed write cannot replace a newer keyboard or menu copy.
-
-Google Docs can accept the rich HTML representation, but Google only documents creation of native editable equations through **Insert → Equation** and equation shortcuts; it does not expose a public clipboard format for constructing a native Google Docs equation object. Consequently, the rich paste can preserve visual formatting, but it cannot be guaranteed to become a native editable Docs equation. The simultaneous calculator-safe plain text remains mathematically correct if Docs chooses its plain-text clipboard flavor.
+Office recovery and manual clipboard writes share a generation-scoped serialized queue. A delayed older copy cannot overwrite a newer keyboard, menu, or Office copy, including when the older browser write had already started and could no longer be cancelled. If a browser rejects a custom MathML format, the manual command retries with plain plus rich HTML. A deferred userscript-manager settings read is similarly guarded, so it cannot undo a mode selected from the menu while startup is still resolving.
 
 ## Deliberate boundaries
 
-Browser security establishes a few hard limits:
-
-- Userscripts cannot run on protected browser UI such as `chrome://`, `about:`, browser extension pages, or some built-in PDF viewers.
-- A canvas, raster image, or SVG path with no selectable DOM text, MathML, source metadata, ARIA label, or alt text has no equation data for a userscript to recover. OCR would require a separate image-recognition system and would be less reliable than the source-first behavior here.
-- Programmatic calls made by a site directly to `navigator.clipboard.writeText()` do not emit the user-initiated `copy` event. Normal keyboard/menu copying does.
-- Closed Shadow DOM contents can only be addressed to the extent the browser's composed selection API exposes or re-scopes them.
-- Rewritten selections include clean plain text and newly generated, sanitized rich HTML. MathML is rebuilt through a Presentation MathML element/attribute allowlist, generated style trust is held out-of-band rather than accepted from page attributes, and oversized or over-deep semantic and rich-selection trees are rejected before cloning. The page's original hidden or duplicated renderer trees are never copied.
-- Password fields and ordinary text controls remain on the browser-native path.
-
-These are capability boundaries, not known corruption cases in the supported selection path.
+- Userscripts cannot run on protected browser UI, extension pages, or every built-in PDF viewer.
+- Canvas pixels, raster images, and SVG paths without selectable text, MathML, source metadata, ARIA, or alt text require OCR, which this structure-first userscript deliberately does not guess.
+- A site's direct `navigator.clipboard.writeText()` call does not emit a user copy event.
+- Closed Shadow DOM can only be handled to the extent the browser exposes its composed selection.
+- Rich HTML and MathML are rebuilt through allowlists and strict budgets; the source renderer tree is never pasted wholesale.
+- Password fields remain native.
 
 ## Test and inspect
 
-Node 20.19 or newer is required only for development tests; the userscript itself has no runtime dependencies.
+Node 20.19 or newer is required only for development:
 
 ```sh
-cd /Users/atharvjoshi/Downloads/coding/clean-math-copy
+cd clean-math-copy
 npm install
 npm run check
 npm run browser-smoke
 ```
 
-`npm run check` performs a syntax check and runs the Node test suite. The suite includes the reported ChatGPT equations, exact scientific-number and one-token selections, whole-root versus radicand-only selection, denominator-first repeated-script disambiguation, selections crossing prose/math boundaries, standalone Unicode equations and comparative-prose rejection, raw-LaTeX precedence/styled identifiers/functions/inverse trig/cases/sets/aggregates and parser budgets, executable-result verification, real KaTeX 0.17-generated markup, rendered literal division, scripted fences, norms, functions, limits, cases, and bounded operators, absolute versus relational vertical bars, separate visual/accessibility branches, Word positioned subscripts, exact reported OMML content and native-duplicate recovery, mixed/multiple Office equations, stopped-event and delayed-staging recovery, cross-pipeline newest-copy-wins races, empty-payload rejection, MathML/rich-HTML sanitization and tree limits, rich clipboard formats and fallback retries, trailing-whitespace rejection, MathJax fallbacks, native-copy pass-through, and packaging checks. `npm run browser-smoke` is a permanent end-to-end runner that additionally drives the fixture through a locally installed Chromium-family browser and its real `ClipboardEvent`/`DataTransfer` implementation; set `CHROME_BIN` if the browser is in a nonstandard location.
+`npm run check` runs the syntax and Node suites. `npm run browser-smoke` drives a permanent fixture through a locally installed Chromium-family browser and real `ClipboardEvent`/`DataTransfer`; set `CHROME_BIN` for a nonstandard browser path.
 
-For hands-on browser verification, open [`demo/manual-test.html`](./demo/manual-test.html) after installing the userscript. The larger validation grid is in [`docs/TEST-MATRIX.md`](./docs/TEST-MATRIX.md).
-
-## Technical basis
-
-The implementation follows the standard cancelable `copy` event and writes `text/plain`, `text/html`, and available MathML through `ClipboardEvent.clipboardData`. KaTeX's default combined output includes HTML and MathML, while MathJax exposes original input through MathItem metadata and may provide assistive MathML. MathML semantics explicitly supports alternate TeX annotations. See [`docs/RESEARCH.md`](./docs/RESEARCH.md) for the primary references and the design conclusions taken from them.
+For manual verification, open [`demo/manual-test.html`](./demo/manual-test.html). The complete validation grid is in [`docs/TEST-MATRIX.md`](./docs/TEST-MATRIX.md), and primary-source design references are in [`docs/RESEARCH.md`](./docs/RESEARCH.md).
 
 ## License
 

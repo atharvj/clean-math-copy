@@ -7,6 +7,14 @@
 <body>
   <span id="unicode-partial">0.666 × 10⁻²⁵</span>
 
+  <span id="prime-target">
+    <span data-latex="(y')^2=20x'">(y′)² = 20x′</span>
+  </span>
+
+  <span id="gravity-target">
+    <span data-latex="F_g=G\left(\frac{m_1m_2}{r^2}\right)">F_g = G((m₁m₂)/r²)</span>
+  </span>
+
   <span id="mass-renderer" class="opaque-renderer">
     <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)">
       <math><mrow><mi>m</mi><mo>=</mo><mn>0.666</mn><mo>×</mo><msup><mn>10</mn><mrow><mo>−</mo><mn>25</mn></mrow></msup><mtext> </mtext><mi>kg</mi></mrow></math>
@@ -44,6 +52,7 @@
 
   <span id="ordinary-symbol-prose">Symbols in prose: α vs β.</span>
   <span id="comparative-prose">Plan A ≠ Plan B</span>
+  <span id="ordinary-artifacts">alpha&#8203;&nbsp;beta</span>
   <span id="raw-styled">$\mathrm{speed}=2\mathrm{time}$</span>
 
   <pre id="result">pending</pre>
@@ -54,14 +63,7 @@
       const assertEqual = (name, actual, expected) => {
         checks.push({ name, pass: actual === expected, actual, expected });
       };
-      const copyRange = (element, start, end) => {
-        const selection = getSelection();
-        selection.removeAllRanges();
-        const range = document.createRange();
-        const text = element.firstChild;
-        range.setStart(text, start == null ? 0 : start);
-        range.setEnd(text, end == null ? text.nodeValue.length : end);
-        selection.addRange(range);
+      const dispatchCopy = (element) => {
         const transfer = new DataTransfer();
         const event = new ClipboardEvent('copy', {
           bubbles: true,
@@ -77,21 +79,44 @@
           mathML: transfer.getData('application/mathml+xml')
         };
       };
+      const copyRange = (element, start, end) => {
+        const selection = getSelection();
+        selection.removeAllRanges();
+        const range = document.createRange();
+        const text = element.firstChild;
+        range.setStart(text, start == null ? 0 : start);
+        range.setEnd(text, end == null ? text.nodeValue.length : end);
+        selection.addRange(range);
+        return dispatchCopy(element);
+      };
+      const copyContents = (element) => {
+        const selection = getSelection();
+        selection.removeAllRanges();
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        selection.addRange(range);
+        return dispatchCopy(element);
+      };
 
       const unicode = copyRange(document.querySelector('#unicode-partial'));
-      assertEqual('standalone Unicode numeric partial', unicode.plain, '0.666*10^(-25)');
-      assertEqual('standalone Unicode event handled', unicode.prevented, true);
-      assertEqual('standalone Unicode rich symbols', unicode.html.includes('0.666 × 10⁻²⁵'), true);
+      assertEqual('already-faithful Unicode stays native', unicode.prevented, false);
+      assertEqual('native Unicode leaves transfer untouched', unicode.plain, '');
+
+      const prime = copyContents(document.querySelector('#prime-target'));
+      assertEqual('faithful prime target', prime.plain, '(y′)² = 20x′');
+
+      const gravity = copyContents(document.querySelector('#gravity-target'));
+      assertEqual('faithful gravity target', gravity.plain, 'F_g = G((m₁m₂)/r²)');
 
       const massVisual = document.querySelector('#mass-renderer .visual-layout');
       const massText = massVisual.textContent;
       const massStart = massText.indexOf('0.666');
       const mass = copyRange(massVisual, massStart, massStart + '0.666×10−25'.length);
-      assertEqual('renderer exact partial', mass.plain, '0.666*10^(-25)');
+      assertEqual('renderer exact partial', mass.plain, '0.666 × 10⁻²⁵');
 
       const rootVisual = document.querySelector('#root-renderer .visual-layout');
       const root = copyRange(rootVisual);
-      assertEqual('whole structural root', root.plain, 'r ∝ sqrt(m/abs(q))');
+      assertEqual('faithful structural root', root.plain, 'r ∝ √(m/|q|)');
       assertEqual('no trailing whitespace', /\s$/.test(root.plain), false);
       assertEqual('structural rich HTML', root.html.includes('border-top:1px solid currentColor'), true);
       assertEqual('sanitized MathML flavor', /^<math[ >]/.test(root.mathML), true);
@@ -102,13 +127,13 @@
       assertEqual('no leaked Markdown emphasis', /\*/.test(q.plain), false);
 
       const renderedFunction = copyRange(document.querySelector('#function-renderer .visual-layout'));
-      assertEqual('rendered functions and power', renderedFunction.plain, 'sin(abs(x))+cos(y)^(2)');
+      assertEqual('rendered functions and power', renderedFunction.plain, 'sin(|x|) + cos²(y)');
 
       const renderedSum = copyRange(document.querySelector('#sum-renderer .visual-layout'));
-      assertEqual('rendered bounded sum', renderedSum.plain, 'sum(i^(2),i,1,n)');
+      assertEqual('rendered bounded sum', renderedSum.plain, '∑ᵢ₌₁ⁿ i²');
 
       const renderedRelation = copyRange(document.querySelector('#relation-renderer .visual-layout'));
-      assertEqual('relational bar stays relational', renderedRelation.plain, 'a | b');
+      assertEqual('relational bar stays relational', renderedRelation.plain, 'a ∣ b');
 
       const ordinary = copyRange(document.querySelector('#ordinary-symbol-prose'));
       assertEqual('ordinary symbol prose stays native', ordinary.prevented, false);
@@ -118,8 +143,12 @@
       assertEqual('ordinary comparison stays native', comparison.prevented, false);
       assertEqual('comparison leaves transfer untouched', comparison.plain, '');
 
+      const artifacts = copyRange(document.querySelector('#ordinary-artifacts'));
+      assertEqual('ordinary artifact cleanup is handled', artifacts.prevented, true);
+      assertEqual('ordinary artifact cleanup text', artifacts.plain, 'alpha beta');
+
       const styled = copyRange(document.querySelector('#raw-styled'));
-      assertEqual('styled raw identifiers stay whole', styled.plain, 'speed=2*time');
+      assertEqual('styled raw identifiers stay whole', styled.plain, 'speed = 2time');
 
       const output = { ok: checks.every((check) => check.pass), checks };
       document.querySelector('#result').textContent = JSON.stringify(output);

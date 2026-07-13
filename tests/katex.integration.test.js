@@ -6,11 +6,12 @@ const katex = require('katex');
 const { JSDOM } = require('jsdom');
 const cleanCopy = require('../clean-math-copy.user.js');
 
-function copyVisibleKaTeX(source) {
+function copyVisibleKaTeX(source, outputMode = 'calculator', renderOptions) {
   const rendered = katex.renderToString(source, {
     displayMode: true,
     output: 'htmlAndMathml',
-    throwOnError: true
+    throwOnError: true,
+    ...(renderOptions || {})
   });
   const instance = new JSDOM('<!doctype html><html><body><div id="fixture">' + rendered + '</div></body></html>');
   const visual = instance.window.document.querySelector('.katex-html');
@@ -21,11 +22,238 @@ function copyVisibleKaTeX(source) {
   return cleanCopy.getCopyPayload(
     instance.window.document,
     selection,
-    cleanCopy.DEFAULT_SETTINGS,
+    { ...cleanCopy.DEFAULT_SETTINGS, outputMode },
     instance.window,
     visual
   );
 }
+
+test('real KaTeX DOM: faithful mode reproduces the two target visual formulas', () => {
+  assert.equal(
+    copyVisibleKaTeX(String.raw`(y')^2=20x'`, 'faithful').text,
+    '(y′)² = 20x′'
+  );
+  assert.equal(
+    copyVisibleKaTeX(String.raw`F_g=G\left(\frac{m_1m_2}{r^2}\right)`, 'faithful').text,
+    'F_g = G((m₁m₂)/r²)'
+  );
+});
+
+test('real KaTeX DOM: faithful mode uses readable roots, fences, scripts, and minimal fraction grouping', () => {
+  assert.equal(
+    copyVisibleKaTeX(String.raw`r\propto\sqrt{\frac{m}{\lvert q\rvert}}`, 'faithful').text,
+    'r ∝ √(m/|q|)'
+  );
+  assert.equal(copyVisibleKaTeX(String.raw`\lVert x\rVert_2`, 'faithful').text, '‖x‖₂');
+  assert.equal(copyVisibleKaTeX(String.raw`\frac{a+b}{c+d}`, 'faithful').text, '(a + b)/(c + d)');
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\frac{-b\pm\sqrt{b^2-4ac}}{2a}`, 'faithful').text,
+    '(−b ± √(b² − 4ac))/(2a)'
+  );
+  assert.equal(copyVisibleKaTeX(String.raw`\sin\lvert x\rvert`, 'faithful').text, 'sin |x|');
+  assert.equal(copyVisibleKaTeX(String.raw`\sin^2(x)`, 'faithful').text, 'sin²(x)');
+  assert.equal(copyVisibleKaTeX(String.raw`\sqrt{x}`, 'faithful').text, '√x');
+  assert.equal(copyVisibleKaTeX(String.raw`\sqrt{x^2}`, 'faithful').text, '√(x²)');
+  assert.equal(copyVisibleKaTeX(String.raw`\sqrt{x'}`, 'faithful').text, '√(x′)');
+  assert.equal(copyVisibleKaTeX(String.raw`\sqrt{x_1}`, 'faithful').text, '√x₁');
+  assert.equal(copyVisibleKaTeX(String.raw`\sqrt{x}y`, 'faithful').text, '√(x)y');
+  assert.equal(copyVisibleKaTeX(String.raw`\frac1{\sqrt{x}y}`, 'faithful').text, '1/(√(x)y)');
+  assert.equal(copyVisibleKaTeX(String.raw`\sqrt{xy}`, 'faithful').text, '√(xy)');
+  assert.equal(copyVisibleKaTeX(String.raw`\sqrt[3]{x}`, 'faithful').text, '∛x');
+});
+
+test('real KaTeX DOM: faithful mode retains invisible group and compound-operator scope', () => {
+  const cases = new Map([
+    [String.raw`\frac1{abcd}`, '1/(abcd)'],
+    [String.raw`\frac1{2ab}`, '1/(2ab)'],
+    [String.raw`{a+b}^2`, '(a + b)²'],
+    [String.raw`{ab}^2`, '(ab)²'],
+    [String.raw`\sqrt{x}^2`, '(√x)²'],
+    [String.raw`2{a+b}`, '2(a + b)'],
+    [String.raw`{a+b}c`, '(a + b)c'],
+    [String.raw`\sin{x+y}`, 'sin(x + y)'],
+    [String.raw`\overline{a+b}`, 'overline(a + b)'],
+    [String.raw`\hat{xy}`, 'hat(xy)'],
+    [String.raw`a\parallel b`, 'a ∥ b'],
+    [String.raw`\text{time-dependent; don't}`, 'time-dependent; don’t']
+  ]);
+  for (const [source, expected] of cases) {
+    assert.equal(copyVisibleKaTeX(source, 'faithful').text, expected, source);
+  }
+});
+
+test('real KaTeX DOM: faithful mode preserves explicit alphabets and enclosures', () => {
+  const cases = new Map([
+    [String.raw`\mathbf{x}`, '𝐱'],
+    [String.raw`\boldsymbol{\alpha}`, '𝜶'],
+    [String.raw`\mathcal{B}`, 'ℬ'],
+    [String.raw`\mathscr{x}`, '𝓍'],
+    [String.raw`\mathfrak{C}`, 'ℭ'],
+    [String.raw`\mathsf{x}`, '𝗑'],
+    [String.raw`\mathtt{x}`, '𝚡'],
+    [String.raw`\mathbb{R}`, 'ℝ'],
+    [String.raw`\mathcal{\alpha}`, 'script(α)'],
+    [String.raw`\mathbf{x+1}`, '𝐱 + 𝟏'],
+    [String.raw`\boldsymbol{\alpha+\Gamma}`, '𝜶 + 𝚪'],
+    [String.raw`\cancel{x}`, 'cancel(x)'],
+    [String.raw`\bcancel{x}`, 'bcancel(x)'],
+    [String.raw`\xcancel{x}`, 'xcancel(x)'],
+    [String.raw`\boxed{x}`, 'boxed(x)']
+  ]);
+  for (const [source, expected] of cases) {
+    assert.equal(copyVisibleKaTeX(source, 'faithful').text, expected, source);
+  }
+});
+
+test('real KaTeX DOM: faithful Greek variants agree with TeX glyph conventions', () => {
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\phi,\varphi,\epsilon,\varepsilon`, 'faithful').text,
+    'ϕ, φ, ϵ, ε'
+  );
+});
+
+test('real KaTeX DOM: faithful symbols agree with canonical renderer glyphs', () => {
+  const cases = new Map([
+    [String.raw`\varkappa`, 'ϰ'], [String.raw`\nparallel`, '∦'],
+    [String.raw`\nmid`, '∤'], [String.raw`\owns`, '∋'],
+    [String.raw`\subsetneq`, '⊊'], [String.raw`\supsetneq`, '⊋'],
+    [String.raw`\smallsetminus`, '∖'], [String.raw`\land`, '∧'],
+    [String.raw`\lor`, '∨'], [String.raw`\Box`, '□'],
+    [String.raw`\Diamond`, '◊'], [String.raw`\clubsuit`, '♣'],
+    [String.raw`\diamondsuit`, '♢'], [String.raw`\heartsuit`, '♡'],
+    [String.raw`\spadesuit`, '♠'], [String.raw`\cdot`, '⋅'],
+    [String.raw`\bullet`, '∙'], [String.raw`\iff`, '⟺'],
+    [String.raw`\implies`, '⟹'], [String.raw`\impliedby`, '⟸']
+  ]);
+  for (const [source, expected] of cases) {
+    assert.equal(copyVisibleKaTeX(String.raw`x=` + source, 'faithful').text, 'x = ' + expected, source);
+    assert.equal(copyVisibleKaTeX(source, 'faithful').text, expected, 'standalone ' + source);
+  }
+});
+
+test('real KaTeX DOM: faithful whole-copy follows rendered semantics over divergent source', () => {
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\foo+1`, 'faithful', { macros: { '\\foo': 'x^2' } }).text,
+    'x² + 1'
+  );
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\alpha+1`, 'faithful', { macros: { '\\alpha': 'x' } }).text,
+    'x + 1'
+  );
+  assert.equal(copyVisibleKaTeX(String.raw`\pmb{x}`, 'faithful').text, 'x');
+  assert.equal(copyVisibleKaTeX(String.raw`x\kern1em y`, 'faithful').text, 'x y');
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\htmlClass{foo}{x}`, 'faithful', { trust: true, strict: false }).text,
+    'x'
+  );
+});
+
+test('real KaTeX DOM: faithful mode preserves binomial stacks, accents, and isotope prescripts', () => {
+  const cases = new Map([
+    [String.raw`\binom{n}{k}`, 'C(n, k)'],
+    [String.raw`\dbinom{n}{k}`, 'C(n, k)'],
+    [String.raw`\tbinom{n}{k}`, 'C(n, k)'],
+    [String.raw`{n\choose k}`, 'C(n, k)'],
+    [String.raw`{n\atop k}`, 'stack(n, k)'],
+    [String.raw`\vec v`, 'v⃗'],
+    [String.raw`\bar x`, 'x̅'],
+    [String.raw`{}^{14}_{6}C`, '¹⁴₆C']
+  ]);
+  for (const [source, expected] of cases) {
+    assert.equal(copyVisibleKaTeX(source, 'faithful').text, expected, source);
+  }
+  const binomial = copyVisibleKaTeX(String.raw`\binom{n}{k}`, 'faithful');
+  assert.doesNotMatch(binomial.html, /border-top:1px solid currentColor/u);
+  assert.match(copyVisibleKaTeX(String.raw`\vec v`, 'faithful').html, /v⃗/u);
+  assert.match(copyVisibleKaTeX(String.raw`{}^{14}_{6}C`, 'faithful').html, /¹⁴₆C/u);
+
+  const cancelled = copyVisibleKaTeX(String.raw`\cancel{x}`, 'faithful');
+  assert.match(cancelled.html, /background-image:linear-gradient/u);
+  assert.match(cancelled.html, /aria-label="cancel\(x\)"/u);
+  const boxed = copyVisibleKaTeX(String.raw`\boxed{x}`, 'faithful');
+  assert.match(boxed.html, /border:1px solid currentColor/u);
+  assert.match(boxed.html, /aria-label="boxed\(x\)"/u);
+});
+
+test('real KaTeX DOM: faithful mode recognizes renderer accent glyphs without losing semantic braces', () => {
+  const cases = new Map([
+    [String.raw`\acute x`, 'x́'], [String.raw`\grave x`, 'x̀'],
+    [String.raw`\breve x`, 'x̆'], [String.raw`\check x`, 'x̌'],
+    [String.raw`\mathring x`, 'x̊'], [String.raw`\underline x`, 'x̲'],
+    [String.raw`\overbrace{x}`, 'overset(⏞, x)'],
+    [String.raw`\underbrace{x}`, 'underset(⏟, x)']
+  ]);
+  for (const [source, expected] of cases) {
+    assert.equal(copyVisibleKaTeX(source, 'faithful').text, expected, source);
+  }
+});
+
+test('real KaTeX DOM: sanitizer retains nested token structures and rich presentation', () => {
+  const modulo = copyVisibleKaTeX(String.raw`a\bmod n`, 'faithful');
+  assert.equal(modulo.text, 'a mod n');
+  assert.match(modulo.mathML, /<mi mathvariant="normal">m<\/mi>/u);
+  assert.match(modulo.html, />mod<\/span>/u);
+
+  const annotatedArrow = copyVisibleKaTeX(String.raw`A\overset f\longrightarrow B`, 'faithful');
+  assert.equal(annotatedArrow.text, 'A overset(f, ⟶) B');
+  assert.match(annotatedArrow.mathML, /<mover>/u);
+  assert.match(annotatedArrow.html, /⟶<\/span><sup>f<\/sup>/u);
+
+  assert.equal(
+    copyVisibleKaTeX(String.raw`A\underset f\longrightarrow B`, 'faithful').text,
+    'A underset(f, ⟶) B'
+  );
+});
+
+test('real KaTeX DOM: faithful exact selections remain exact and retain visual scripts', () => {
+  const numeric = String.raw`m = 0.666 \times 10^{-25}\,\mathrm{kg}`;
+  assert.equal(copyVisibleSubstring(numeric, '0.666×10−25', 'faithful').text, '0.666 × 10⁻²⁵');
+  assert.equal(copyVisibleSubstring(numeric, '10−25', 'faithful').text, '10⁻²⁵');
+  assert.equal(
+    copyVisibleSubstring(String.raw`r\propto\sqrt{\frac{m}{\lvert q\rvert}}`, 'q', 'faithful').text,
+    'q'
+  );
+  assert.equal(
+    copyVisibleSubstring(String.raw`r\propto\sqrt{\frac{m}{\lvert q\rvert}}`, '∣', 'faithful').text,
+    '|'
+  );
+});
+
+test('real KaTeX DOM: faithful matrices, cases, and bounds keep readable linear structure', () => {
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\begin{bmatrix}a&b\\c&d\end{bmatrix}`, 'faithful').text,
+    '[a, b; c, d]'
+  );
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\begin{cases}x^2&x>0\\-x&x\le0\end{cases}`, 'faithful').text,
+    '{x² if x > 0; −x if x ≤ 0}'
+  );
+  assert.equal(copyVisibleKaTeX(String.raw`\sum_{i=1}^n i^2`, 'faithful').text, '∑ᵢ₌₁ⁿ i²');
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\lim_{x\to0}\frac{\sin x}{x}`, 'faithful').text,
+    'lim_(x → 0) (sin x)/x'
+  );
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\begin{aligned}x&=1\\y&=2\end{aligned}`, 'faithful').text,
+    'x = 1; y = 2'
+  );
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\begin{gathered}x=1\\y=2\end{gathered}`, 'faithful').text,
+    'x = 1; y = 2'
+  );
+});
+
+test('faithful MathML keeps invisible products invisible unless operands would merge falsely', () => {
+  const parse = (body) => new JSDOM(
+    '<!doctype html><math xmlns="http://www.w3.org/1998/Math/MathML"><mrow>' + body + '</mrow></math>'
+  ).window.document.querySelector('math');
+  assert.equal(cleanCopy.mathMLToFaithful(parse('<mi>x</mi><mo>⁢</mo><mi>y</mi>')), 'xy');
+  assert.equal(cleanCopy.mathMLToFaithful(parse('<mn>2</mn><mo>⁢</mo><mn>3</mn>')), '2 ⋅ 3');
+  assert.equal(
+    cleanCopy.mathMLToFaithful(parse('<mi>speed</mi><mo>⁢</mo><mi>time</mi>')),
+    'speed ⋅ time'
+  );
+});
 
 function copyVisibleSubstring(source, substring, outputMode = 'calculator', occurrenceIndex = 0) {
   const rendered = katex.renderToString(source, {
@@ -141,7 +369,7 @@ test('real KaTeX DOM: keeps mixed prose-to-partial-math selections exact at the 
     instance.window,
     line
   );
-  assert.equal(payload.text, 'Before m=0.666*10^(-25)');
+  assert.equal(payload.text, 'Before m = 0.666 × 10⁻²⁵');
   assert.doesNotMatch(payload.text, /kg|after/);
 });
 
@@ -185,7 +413,7 @@ test('real KaTeX DOM: selecting a whole radical keeps the root while selecting i
     instance.window,
     radical
   );
-  assert.equal(payload.text, 'sqrt(x)');
+  assert.equal(payload.text, '√x');
   assert.equal(copyVisibleSubstring(String.raw`a+\sqrt{x}+b`, 'x').text, 'x');
 });
 
