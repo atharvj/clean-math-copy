@@ -188,7 +188,7 @@ test('copies KaTeX exactly once and uses its MathML structure', () => {
   const payload = cleanCopy.getCopyPayload(
     instance.window.document,
     selection,
-    { outputMode: 'unicode' },
+    { outputMode: 'faithful' },
     instance.window,
     target
   );
@@ -265,12 +265,12 @@ test('keeps several inline equations in document order with their surrounding sp
   const target = instance.window.document.querySelector('#target');
   const selection = selectContents(instance.window, target);
   assert.equal(
-    cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'unicode' }, instance.window, target).text,
+    cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'faithful' }, instance.window, target).text,
     'First x = 1, then y = 2.'
   );
 });
 
-test('supports original LaTeX and ASCII output modes', () => {
+test('supports original LaTeX output mode', () => {
   const instance = dom('<p id="target">Value: ' + katex(
     '<mfrac><mn>1</mn><mn>2</mn></mfrac>',
     String.raw`\frac{1}{2}`
@@ -280,10 +280,6 @@ test('supports original LaTeX and ASCII output modes', () => {
   assert.equal(
     cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'latex' }, instance.window, target).text,
     String.raw`Value: $\frac{1}{2}$`
-  );
-  assert.equal(
-    cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'ascii' }, instance.window, target).text,
-    'Value: (1)/(2)'
   );
 });
 
@@ -298,7 +294,7 @@ test('an unmatched partial renderer selection is never widened to the whole equa
   range.setStart(duplicate, 2);
   range.setEnd(duplicate, 7);
   selection.addRange(range);
-  const payload = cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'unicode' }, instance.window, duplicate.parentElement);
+  const payload = cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'faithful' }, instance.window, duplicate.parentElement);
   assert.equal(payload, null);
 });
 
@@ -488,8 +484,8 @@ test('serializes native MathML fractions, roots, scripts, and tables', () => {
   const target = instance.window.document.querySelector('#target');
   const selection = selectContents(instance.window, target);
   assert.equal(
-    cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'unicode' }, instance.window, target).text,
-    '(x + 1)/(√(y)) = a₁²'
+    cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'faithful' }, instance.window, target).text,
+    '(x + 1)/√y = a₁²'
   );
   assert.equal(cleanCopy.mathMLToUnicode(instance.window.document.querySelector('#matrix')), '[a, b; c, d]');
 });
@@ -980,7 +976,7 @@ test('places display equations on their own line without renderer whitespace', (
     '<p>After</p></div>');
   const target = instance.window.document.querySelector('#target');
   assert.equal(
-    cleanCopy.getCopyPayload(instance.window.document, selectContents(instance.window, target), { outputMode: 'unicode' }, instance.window, target).text,
+    cleanCopy.getCopyPayload(instance.window.document, selectContents(instance.window, target), { outputMode: 'faithful' }, instance.window, target).text,
     'Before\n\nx = 1\nAfter'
   );
 });
@@ -1005,7 +1001,7 @@ test('uses MathJax original TeX when no assistive MathML is present', () => {
   };
   const selection = selectContents(instance.window, target);
   assert.equal(
-    cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'unicode' }, pageWindow, target).text,
+    cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'faithful' }, pageWindow, target).text,
     'Result: ∫₀¹ x² dx'
   );
 });
@@ -1034,7 +1030,7 @@ test('source-only MathJax rewrites exact visual drags but never widens a partial
     return cleanCopy.getCopyPayload(
       instance.window.document,
       selection,
-      { outputMode: 'unicode' },
+      { outputMode: 'faithful' },
       pageWindow,
       textElement
     );
@@ -1955,7 +1951,7 @@ test('falls back to the MathJax MathItem list when container lookup rejects rend
       }
     }
   };
-  assert.equal(cleanCopy.extractMathText(root, 'unicode', pageWindow), '√(x)');
+  assert.equal(cleanCopy.extractMathText(root, 'faithful', pageWindow), '√x');
 });
 
 test('preserves semantic blocks, lists, tables, image alt text, and preformatted text around math', () => {
@@ -1970,7 +1966,7 @@ test('preserves semantic blocks, lists, tables, image alt text, and preformatted
   ].join(''));
   const target = instance.window.document.querySelector('#target');
   const selection = selectContents(instance.window, target);
-  const text = cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'unicode' }, instance.window, target).text;
+  const text = cleanCopy.getCopyPayload(instance.window.document, selection, { outputMode: 'faithful' }, instance.window, target).text;
   assert.equal(text, [
     'Formula x = 1',
     '',
@@ -2804,7 +2800,10 @@ test('raw delimited LaTeX converts in prose but remains literal in code and text
   const instance = dom('<p id="prose">Equation $x^2+1$.</p><code id="code">$x^2+1$</code><textarea id="input">$x^2+1$</textarea>');
   const prose = instance.window.document.querySelector('#prose');
   assert.equal(
-    cleanCopy.getCopyPayload(instance.window.document, selectContents(instance.window, prose), { outputMode: 'unicode' }, instance.window, prose).text,
+    cleanCopy.getCopyPayload(instance.window.document, selectContents(instance.window, prose), {
+      outputMode: 'faithful',
+      convertDelimitedLatex: false
+    }, instance.window, prose).text,
     'Equation x² + 1.'
   );
   const code = instance.window.document.querySelector('#code');
@@ -3110,27 +3109,16 @@ test('decodes the reported Google Docs equation from its structural clipboard sl
     'abs(B)=sqrt((27.187)^(2)+(17.479)^(2)+(-28.112)^(2)) = 42.84 μT'
   );
   assert.equal(
-    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'unicode' }).text,
-    '|B| = √((27.187)² + (17.479)² + (-28.112)²) = 42.84 μT'
-  );
-  assert.equal(
-    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'ascii' }).text,
-    '|B| = sqrt((27.187)^2 + (17.479)^2 + (-28.112)^2) = 42.84 μT'
-  );
-  assert.equal(
     cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'latex' }).text,
     '$|B|=√((27.187)^{2}+(17.479)^{2}+(-28.112)^{2})$ = 42.84 μT'
   );
-  for (const outputMode of ['calculator', 'ascii', 'latex']) {
+  for (const outputMode of ['calculator', 'latex']) {
     const payload = cleanCopy.googleDocsSlicePayload(slice, { outputMode });
     const rich = dom(payload.html).window.document.body;
     assert.equal(rich.querySelector('sup, sub'), null, outputMode);
     assert.equal(rich.textContent, payload.text, outputMode);
     assert.equal(/^[\s\u200b\u2060]|[\s\u200b\u2060]$/u.test(rich.textContent), false, outputMode);
   }
-  const unicodeRich = dom(cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'unicode' }).html)
-    .window.document.body;
-  assert.equal(unicodeRich.querySelectorAll('sup').length, 3);
 });
 
 test('Google Docs suppresses only contextual empty fence placeholders and keeps authored fences', () => {
@@ -3184,8 +3172,6 @@ test('Google Docs scripts keep close-only and vertical fence bases atomic', () =
   const expected = {
     faithful: '|B|²',
     calculator: 'abs(B)^(2)',
-    unicode: '|B|²',
-    ascii: '|B|^2',
     latex: '$|B|^{2}$'
   };
   for (const [outputMode, text] of Object.entries(expected)) {
@@ -3603,8 +3589,14 @@ test('Google Docs owns an inherited child before its clipboard class is assigned
   try {
     childController = cleanCopy.install(frame.contentDocument, frame.contentWindow);
     assert.equal(frame.contentDocument.__cleanMathCopyInstalled, true);
-    storedSettings = { ...storedSettings, outputMode: 'ascii' };
-    assert.equal(childController.settings.outputMode, 'ascii');
+    storedSettings = {
+      outputMode: 'ascii',
+      convertDelimitedLatex: false,
+      cleanInvisibleArtifacts: false
+    };
+    assert.deepEqual(childController.settings, { outputMode: 'faithful' });
+    storedSettings = { outputMode: 'calculator' };
+    assert.equal(childController.settings.outputMode, 'calculator');
     storedSettings = { ...storedSettings, outputMode: 'faithful' };
   } finally {
     if (previousGetValue) Object.defineProperty(globalThis, 'GM_getValue', previousGetValue);
@@ -4292,7 +4284,7 @@ test('reconstructs Word for the web positioned subscripts without copying its la
   const payload = cleanCopy.getCopyPayload(
     instance.window.document,
     selectContents(instance.window, line),
-    { outputMode: 'unicode' },
+    { outputMode: 'faithful' },
     instance.window,
     line
   );
@@ -4317,7 +4309,7 @@ test('reconstructs Word for the web positioned subscripts without copying its la
   partial.removeAllRanges();
   partial.addRange(range);
   assert.equal(
-    cleanCopy.getCopyPayload(instance.window.document, partial, { outputMode: 'unicode' }, instance.window, tokens[0]).text,
+    cleanCopy.getCopyPayload(instance.window.document, partial, { outputMode: 'faithful' }, instance.window, tokens[0]).text,
     'R₁'
   );
 });
@@ -4334,7 +4326,7 @@ test('recognizes Unicode letterlike math exceptions in positioned Word scripts',
   const payload = cleanCopy.getCopyPayload(
     instance.window.document,
     selectContents(instance.window, line),
-    { outputMode: 'unicode' },
+    { outputMode: 'faithful' },
     instance.window,
     line
   );
@@ -4710,57 +4702,15 @@ test('a newer Word copy cancels an older staging recovery before it can overwrit
   }
 });
 
-test('a manual copy cancels an older Word staging recovery before it can overwrite the clipboard', async () => {
-  const instance = dom([
-    '<div id="WACViewPanel_EditingElement" contenteditable="true">\u00a0</div>',
-    '<div id="WACViewPanel_ClipboardElement"></div>',
-    '<p id="manual">newer manual copy</p>'
-  ].join(''), 'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx');
-  const officeTarget = instance.window.document.querySelector('#WACViewPanel_EditingElement');
-  const staging = instance.window.document.querySelector('#WACViewPanel_ClipboardElement');
-  const manualTarget = instance.window.document.querySelector('#manual');
-  selectContents(instance.window, officeTarget);
-  const commands = new Map();
-  const recovered = [];
-  const previousRegister = global.GM_registerMenuCommand;
-  const previousSetClipboard = global.GM_setClipboard;
-  global.GM_registerMenuCommand = (name, callback) => commands.set(name, callback);
-  global.GM_setClipboard = (value) => { recovered.push(value); };
-  try {
-    cleanCopy.install(instance.window.document, instance.window);
-    officeTarget.addEventListener('copy', () => {
-      staging.textContent = 'older staged copy';
-    });
-    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
-    Object.defineProperty(event, 'clipboardData', {
-      value: { get types() { return []; }, clearData() {}, setData() {}, getData() { return ''; } }
-    });
-    officeTarget.dispatchEvent(event);
-
-    selectContents(instance.window, manualTarget);
-    const command = commands.get('Clean Math Copy: copy current selection now');
-    assert.equal(await command(), true);
-    await new Promise((resolve) => instance.window.setTimeout(resolve, 10));
-    assert.deepEqual(recovered, ['newer manual copy']);
-  } finally {
-    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
-    else global.GM_registerMenuCommand = previousRegister;
-    if (previousSetClipboard === undefined) delete global.GM_setClipboard;
-    else global.GM_setClipboard = previousSetClipboard;
-  }
-});
-
-test('a deferred settings read cannot overwrite a newer menu choice', async () => {
+test('mode menu exposes exactly three persistent choices and rejects a stale settings read', async () => {
   const instance = dom('<p>settings race</p>');
   const commands = new Map();
   const saved = [];
+  let nextCommandId = 0;
   let resolveInitialRead;
   const previousGM = global.GM;
   const previousRegister = global.GM_registerMenuCommand;
   try {
-    // Exercise the modern asynchronous userscript API specifically. Its
-    // startup read is intentionally left pending until after the user changes
-    // the output mode from the registered menu.
     delete global.GM_registerMenuCommand;
     global.GM = {
       getValue() {
@@ -4770,15 +4720,28 @@ test('a deferred settings read cannot overwrite a newer menu choice', async () =
         saved.push(value);
         return Promise.resolve();
       },
-      registerMenuCommand(name, callback) {
-        commands.set(name, callback);
+      registerMenuCommand(caption, callback, options) {
+        const id = options.id == null ? 'returned-menu-' + (++nextCommandId) : options.id;
+        commands.set(id, { caption, callback, options });
+        return id;
       }
     };
     const installed = cleanCopy.install(instance.window.document, instance.window);
-    assert.equal(installed.settings.outputMode, 'faithful');
-    commands.get('Clean Math Copy: calculator-safe output')();
-    assert.equal(installed.settings.outputMode, 'calculator');
-    assert.equal(saved.at(-1).outputMode, 'calculator');
+    const expectedIds = ['returned-menu-1', 'returned-menu-2', 'returned-menu-3'];
+    const checked = () => Array.from(commands.values()).filter((command) => command.caption.startsWith('✓ '));
+    assert.deepEqual(Array.from(commands.keys()).sort(), expectedIds);
+    assert.deepEqual(checked().map((command) => command.caption), ['✓ Faithful readable (recommended)']);
+    assert.equal(Array.from(commands.values()).every((command) => command.options.autoClose === true), true);
+    assert.doesNotMatch(
+      Array.from(commands.values(), (command) => command.caption).join('\n'),
+      /ASCII|toggle|copy current|show current/i
+    );
+
+    commands.get('returned-menu-2').callback();
+    assert.deepEqual(installed.settings, { outputMode: 'calculator' });
+    assert.deepEqual(saved.at(-1), { outputMode: 'calculator' });
+    assert.deepEqual(checked().map((command) => command.caption), ['✓ Calculator-safe']);
+    assert.equal(commands.size, 3);
 
     resolveInitialRead({
       outputMode: 'latex',
@@ -4787,11 +4750,63 @@ test('a deferred settings read cannot overwrite a newer menu choice', async () =
     });
     await Promise.resolve();
     await Promise.resolve();
-    assert.deepEqual(installed.settings, {
-      outputMode: 'calculator',
-      convertDelimitedLatex: true,
-      cleanInvisibleArtifacts: true
-    });
+    assert.deepEqual(installed.settings, { outputMode: 'calculator' });
+    assert.deepEqual(checked().map((command) => command.caption), ['✓ Calculator-safe']);
+
+    commands.get('returned-menu-3').callback();
+    assert.deepEqual(installed.settings, { outputMode: 'latex' });
+    assert.deepEqual(checked().map((command) => command.caption), ['✓ Original LaTeX']);
+    assert.equal(commands.size, 3);
+  } finally {
+    if (previousGM === undefined) delete global.GM;
+    else global.GM = previousGM;
+    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
+    else global.GM_registerMenuCommand = previousRegister;
+  }
+});
+
+test('asynchronous menu IDs serialize a stored-mode checkmark refresh without duplicates', async () => {
+  const instance = dom('<p>stored settings</p>');
+  const commands = new Map();
+  let nextCommandId = 0;
+  const previousGM = global.GM;
+  const previousRegister = global.GM_registerMenuCommand;
+  try {
+    delete global.GM_registerMenuCommand;
+    global.GM = {
+      getValue() {
+        return Promise.resolve({
+          outputMode: 'latex',
+          convertDelimitedLatex: false,
+          cleanInvisibleArtifacts: false
+        });
+      },
+      setValue() { return Promise.resolve(); },
+      registerMenuCommand(caption, callback, options) {
+        const id = options.id == null ? 'returned-menu-' + (++nextCommandId) : options.id;
+        commands.set(id, { caption, callback });
+        return Promise.resolve(id);
+      }
+    };
+    const installed = cleanCopy.install(instance.window.document, instance.window);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(installed.settings, { outputMode: 'latex' });
+    assert.equal(commands.size, 3);
+    assert.deepEqual(
+      Array.from(commands.values()).filter((command) => command.caption.startsWith('✓ '))
+        .map((command) => command.caption),
+      ['✓ Original LaTeX']
+    );
+    commands.get('returned-menu-2').callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(installed.settings, { outputMode: 'calculator' });
+    assert.equal(commands.size, 3);
+    assert.deepEqual(
+      Array.from(commands.values()).filter((command) => command.caption.startsWith('✓ '))
+        .map((command) => command.caption),
+      ['✓ Calculator-safe']
+    );
   } finally {
     if (previousGM === undefined) delete global.GM;
     else global.GM = previousGM;
@@ -4839,14 +4854,14 @@ test('installed handler leaves ordinary copy events and site behavior untouched'
   assert.equal(event.defaultPrevented, false);
 });
 
-test('manual copy command preserves plain, rich HTML, and MathML clipboard representations', async () => {
-  const instance = dom('<div id="target">' + katex(
-    '<mfrac><mn>1</mn><msqrt><mi>x</mi></msqrt></mfrac>',
-    String.raw`\frac{1}{\sqrt{x}}`
-  ) + '</div>');
-  const target = instance.window.document.querySelector('#target');
+test('Word staging recovery preserves plain, rich HTML, and MathML clipboard representations', async () => {
+  const instance = dom([
+    '<div id="WACViewPanel_EditingElement" contenteditable="true">&nbsp;</div>',
+    '<div id="WACViewPanel_ClipboardElement"></div>'
+  ].join(''), 'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx');
+  const target = instance.window.document.querySelector('#WACViewPanel_EditingElement');
+  const staging = instance.window.document.querySelector('#WACViewPanel_ClipboardElement');
   selectContents(instance.window, target);
-  const commands = new Map();
   let writtenItem = null;
   let plainFallbackCalls = 0;
   class FakeClipboardItem {
@@ -4858,15 +4873,22 @@ test('manual copy command preserves plain, rich HTML, and MathML clipboard repre
     configurable: true,
     value: { write(items) { writtenItem = items[0]; return Promise.resolve(); } }
   });
-  const previousRegister = global.GM_registerMenuCommand;
   const previousSetClipboard = global.GM_setClipboard;
-  global.GM_registerMenuCommand = (name, callback) => commands.set(name, callback);
   global.GM_setClipboard = () => { plainFallbackCalls += 1; };
   try {
-    cleanCopy.install(instance.window.document, instance.window);
-    const command = commands.get('Clean Math Copy: copy current selection now');
-    assert.equal(typeof command, 'function');
-    assert.equal(await command(), true);
+    cleanCopy.install(instance.window.document, instance.window, { registerMenus: false });
+    target.addEventListener('copy', () => {
+      staging.innerHTML = [
+        '<math xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mn>1</mn>',
+        '<msqrt><mi>x</mi></msqrt></mfrac></math>'
+      ].join('');
+    });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+    Object.defineProperty(event, 'clipboardData', {
+      value: { get types() { return []; }, clearData() {}, setData() {}, getData() { return ''; } }
+    });
+    target.dispatchEvent(event);
+    await new Promise((resolve) => instance.window.setTimeout(resolve, 10));
     assert.ok(writtenItem);
     assert.deepEqual(
       Object.keys(writtenItem.representations).sort(),
@@ -4877,24 +4899,21 @@ test('manual copy command preserves plain, rich HTML, and MathML clipboard repre
     assert.match(await writtenItem.representations['application/mathml+xml'].text(), /^<math/);
     assert.equal(plainFallbackCalls, 0);
   } finally {
-    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
-    else global.GM_registerMenuCommand = previousRegister;
     if (previousSetClipboard === undefined) delete global.GM_setClipboard;
     else global.GM_setClipboard = previousSetClipboard;
   }
 });
 
-test('manual copy retries plain plus rich HTML when a browser rejects custom MathML', async () => {
-  const instance = dom('<div id="target">' + katex(
-    '<msqrt><mi>x</mi></msqrt>',
-    String.raw`\sqrt{x}`
-  ) + '</div>');
-  const target = instance.window.document.querySelector('#target');
+test('Word staging recovery retries without custom MathML when a browser rejects it', async () => {
+  const instance = dom([
+    '<div id="WACViewPanel_EditingElement" contenteditable="true">&nbsp;</div>',
+    '<div id="WACViewPanel_ClipboardElement"></div>'
+  ].join(''), 'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx');
+  const target = instance.window.document.querySelector('#WACViewPanel_EditingElement');
+  const staging = instance.window.document.querySelector('#WACViewPanel_ClipboardElement');
   selectContents(instance.window, target);
-  const commands = new Map();
   const constructorAttempts = [];
   let writtenItem = null;
-  let plainFallbackCalls = 0;
   class RejectCustomMathMLItem {
     constructor(representations) {
       constructorAttempts.push(Object.keys(representations).sort());
@@ -4908,222 +4927,32 @@ test('manual copy retries plain plus rich HTML when a browser rejects custom Mat
     configurable: true,
     value: { write(items) { writtenItem = items[0]; return Promise.resolve(); } }
   });
-  const previousRegister = global.GM_registerMenuCommand;
-  const previousSetClipboard = global.GM_setClipboard;
-  global.GM_registerMenuCommand = (name, callback) => commands.set(name, callback);
-  global.GM_setClipboard = () => { plainFallbackCalls += 1; };
-  try {
-    cleanCopy.install(instance.window.document, instance.window);
-    assert.equal(await commands.get('Clean Math Copy: copy current selection now')(), true);
-    assert.equal(constructorAttempts.length, 2);
-    assert.deepEqual(Object.keys(writtenItem.representations).sort(), ['text/html', 'text/plain']);
-    assert.match(await writtenItem.representations['text/html'].text(), /role="math"/);
-    assert.equal(plainFallbackCalls, 0);
-  } finally {
-    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
-    else global.GM_registerMenuCommand = previousRegister;
-    if (previousSetClipboard === undefined) delete global.GM_setClipboard;
-    else global.GM_setClipboard = previousSetClipboard;
-  }
-});
-
-test('serializes overlapping successful manual writes so the newest request remains final', async () => {
-  const instance = dom([
-    '<div id="first">', katex('<mi>x</mi>', 'x'), '</div>',
-    '<div id="second">', katex('<mi>y</mi>', 'y'), '</div>'
-  ].join(''));
-  const firstTarget = instance.window.document.querySelector('#first');
-  const secondTarget = instance.window.document.querySelector('#second');
-  selectContents(instance.window, firstTarget);
-  const commands = new Map();
-  const attempts = [];
-  const completeWrites = [];
-  let finalClipboard = '';
-  class FakeClipboardItem {
-    constructor(representations) { this.representations = representations; }
-  }
-  Object.defineProperty(instance.window, 'Blob', { configurable: true, value: Blob });
-  Object.defineProperty(instance.window, 'ClipboardItem', { configurable: true, value: FakeClipboardItem });
-  Object.defineProperty(instance.window.navigator, 'clipboard', {
-    configurable: true,
-    value: {
-      write(items) {
-        const item = items[0];
-        attempts.push(item);
-        return new Promise((resolve) => {
-          completeWrites.push(async () => {
-            finalClipboard = await item.representations['text/plain'].text();
-            resolve();
-          });
-        });
-      }
-    }
+  cleanCopy.install(instance.window.document, instance.window, { registerMenus: false });
+  target.addEventListener('copy', () => {
+    staging.innerHTML = '<math xmlns="http://www.w3.org/1998/Math/MathML"><msqrt><mi>x</mi></msqrt></math>';
   });
-  const previousRegister = global.GM_registerMenuCommand;
-  const previousSetClipboard = global.GM_setClipboard;
-  global.GM_registerMenuCommand = (name, callback) => commands.set(name, callback);
-  global.GM_setClipboard = () => { throw new Error('rich clipboard path should win'); };
-  try {
-    cleanCopy.install(instance.window.document, instance.window);
-    const command = commands.get('Clean Math Copy: copy current selection now');
-    const older = command();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(attempts.length, 1);
-
-    selectContents(instance.window, secondTarget);
-    const newer = command();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(attempts.length, 1, 'newer write started before the older write settled');
-
-    await completeWrites[0]();
-    assert.equal(await older, false);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(attempts.length, 2);
-    await completeWrites[1]();
-    assert.equal(await newer, true);
-    assert.equal(finalClipboard, 'y');
-  } finally {
-    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
-    else global.GM_registerMenuCommand = previousRegister;
-    if (previousSetClipboard === undefined) delete global.GM_setClipboard;
-    else global.GM_setClipboard = previousSetClipboard;
-  }
-});
-
-test('a stale manual clipboard rejection cannot retry over a newer manual copy', async () => {
-  const instance = dom([
-    '<div id="first">', katex('<mi>x</mi>', 'x'), '</div>',
-    '<div id="second">', katex('<mi>y</mi>', 'y'), '</div>'
-  ].join(''));
-  const firstTarget = instance.window.document.querySelector('#first');
-  const secondTarget = instance.window.document.querySelector('#second');
-  selectContents(instance.window, firstTarget);
-  const commands = new Map();
-  const attempts = [];
-  let rejectFirst = null;
-  let plainFallbackCalls = 0;
-  class FakeClipboardItem {
-    constructor(representations) { this.representations = representations; }
-  }
-  Object.defineProperty(instance.window, 'Blob', { configurable: true, value: Blob });
-  Object.defineProperty(instance.window, 'ClipboardItem', { configurable: true, value: FakeClipboardItem });
-  Object.defineProperty(instance.window.navigator, 'clipboard', {
-    configurable: true,
-    value: {
-      write(items) {
-        attempts.push(items[0]);
-        if (attempts.length === 1) {
-          return new Promise((_resolve, reject) => { rejectFirst = reject; });
-        }
-        return Promise.resolve();
-      }
-    }
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: { get types() { return []; }, clearData() {}, setData() {}, getData() { return ''; } }
   });
-  const previousRegister = global.GM_registerMenuCommand;
-  const previousSetClipboard = global.GM_setClipboard;
-  global.GM_registerMenuCommand = (name, callback) => commands.set(name, callback);
-  global.GM_setClipboard = () => { plainFallbackCalls += 1; };
-  try {
-    cleanCopy.install(instance.window.document, instance.window);
-    const command = commands.get('Clean Math Copy: copy current selection now');
-    const older = command();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(typeof rejectFirst, 'function');
-
-    selectContents(instance.window, secondTarget);
-    const newer = command();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(attempts.length, 1);
-    rejectFirst(new DOMException('custom representation rejected', 'NotSupportedError'));
-    assert.equal(await older, false);
-    assert.equal(await newer, true);
-    assert.equal(attempts.length, 2);
-    assert.equal(await attempts[0].representations['text/plain'].text(), 'x');
-    assert.equal(await attempts[1].representations['text/plain'].text(), 'y');
-    assert.equal(plainFallbackCalls, 0);
-  } finally {
-    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
-    else global.GM_registerMenuCommand = previousRegister;
-    if (previousSetClipboard === undefined) delete global.GM_setClipboard;
-    else global.GM_setClipboard = previousSetClipboard;
-  }
+  target.dispatchEvent(event);
+  await new Promise((resolve) => instance.window.setTimeout(resolve, 10));
+  assert.equal(constructorAttempts.length, 2);
+  assert.deepEqual(Object.keys(writtenItem.representations).sort(), ['text/html', 'text/plain']);
+  assert.equal(await writtenItem.representations['text/plain'].text(), '√x');
+  assert.match(await writtenItem.representations['text/html'].text(), /border-top:1px solid currentColor/);
 });
 
-test('a keyboard copy invalidates an older manual clipboard retry', async () => {
+test('a newer keyboard copy replays after an in-flight Word staging write', async () => {
   const instance = dom([
-    '<div id="first">', katex('<mi>x</mi>', 'x'), '</div>',
-    '<div id="second">', katex('<mi>y</mi>', 'y'), '</div>'
-  ].join(''));
-  const firstTarget = instance.window.document.querySelector('#first');
-  const secondTarget = instance.window.document.querySelector('#second');
-  selectContents(instance.window, firstTarget);
-  const commands = new Map();
-  const attempts = [];
-  let rejectFirst = null;
-  let plainFallbackCalls = 0;
-  class FakeClipboardItem {
-    constructor(representations) { this.representations = representations; }
-  }
-  Object.defineProperty(instance.window, 'Blob', { configurable: true, value: Blob });
-  Object.defineProperty(instance.window, 'ClipboardItem', { configurable: true, value: FakeClipboardItem });
-  Object.defineProperty(instance.window.navigator, 'clipboard', {
-    configurable: true,
-    value: {
-      write(items) {
-        attempts.push(items[0]);
-        if (attempts.length === 1) {
-          return new Promise((_resolve, reject) => { rejectFirst = reject; });
-        }
-        return Promise.resolve();
-      }
-    }
-  });
-  const previousRegister = global.GM_registerMenuCommand;
-  const previousSetClipboard = global.GM_setClipboard;
-  global.GM_registerMenuCommand = (name, callback) => commands.set(name, callback);
-  global.GM_setClipboard = () => { plainFallbackCalls += 1; };
-  try {
-    cleanCopy.install(instance.window.document, instance.window);
-    const older = commands.get('Clean Math Copy: copy current selection now')();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(typeof rejectFirst, 'function');
-
-    selectContents(instance.window, secondTarget);
-    const copied = new Map();
-    const keyboardEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
-    Object.defineProperty(keyboardEvent, 'clipboardData', {
-      value: {
-        clearData() { copied.clear(); },
-        setData(type, value) { copied.set(type, value); },
-        getData(type) { return copied.get(type) || ''; }
-      }
-    });
-    secondTarget.dispatchEvent(keyboardEvent);
-    assert.equal(copied.get('text/plain'), 'y');
-
-    rejectFirst(new DOMException('custom representation rejected', 'NotSupportedError'));
-    assert.equal(await older, false);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(attempts.length, 2);
-    assert.equal(await attempts[1].representations['text/plain'].text(), 'y');
-    assert.equal(plainFallbackCalls, 0);
-  } finally {
-    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
-    else global.GM_registerMenuCommand = previousRegister;
-    if (previousSetClipboard === undefined) delete global.GM_setClipboard;
-    else global.GM_setClipboard = previousSetClipboard;
-  }
-});
-
-test('replays a newer native keyboard copy after an already-started manual write finishes late', async () => {
-  const instance = dom([
-    '<div id="first">', katex('<mi>x</mi>', 'x'), '</div>',
-    '<p id="second">new native text</p>'
-  ].join(''));
-  const firstTarget = instance.window.document.querySelector('#first');
-  const secondTarget = instance.window.document.querySelector('#second');
-  selectContents(instance.window, firstTarget);
-  const commands = new Map();
+    '<div id="WACViewPanel_EditingElement" contenteditable="true">&nbsp;</div>',
+    '<div id="WACViewPanel_ClipboardElement"></div>',
+    '<p id="newer">new native text</p>'
+  ].join(''), 'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx');
+  const officeTarget = instance.window.document.querySelector('#WACViewPanel_EditingElement');
+  const staging = instance.window.document.querySelector('#WACViewPanel_ClipboardElement');
+  const newerTarget = instance.window.document.querySelector('#newer');
+  selectContents(instance.window, officeTarget);
   const attempts = [];
   let completeOlder = null;
   let finalClipboard = '';
@@ -5146,74 +4975,43 @@ test('replays a newer native keyboard copy after an already-started manual write
             };
           });
         }
-        return item.representations['text/plain'].text().then((text) => {
-          finalClipboard = text;
-        });
+        return item.representations['text/plain'].text().then((text) => { finalClipboard = text; });
       }
     }
   });
-  const previousRegister = global.GM_registerMenuCommand;
-  const previousSetClipboard = global.GM_setClipboard;
-  global.GM_registerMenuCommand = (name, callback) => commands.set(name, callback);
-  global.GM_setClipboard = () => { throw new Error('ClipboardItem path should win'); };
-  try {
-    cleanCopy.install(instance.window.document, instance.window);
-    const older = commands.get('Clean Math Copy: copy current selection now')();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(typeof completeOlder, 'function');
+  cleanCopy.install(instance.window.document, instance.window, { registerMenus: false });
+  officeTarget.addEventListener('copy', () => {
+    staging.innerHTML = '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>';
+  });
+  const olderEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(olderEvent, 'clipboardData', {
+    value: { get types() { return []; }, clearData() {}, setData() {}, getData() { return ''; } }
+  });
+  officeTarget.dispatchEvent(olderEvent);
+  await new Promise((resolve) => instance.window.setTimeout(resolve, 10));
+  assert.equal(typeof completeOlder, 'function');
 
-    selectContents(instance.window, secondTarget);
-    const keyboardEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
-    const eventClipboard = new Map();
-    Object.defineProperty(keyboardEvent, 'clipboardData', {
-      value: {
-        get types() { return Array.from(eventClipboard.keys()); },
-        clearData() { eventClipboard.clear(); },
-        setData(type, value) { eventClipboard.set(type, value); },
-        getData(type) { return eventClipboard.get(type) || ''; }
-      }
-    });
-    secondTarget.dispatchEvent(keyboardEvent);
-    assert.equal(keyboardEvent.defaultPrevented, false);
-    // jsdom has no native clipboard implementation, so model the browser's
-    // synchronous native copy before the older async write completes.
-    finalClipboard = secondTarget.textContent;
+  selectContents(instance.window, newerTarget);
+  const newerEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  const eventClipboard = new Map();
+  Object.defineProperty(newerEvent, 'clipboardData', {
+    value: {
+      get types() { return Array.from(eventClipboard.keys()); },
+      clearData() { eventClipboard.clear(); },
+      setData(type, value) { eventClipboard.set(type, value); },
+      getData(type) { return eventClipboard.get(type) || ''; }
+    }
+  });
+  newerTarget.dispatchEvent(newerEvent);
+  assert.equal(newerEvent.defaultPrevented, false);
+  finalClipboard = newerTarget.textContent;
 
-    await completeOlder();
-    assert.equal(await older, false);
-    await new Promise((resolve) => setImmediate(resolve));
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(attempts.length, 2);
-    assert.equal(finalClipboard, 'new native text');
-    assert.equal(await attempts[1].representations['text/plain'].text(), 'new native text');
-  } finally {
-    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
-    else global.GM_registerMenuCommand = previousRegister;
-    if (previousSetClipboard === undefined) delete global.GM_setClipboard;
-    else global.GM_setClipboard = previousSetClipboard;
-  }
-});
-
-test('manual copy command still uses the plain fallback for ordinary text', async () => {
-  const instance = dom('<p id="target">Ordinary text</p>');
-  const target = instance.window.document.querySelector('#target');
-  selectContents(instance.window, target);
-  const commands = new Map();
-  const copied = [];
-  const previousRegister = global.GM_registerMenuCommand;
-  const previousSetClipboard = global.GM_setClipboard;
-  global.GM_registerMenuCommand = (name, callback) => commands.set(name, callback);
-  global.GM_setClipboard = (text) => copied.push(text);
-  try {
-    cleanCopy.install(instance.window.document, instance.window);
-    assert.equal(await commands.get('Clean Math Copy: copy current selection now')(), true);
-    assert.deepEqual(copied, ['Ordinary text']);
-  } finally {
-    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
-    else global.GM_registerMenuCommand = previousRegister;
-    if (previousSetClipboard === undefined) delete global.GM_setClipboard;
-    else global.GM_setClipboard = previousSetClipboard;
-  }
+  await completeOlder();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(attempts.length, 2);
+  assert.equal(finalClipboard, 'new native text');
+  assert.equal(await attempts[1].representations['text/plain'].text(), 'new native text');
 });
 
 test('rewrites invisible artifacts without touching emoji joiners', () => {
@@ -5222,7 +5020,7 @@ test('rewrites invisible artifacts without touching emoji joiners', () => {
   const payload = cleanCopy.getCopyPayload(
     instance.window.document,
     selectContents(instance.window, target),
-    {},
+    { cleanInvisibleArtifacts: false },
     instance.window,
     target
   );

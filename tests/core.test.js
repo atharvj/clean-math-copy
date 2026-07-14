@@ -239,7 +239,7 @@ test('preserves unknown LaTeX commands instead of silently deleting content', ()
 test('converts delimited LaTeX but does not mistake currency for math', () => {
   const result = cleanCopy.convertDelimitedLatexText(
     String.raw`Costs $5 and formula $x^2 + 1$; another costs $10.`,
-    'unicode'
+    'faithful'
   );
   assert.equal(result.converted, 1);
   assert.equal(result.text, 'Costs $5 and formula x² + 1; another costs $10.');
@@ -258,16 +258,15 @@ test('preserves delimiters when a LaTeX construct has no visible output', () => 
   }
 });
 
-test('supports display delimiters, original LaTeX mode, and ASCII mode', () => {
+test('supports display delimiters and original LaTeX mode', () => {
   assert.deepEqual(
-    cleanCopy.convertDelimitedLatexText(String.raw`Use \[\alpha \leq \beta\].`, 'unicode'),
+    cleanCopy.convertDelimitedLatexText(String.raw`Use \[\alpha \leq \beta\].`, 'faithful'),
     { text: 'Use α ≤ β.', converted: 1 }
   );
   assert.deepEqual(
     cleanCopy.convertDelimitedLatexText(String.raw`Use \(x^2\).`, 'latex'),
     { text: 'Use $x^2$.', converted: 1 }
   );
-  assert.equal(cleanCopy.unicodeToAscii('α ≤ β → ∞'), 'alpha <= beta -> infinity');
 });
 
 test('produces calculator-safe syntax with explicit multiplication and scientific powers', () => {
@@ -458,9 +457,10 @@ test('cleans copy artifacts without breaking emoji joiners or intentional newlin
 });
 
 test('normalizes invalid settings safely', () => {
-  assert.deepEqual(cleanCopy.normalizeSettings({ outputMode: 'bogus' }), {
-    outputMode: 'faithful',
-    convertDelimitedLatex: true,
-    cleanInvisibleArtifacts: true
-  });
+  assert.deepEqual(cleanCopy.normalizeSettings({ outputMode: 'bogus' }), { outputMode: 'faithful' });
+  assert.deepEqual(cleanCopy.normalizeSettings({
+    outputMode: 'ascii',
+    convertDelimitedLatex: false,
+    cleanInvisibleArtifacts: false
+  }), { outputMode: 'faithful' });
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.1.3
+// @version      2.2.0
 // @description  Faithfully copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
@@ -43,7 +43,6 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function cleanMathCopyFactory(global) {
   'use strict';
 
-  const VERSION = '2.1.3';
   const STORAGE_KEY = 'cleanMathCopy.settings.v3';
   const MATHML_NAMESPACE = 'http://www.w3.org/1998/Math/MathML';
   const MAX_CLIPBOARD_MARKUP_LENGTH = 1024 * 1024;
@@ -139,11 +138,8 @@
     '[data-testid*="formula"]'
   ].join(',');
 
-  const DEFAULT_SETTINGS = Object.freeze({
-    outputMode: 'faithful',
-    convertDelimitedLatex: true,
-    cleanInvisibleArtifacts: true
-  });
+  const OUTPUT_MODES = Object.freeze(['faithful', 'calculator', 'latex']);
+  const DEFAULT_SETTINGS = Object.freeze({ outputMode: 'faithful' });
 
   const SYMBOLS = Object.freeze({
     alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ϵ', varepsilon: 'ε',
@@ -298,14 +294,10 @@
 
   function normalizeSettings(settings) {
     const candidate = settings && typeof settings === 'object' ? settings : {};
-    const outputMode = ['calculator', 'faithful', 'unicode', 'latex', 'ascii'].includes(candidate.outputMode)
+    const outputMode = OUTPUT_MODES.includes(candidate.outputMode)
       ? candidate.outputMode
       : DEFAULT_SETTINGS.outputMode;
-    return {
-      outputMode,
-      convertDelimitedLatex: candidate.convertDelimitedLatex !== false,
-      cleanInvisibleArtifacts: candidate.cleanInvisibleArtifacts !== false
-    };
+    return { outputMode };
   }
 
   function stripLatexDelimiters(input) {
@@ -1763,28 +1755,6 @@
     }
   }
 
-  function unicodeToAscii(input) {
-    let text = '';
-    for (const character of String(input)) {
-      if (Object.prototype.hasOwnProperty.call(ASCII_SYMBOLS, character)) {
-        text += ASCII_SYMBOLS[character];
-        continue;
-      }
-      const superscriptEntry = Object.entries(SUPERSCRIPTS).find((entry) => entry[1] === character);
-      if (superscriptEntry) {
-        text += '^' + superscriptEntry[0];
-        continue;
-      }
-      const subscriptEntry = Object.entries(SUBSCRIPTS).find((entry) => entry[1] === character);
-      if (subscriptEntry) {
-        text += '_' + subscriptEntry[0];
-        continue;
-      }
-      text += character;
-    }
-    return text.replace(/[ ]{2,}/g, ' ').trim();
-  }
-
   const CALCULATOR_FUNCTIONS = new Set([
     'C', 'abs', 'acos', 'acosh', 'arccos', 'arcsin', 'arctan', 'arg', 'asin', 'asinh',
     'atan', 'atanh', 'ceil', 'cos', 'cosh', 'cot', 'csc', 'det', 'exp', 'floor',
@@ -2147,11 +2117,7 @@
       let rendered;
       if (outputMode === 'latex') rendered = display ? '$$' + source + '$$' : '$' + source + '$';
       else if (outputMode === 'calculator') rendered = latexToCalculator(source);
-      else if (outputMode === 'faithful') rendered = latexToFaithful(source);
-      else {
-        const unicode = latexToUnicode(source);
-        rendered = outputMode === 'ascii' ? unicodeToAscii(unicode) : unicode;
-      }
+      else rendered = latexToFaithful(source);
       if (!rendered || !rendered.trim()) return original;
       converted += 1;
       return rendered;
@@ -4442,10 +4408,8 @@
       if (single && !elementChildren(single).length && isVerticalBarToken(single.textContent || '')) return '|';
       return mathMLToCalculator(mathElement);
     }
-    if (outputMode === 'faithful') return mathMLToFaithful(mathElement);
     if (outputMode === 'latex') return '$' + mathMLToLatexNode(mathElement) + '$';
-    const unicode = mathMLToUnicode(mathElement);
-    return outputMode === 'ascii' ? unicodeToAscii(unicode) : unicode;
+    return mathMLToFaithful(mathElement);
   }
 
   function findSelectedMathMLFragment(mathElement, selectedText, selectedOffset, visualText, preferredStructures, preferVisualFractions) {
@@ -6196,7 +6160,7 @@
   }
 
   function extractMathText(root, outputMode, pageWindow) {
-    const mode = ['calculator', 'faithful', 'unicode', 'latex', 'ascii'].includes(outputMode)
+    const mode = OUTPUT_MODES.includes(outputMode)
       ? outputMode
       : DEFAULT_SETTINGS.outputMode;
     const source = getMathSource(root, pageWindow);
@@ -6209,15 +6173,9 @@
       if (source) return latexToCalculator(source);
       return unicodeToCalculator(formatMathText(fallbackMathText(root)));
     }
-    if (mode === 'faithful') {
-      if (math) return faithfulRenderedMathText(root, math, pageWindow);
-      if (source) return latexToFaithful(source);
-      return formatFaithfulMathText(fallbackMathText(root));
-    }
-    let unicode = math ? mathMLToUnicode(math) : '';
-    if (!unicode && source) unicode = latexToUnicode(source);
-    if (!unicode) unicode = formatMathText(fallbackMathText(root));
-    return mode === 'ascii' ? unicodeToAscii(unicode) : unicode;
+    if (math) return faithfulRenderedMathText(root, math, pageWindow);
+    if (source) return latexToFaithful(source);
+    return formatFaithfulMathText(fallbackMathText(root));
   }
 
   function isMathRoot(element) {
@@ -7463,7 +7421,7 @@
 
   function semanticTextClipboardHTML(input, outputMode) {
     const source = cleanClipboardText(input);
-    if (outputMode !== 'faithful' && outputMode !== 'unicode') {
+    if (outputMode !== 'faithful') {
       return plainTextClipboardHTML(source);
     }
     const superscriptReverse = Object.fromEntries(
@@ -8165,8 +8123,6 @@
   function googleDocsEquationText(latex, outputMode) {
     let text = '';
     if (outputMode === 'calculator') text = latexToCalculator(latex);
-    else if (outputMode === 'unicode') text = latexToUnicode(latex);
-    else if (outputMode === 'ascii') text = unicodeToAscii(latexToFaithful(latex));
     else if (outputMode === 'latex') text = '$' + latex + '$';
     else text = latexToFaithful(latex);
     text = finalizeRewrittenText(text);
@@ -8371,10 +8327,9 @@
         } else if (settings.outputMode === 'latex') {
           scriptText = marker + '{' + raw + '}';
         } else {
-          const explicit = settings.outputMode === 'ascii' ? unicodeToAscii(raw) : raw;
-          scriptText = nestedScriptContainers.has(element) || Array.from(explicit).length !== 1
-            ? marker + '(' + explicit + ')'
-            : marker + explicit;
+          scriptText = nestedScriptContainers.has(element) || Array.from(raw).length !== 1
+            ? marker + '(' + raw + ')'
+            : marker + raw;
         }
       }
       TRUSTED_TEXT_PLACEHOLDERS.set(replacement, {
@@ -8389,9 +8344,7 @@
     if (!text.trim() || text === originalText) return null;
     if (looksLikeStandaloneUnicodeMath(text)) {
       if (settings.outputMode === 'faithful') text = formatFaithfulMathText(text);
-      else if (settings.outputMode === 'unicode') text = formatMathText(text);
       else if (settings.outputMode === 'calculator') text = unicodeToCalculator(text, { preserveLongIdentifiers: true });
-      else if (settings.outputMode === 'ascii') text = unicodeToAscii(formatMathText(text));
     }
     text = finalizeRewrittenText(text);
     if (!text.trim()) return null;
@@ -8669,7 +8622,6 @@
     if (!looksLikeStandaloneUnicodeMath(value)) return null;
     let text = value;
     if (settings.outputMode === 'calculator') text = unicodeToCalculator(value, { preserveLongIdentifiers: true });
-    else if (settings.outputMode === 'ascii') text = unicodeToAscii(value);
     else if (settings.outputMode === 'latex') return null;
     text = finalizeRewrittenText(text);
     if (!text.trim() || text === nativeText) return null;
@@ -9566,11 +9518,11 @@
     const normalized = normalizeOfficeGlyphs(value).trim();
     if (outputMode === 'calculator') return kind === 'sub' ? '_(' + normalized + ')' : '^(' + normalized + ')';
     if (outputMode === 'latex') return kind === 'sub' ? '_{' + normalized + '}' : '^{' + normalized + '}';
-    if (outputMode === 'ascii') return kind === 'sub' ? '_' + normalized : '^' + normalized;
-    if (outputMode === 'faithful') {
-      return toFaithfulScript(normalized, kind === 'sub' ? SUBSCRIPTS : SUPERSCRIPTS, kind === 'sub' ? '_' : '^');
-    }
-    return toScript(normalized, kind === 'sub' ? SUBSCRIPTS : SUPERSCRIPTS, kind === 'sub' ? '_' : '^');
+    return toFaithfulScript(
+      normalized,
+      kind === 'sub' ? SUBSCRIPTS : SUPERSCRIPTS,
+      kind === 'sub' ? '_' : '^'
+    );
   }
 
   function positionedTokenElementsForRange(range, documentObject) {
@@ -9873,7 +9825,7 @@
 
     const nativeText = ranges.map((range) => range.toString()).join('\n');
     const rawLatexProtected = isRawLatexProtected(target, selection, true, ranges);
-    if (settings.convertDelimitedLatex && !rawLatexProtected) {
+    if (!rawLatexProtected) {
       const converted = convertDelimitedLatexText(nativeText, settings.outputMode);
       const finalized = finalizeRewrittenText(converted.text);
       if (converted.converted > 0 && finalized.trim()) return { text: finalized, reason: 'delimited-latex', mathRanges: 0 };
@@ -9884,10 +9836,8 @@
       const unicodeMath = standaloneUnicodeMathPayload(nativeText, ranges, settings, documentObject);
       if (unicodeMath) return unicodeMath;
     }
-    if (settings.cleanInvisibleArtifacts) {
-      const ordinary = ordinarySelectionPayload(documentObject, selection, pageWindow, target, ranges);
-      if (ordinary) return ordinary;
-    }
+    const ordinary = ordinarySelectionPayload(documentObject, selection, pageWindow, target, ranges);
+    if (ordinary) return ordinary;
     return null;
   }
 
@@ -9935,7 +9885,7 @@
     return normalized;
   }
 
-  function setClipboardFromMenu(text) {
+  function writePlainClipboard(text) {
     try {
       if (typeof GM_setClipboard === 'function') {
         GM_setClipboard(text, 'text');
@@ -9978,7 +9928,7 @@
   function writeClipboardPayloadNow(payload, pageWindow, isCurrent) {
     if (!payload || !payload.text || !payload.text.trim() || !isCurrent()) return Promise.resolve(false);
     const writePlainFallback = () => isCurrent()
-      ? setClipboardFromMenu(payload.text).then((written) => Boolean(written && isCurrent()))
+      ? writePlainClipboard(payload.text).then((written) => Boolean(written && isCurrent()))
       : Promise.resolve(false);
     try {
       const ClipboardItemConstructor = pageWindow && pageWindow.ClipboardItem;
@@ -11420,7 +11370,8 @@
     const googleDocsPage = isGoogleDocsPage(pageWindow);
     let activeOfficeState = null;
     let officeGeneration = 0;
-    let manualClipboardGeneration = 0;
+    let copyGeneration = 0;
+    let refreshModeMenus = () => {};
 
     const pageRelayInstalled = installPageClipboardRelay(
       documentObject,
@@ -11437,7 +11388,10 @@
           // A menu command can run while an asynchronous manager read is
           // pending. Never let that stale startup value overwrite the newer
           // in-memory choice the user has already made and persisted.
-          if (settingsGeneration === loadGeneration) settings = normalizeSettings(stored);
+          if (settingsGeneration === loadGeneration) {
+            settings = normalizeSettings(stored);
+            refreshModeMenus();
+          }
         }, () => {});
       }
     } catch (_error) {
@@ -11448,10 +11402,10 @@
       if (!event || handledEvents.has(event)) return;
       handledEvents.add(event);
       const eventSettings = currentSettings();
-      // Any newer keyboard/context-menu copy invalidates an in-flight manual
-      // Clipboard API retry just as another manual command would.
+      // Any newer keyboard/context-menu copy invalidates an in-flight async
+      // recovery and replays behind a write that has already started.
       const replayAfterPendingWrite = hasPendingClipboardWrite();
-      const clipboardGeneration = ++manualClipboardGeneration;
+      const eventGeneration = ++copyGeneration;
       let officeState = null;
       let siteState = null;
       if (isMicrosoftOfficeWebPage(documentObject, pageWindow)) {
@@ -11495,7 +11449,7 @@
       }
       if (replayAfterPendingWrite) {
         const selectedNativeText = selectedNativeClipboardText(selection, event.target);
-        const isReplayCurrent = () => manualClipboardGeneration === clipboardGeneration;
+        const isReplayCurrent = () => copyGeneration === eventGeneration;
         // A Clipboard API call that already started cannot be cancelled. Queue
         // a replay behind it so its late completion cannot become the final
         // clipboard state. Resolve Office/site data only when the replay runs,
@@ -11586,48 +11540,67 @@
         settings = saveSettings(nextSettings);
       };
       const setMode = (mode) => {
-        updateSettings({ ...settings, outputMode: mode });
+        updateSettings({ outputMode: mode });
+        refreshModeMenus();
       };
-      registerMenuCommand('Clean Math Copy: faithful readable output (recommended)', () => setMode('faithful'));
-      registerMenuCommand('Clean Math Copy: calculator-safe output', () => setMode('calculator'));
-      registerMenuCommand('Clean Math Copy: original LaTeX output', () => setMode('latex'));
-      registerMenuCommand('Clean Math Copy: ASCII-only output', () => setMode('ascii'));
-      registerMenuCommand('Clean Math Copy: toggle raw $...$ conversion', () => {
-        updateSettings({ ...settings, convertDelimitedLatex: !settings.convertDelimitedLatex });
-      });
-      registerMenuCommand('Clean Math Copy: toggle ordinary-text cleanup', () => {
-        updateSettings({ ...settings, cleanInvisibleArtifacts: !settings.cleanInvisibleArtifacts });
-      });
-      registerMenuCommand('Clean Math Copy: copy current selection now', () => {
-        // A manual copy is newer than any pending Office staging recovery.
-        // Stop the observer/timer and advance the Office generation so an
-        // already-queued callback also fails its isCurrent guard.
-        if (activeOfficeState && activeOfficeState.recovery) activeOfficeState.recovery.stop();
-        activeOfficeState = null;
-        officeGeneration += 1;
-        const generation = ++manualClipboardGeneration;
-        const isCurrent = () => manualClipboardGeneration === generation;
-        const selection = documentObject.getSelection();
-        const payload = getCopyPayload(documentObject, selection, settings, pageWindow, selection && selection.anchorNode);
-        if (payload) return writeClipboardPayload(payload, pageWindow, isCurrent);
-        const text = cleanClipboardText(selection ? selection.toString() : '');
-        return text && isCurrent()
-          ? writeClipboardPayload({ text, html: '', mathML: '', reason: 'manual-plain', mathRanges: 0 }, pageWindow, isCurrent)
-          : Promise.resolve(false);
-      });
-      registerMenuCommand('Clean Math Copy: show current settings', () => {
-        const message = 'Clean Math Copy v' + VERSION + '\nOutput: ' + settings.outputMode +
-          '\nConvert selected $...$ / \\(...\\): ' + (settings.convertDelimitedLatex ? 'on' : 'off') +
-          '\nClean ordinary copied text: ' + (settings.cleanInvisibleArtifacts ? 'on' : 'off');
-        if (typeof global.alert === 'function') global.alert(message);
-      });
+      const modeMenus = [
+        { mode: 'faithful', label: 'Faithful readable (recommended)' },
+        { mode: 'calculator', label: 'Calculator-safe' },
+        { mode: 'latex', label: 'Original LaTeX' }
+      ];
+      const modeMenuIds = new Map();
+      let pendingModeMenuRender = null;
+      let modeMenusRendered = false;
+      const renderModeMenus = () => {
+        const pendingIds = [];
+        for (const item of modeMenus) {
+          const options = { autoClose: true };
+          if (modeMenuIds.has(item.mode)) options.id = modeMenuIds.get(item.mode);
+          const commandId = registerMenuCommand(
+            (settings.outputMode === item.mode ? '✓ ' : '') + item.label,
+            () => setMode(item.mode),
+            options
+          );
+          if (commandId && typeof commandId.then === 'function') {
+            pendingIds.push(Promise.resolve(commandId).then((resolvedId) => {
+              if (resolvedId != null) modeMenuIds.set(item.mode, resolvedId);
+            }, () => {}));
+          } else if (commandId != null) {
+            modeMenuIds.set(item.mode, commandId);
+          }
+        }
+        return pendingIds.length ? Promise.all(pendingIds) : null;
+      };
+      const trackModeMenuRender = (promise) => {
+        let tracked;
+        tracked = Promise.resolve(promise).then(() => {
+          if (pendingModeMenuRender === tracked) pendingModeMenuRender = null;
+        }, () => {
+          if (pendingModeMenuRender === tracked) pendingModeMenuRender = null;
+        });
+        pendingModeMenuRender = tracked;
+      };
+      refreshModeMenus = () => {
+        if (!modeMenusRendered) {
+          modeMenusRendered = true;
+          const firstRender = renderModeMenus();
+          if (firstRender) trackModeMenuRender(firstRender);
+          return;
+        }
+        if (!pendingModeMenuRender) {
+          const immediateRender = renderModeMenus();
+          if (immediateRender) trackModeMenuRender(immediateRender);
+          return;
+        }
+        trackModeMenuRender(pendingModeMenuRender.then(renderModeMenus, renderModeMenus));
+      };
+      refreshModeMenus();
     }
 
     return { handleCopy, get settings() { return { ...currentSettings() }; } };
   }
 
   return Object.freeze({
-    VERSION,
     DEFAULT_SETTINGS,
     MATH_ROOT_SELECTOR,
     cleanClipboardText,
@@ -11658,7 +11631,6 @@
     serializeRangePayloadWithMath,
     serializeRangeWithMath,
     looksLikeStandaloneUnicodeMath,
-    unicodeToAscii,
     unicodeToCalculator
   });
 });

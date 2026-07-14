@@ -11,7 +11,7 @@ const source = fs.readFileSync(scriptPath, 'utf8');
 test('ships a valid installable userscript metadata block', () => {
   assert.match(source, /^\/\/ ==UserScript==/);
   assert.match(source, /\/\/ @name\s+Clean Math Copy/);
-  assert.match(source, /\/\/ @version\s+2\.1\.3/);
+  assert.match(source, /\/\/ @version\s+2\.2\.0/);
   assert.match(source, /\/\/ @namespace\s+https:\/\/github\.com\/atharvj\/clean-math-copy/);
   assert.match(source, /\/\/ @homepageURL\s+https:\/\/github\.com\/atharvj\/clean-math-copy/);
   assert.match(source, /\/\/ @supportURL\s+https:\/\/github\.com\/atharvj\/clean-math-copy\/issues/);
@@ -24,7 +24,6 @@ test('ships a valid installable userscript metadata block', () => {
   assert.match(source, /\/\/ @grant\s+GM\.addElement/);
   assert.match(source, /\/\/ @match\s+https:\/\/\*\/\*/);
   assert.match(source, /\/\/ ==\/UserScript==/);
-  assert.match(source, /const VERSION = '2\.1\.3'/);
   assert.match(source, /const STORAGE_KEY = 'cleanMathCopy\.settings\.v3'/);
   assert.match(source, /outputMode: 'faithful'/);
 });
