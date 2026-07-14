@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.1.2
+// @version      2.1.3
 // @description  Faithfully copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
@@ -43,7 +43,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function cleanMathCopyFactory(global) {
   'use strict';
 
-  const VERSION = '2.1.2';
+  const VERSION = '2.1.3';
   const STORAGE_KEY = 'cleanMathCopy.settings.v3';
   const MATHML_NAMESPACE = 'http://www.w3.org/1998/Math/MathML';
   const MAX_CLIPBOARD_MARKUP_LENGTH = 1024 * 1024;
@@ -871,6 +871,7 @@
   function convertLatexEnvironment(environment, body, options) {
     const env = environment.replace(/\*$/, '').toLowerCase();
     const calculatorMode = Boolean(options && options.calculatorMode);
+    const agreementMode = Boolean(options && options.agreementMode);
     const convertCell = options && typeof options.convertCell === 'function'
       ? options.convertCell
       : latexToUnicode;
@@ -888,6 +889,12 @@
     if (env === 'cases') {
       if (calculatorMode) {
         return 'piecewise(' + rows.map((cells) => '[' + cells.join(',') + ']').join(',') + ')';
+      }
+      // `if` is a readability aid synthesized by the clipboard formatter; it
+      // is not a glyph in MathJax's cases table. Source-versus-surface
+      // authentication therefore compares only authored cell contents.
+      if (agreementMode) {
+        return '{ ' + rows.map((cells) => cells.join(' ')).join('; ') + ' }';
       }
       return '{ ' + rows.map((cells) => {
         if (cells.length < 2) return cells[0] || '';
@@ -907,6 +914,7 @@
     constructor(input, options) {
       this.calculatorMode = Boolean(options && options.calculatorMode);
       this.faithfulMode = Boolean(options && options.faithfulMode);
+      this.agreementMode = Boolean(options && options.agreementMode);
       const source = stripLatexDelimiters(input);
       this.input = (this.faithfulMode ? escapeFaithfulSentinelCollisions(source) : source)
         .replace(/(^|[^\\])%[^\n\r]*/g, '$1')
@@ -1185,6 +1193,7 @@
         const parsed = new LatexParser(source, {
           calculatorMode: mode === 'calculator',
           faithfulMode: mode === 'faithful',
+          agreementMode: this.agreementMode,
           budget: this.budget
         }).parse();
         if (mode === 'faithful') return formatFaithfulMathText(parsed);
@@ -1429,6 +1438,18 @@
       }
       if ('%_$#&{}'.includes(name)) return name;
 
+      if (name === 'sp' || name === 'sb') {
+        const argument = this.parseArgument();
+        if (this.faithfulMode) {
+          return name === 'sp'
+            ? toFaithfulScript(argument, SUPERSCRIPTS, '^')
+            : toFaithfulScript(argument, SUBSCRIPTS, '_');
+        }
+        return name === 'sp'
+          ? toScript(argument, SUPERSCRIPTS, '^')
+          : toScript(argument, SUBSCRIPTS, '_');
+      }
+
       if (name === 'frac' || name === 'dfrac' || name === 'tfrac' || name === 'cfrac') {
         const numerator = this.parseArgument();
         const denominatorSource = this.faithfulMode ? this.peekArgumentSource() : '';
@@ -1444,7 +1465,11 @@
         return '(' + numerator + ')/(' + denominator + ')';
       }
       if (name === 'binom' || name === 'dbinom' || name === 'tbinom') {
-        return 'C(' + this.parseArgument() + ', ' + this.parseArgument() + ')';
+        const upper = this.parseArgument();
+        const lower = this.parseArgument();
+        // `C` is useful in copied linear text but is not drawn by MathJax;
+        // omit only that synthesized label while authenticating the source.
+        return (this.agreementMode ? '(' : 'C(') + upper + ', ' + lower + ')';
       }
       if (name === 'sqrt') {
         const index = this.parseOptionalArgument();
@@ -1598,6 +1623,7 @@
         return convertLatexEnvironment(environment, body, {
           calculatorMode: this.calculatorMode,
           faithfulMode: this.faithfulMode,
+          agreementMode: this.agreementMode,
           convertCell: (cell) => this.calculatorMode
             ? this.parseCalculatorInner(cell)
             : (this.faithfulMode ? this.parseFaithfulInner(cell) : this.parseUnicodeInner(cell))
@@ -1677,6 +1703,16 @@
     } catch (_error) {
       // Page-authored TeX must never be able to abort a copy event. Budget,
       // stack, parser, and host-object failures all decline conversion.
+      return '';
+    }
+  }
+
+  function latexToVisibleAgreement(input) {
+    try {
+      const source = String(input == null ? '' : input);
+      if (source.length > MAX_MATH_SOURCE_LENGTH) return '';
+      return formatMathText(new LatexParser(source, { agreementMode: true }).parse());
+    } catch (_error) {
       return '';
     }
   }
@@ -3522,7 +3558,7 @@
     const children = elementChildren(node).filter((child) =>
       !['annotation', 'annotation-xml', 'mphantom', 'none'].includes((child.localName || '').toLowerCase())
     );
-    if (['mi', 'mn', 'mo', 'mtext', 'ms', 'mglyph'].includes(name)) {
+    if (['mi', 'mn', 'mo', 'mtext', 'ms', 'mglyph'].includes(name) && !children.length) {
       return [mathSelectionKey(mathMLTokenText(node))];
     }
     if (name === 'mspace' || name === 'annotation' || name === 'annotation-xml' || name === 'mphantom' || name === 'none') {
@@ -3558,6 +3594,702 @@
       return Array.from(new Set(normal.concat(mathSelectionKey(serializeMathMLNode(node))))).slice(0, 32);
     }
     return normal.length ? normal : [mathSelectionKey(mathMLTokenText(node))];
+  }
+
+  // Renderer box trees have a deterministic textual order even when that
+  // order differs from semantic MathML: KaTeX fractions are denominator-first,
+  // indexed roots are index-first, and tables are column-major. Keep this
+  // model deliberately narrow. Trying both numerator orders would make stale
+  // x/y semantics indistinguishable from a visible y/x fraction.
+  function rendererOrderedMathMLSurfaceVariants(node, katexOrder, rawTokenSurface = false) {
+    if (!node || node.nodeType !== 1) return [''];
+    const name = (node.localName || '').toLowerCase();
+    const children = elementChildren(node).filter((child) =>
+      !['annotation', 'annotation-xml', 'mphantom', 'none', 'mspace'].includes((child.localName || '').toLowerCase())
+    );
+    if (['mi', 'mn', 'mo', 'mtext', 'ms', 'mglyph'].includes(name) && !children.length) {
+      return [mathSelectionKey(rawTokenSurface ? (node.textContent || '') : mathMLTokenText(node))];
+    }
+    if (['mspace', 'annotation', 'annotation-xml', 'mphantom', 'none'].includes(name)) return [''];
+    if (name === 'semantics') {
+      const presentation = presentationMathNode(node);
+      return presentation ? rendererOrderedMathMLSurfaceVariants(presentation, katexOrder, rawTokenSurface) : [''];
+    }
+    if (name === 'maction') return children.length
+      ? rendererOrderedMathMLSurfaceVariants(children[0], katexOrder, rawTokenSurface)
+      : [''];
+    if (name === 'mfrac' && children.length >= 2) {
+      return combineSurfaceVariants([
+        rendererOrderedMathMLSurfaceVariants(children[1], katexOrder, rawTokenSurface),
+        rendererOrderedMathMLSurfaceVariants(children[0], katexOrder, rawTokenSurface)
+      ], 32);
+    }
+    if (['msup', 'msub', 'msubsup'].includes(name) && children.length >= 2) {
+      const normal = combineSurfaceVariants(children.map((child) =>
+        rendererOrderedMathMLSurfaceVariants(child, katexOrder, rawTokenSurface)), 32);
+      const base = children[0];
+      const baseText = base && (base.textContent || '');
+      const svgSizedVerticalBar = rawTokenSurface && isVerticalBarToken(baseText) &&
+        base.getAttribute && base.getAttribute('stretchy') === 'true' &&
+        Boolean(base.getAttribute('minsize') || base.getAttribute('maxsize'));
+      if (!svgSizedVerticalBar) return normal;
+      const scriptsOnly = combineSurfaceVariants(children.slice(1).map((child) =>
+        rendererOrderedMathMLSurfaceVariants(child, katexOrder, rawTokenSurface)), 32);
+      return Array.from(new Set(normal.concat(scriptsOnly))).slice(0, 32);
+    }
+    if (name === 'mroot' && children.length >= 2) {
+      return combineSurfaceVariants([
+        rendererOrderedMathMLSurfaceVariants(children[1], katexOrder, rawTokenSurface),
+        rendererOrderedMathMLSurfaceVariants(children[0], katexOrder, rawTokenSurface)
+      ], 32);
+    }
+    if (name === 'mtable') {
+      const rows = children.filter((child) => ['mtr', 'mlabeledtr'].includes((child.localName || '').toLowerCase()));
+      if (!rows.length) return [''];
+      const cells = rows.map((row) => elementChildren(row).filter((child) =>
+        (child.localName || '').toLowerCase() === 'mtd'
+      ));
+      const groups = [];
+      const columns = Math.max(0, ...cells.map((row) => row.length));
+      for (let column = 0; column < columns; column += 1) {
+        for (let row = 0; row < cells.length; row += 1) {
+          if (cells[row][column]) groups.push(rendererOrderedMathMLSurfaceVariants(
+            cells[row][column], katexOrder, rawTokenSurface
+          ));
+        }
+      }
+      return combineSurfaceVariants(groups, 32);
+    }
+    if (name === 'msqrt') {
+      const body = combineSurfaceVariants(children.map((child) =>
+        rendererOrderedMathMLSurfaceVariants(child, katexOrder, rawTokenSurface)), 32);
+      // SVG/CSS radicals contribute no text in KaTeX; a text-backed renderer
+      // can expose the radical glyph without changing operand order.
+      return Array.from(new Set(body.concat(body.map((value) => mathSelectionKey('√') + value)))).slice(0, 32);
+    }
+    if (['mover', 'munder', 'munderover'].includes(name) && children.length) {
+      const base = rendererOrderedMathMLSurfaceVariants(children[0], katexOrder, rawTokenSurface);
+      const marks = children.slice(1).map((child) =>
+        rendererOrderedMathMLSurfaceVariants(child, katexOrder, rawTokenSurface));
+      let orderedGroups = [base, ...marks];
+      if (katexOrder && name === 'munder') orderedGroups = [...marks, base];
+      else if (katexOrder && name === 'munderover' && marks.length >= 2) {
+        orderedGroups = [marks[0], base, marks[1]];
+      }
+      const variants = [...combineSurfaceVariants(orderedGroups, 24), ...base];
+      return Array.from(new Set(variants)).slice(0, 32);
+    }
+    const groups = children.map((child) =>
+      rendererOrderedMathMLSurfaceVariants(child, katexOrder, rawTokenSurface));
+    return groups.length ? combineSurfaceVariants(groups, 32) : [mathSelectionKey(
+      rawTokenSurface ? (node.textContent || '') : mathMLTokenText(node)
+    )];
+  }
+
+  // KaTeX's hidden MathML and visual HTML are separate trees. Flattened text
+  // agreement alone cannot distinguish x^y from x_y, x/(y/z) from (x/y)/z,
+  // or even sqrt(x) from plain x. These helpers compare stable visual layout
+  // markers with bounded MathML spans in an anchor-only coordinate system.
+  // Fences, radicals, and accent marks are excluded because KaTeX may draw
+  // them with CSS/SVG; identifiers, numbers, and written operators remain.
+  function topologyAnchorKey(input) {
+    let value = cleanClipboardText(String(input == null ? '' : input));
+    try { value = value.normalize('NFKC'); } catch (_error) { /* retain source */ }
+    const excluded = new Set(Array.from(
+      '√∛∜|∣❘∥‖()[]{}⟨⟩⌈⌉⌊⌋^~ˆ˜¯ˉ˙¨´ˊˋ˘ˇ˚ˍ'
+    ));
+    const output = [];
+    for (const character of value) {
+      if (excluded.has(character) || /[\u239b-\u23ad]/u.test(character) ||
+          /^[\p{M}\p{Z}\p{Cf}]$/u.test(character) ||
+          /[\ue000-\uf8ff]/u.test(character)) continue;
+      if (/^[\p{L}\p{N}\p{S}]$/u.test(character) || /[=<>+−‐-―*/÷×·⋅∗±∓′-‴]/u.test(character)) {
+        output.push(mathSelectionKey(character));
+      }
+    }
+    return output.join('');
+  }
+
+  function rendererFenceKey(input) {
+    return mathSelectionKey(input)
+      .replace(/[\u239b-\u239d]+/gu, '(')
+      .replace(/[\u239e-\u23a0]+/gu, ')')
+      .replace(/[\u23a1-\u23a3]+/gu, '[')
+      .replace(/[\u23a4-\u23a6]+/gu, ']')
+      .replace(/[\u23a7-\u23ad]+/gu, (pieces) =>
+        /[\u23a7-\u23a9]/u.test(pieces) ? '{' : (/[\u23ab-\u23ad]/u.test(pieces) ? '}' : '')
+      );
+  }
+
+  function matchingFenceOpeningIndex(value, closingIndex) {
+    const closing = value[closingIndex] || '';
+    const openingFor = { ')': '(', ']': '[', '}': '{', '⟩': '⟨', '⌉': '⌈', '⌋': '⌊' };
+    const opening = openingFor[closing];
+    if (!opening) {
+      if (!['|', '‖'].includes(closing)) return -1;
+      return value.lastIndexOf(closing, closingIndex - 1);
+    }
+    let depth = 1;
+    for (let index = closingIndex - 1; index >= 0; index -= 1) {
+      if (value[index] === closing) depth += 1;
+      else if (value[index] === opening) {
+        depth -= 1;
+        if (depth === 0) return index;
+      }
+    }
+    return -1;
+  }
+
+  function rendererOrderedMathMLTopologyLayouts(node) {
+    const cache = new WeakMap();
+    const budget = { work: 0, exhausted: false };
+    const spend = (amount = 1) => {
+      budget.work += amount;
+      if (budget.work > MAX_PARTIAL_MATCH_WORK) budget.exhausted = true;
+      return !budget.exhausted;
+    };
+    const shift = (layout, amount) => ({
+      text: layout.text,
+      spans: layout.spans.map((span) => ({
+        node: span.node,
+        start: span.start + amount,
+        end: span.end + amount
+      }))
+    });
+    const combine = (groups, limit) => {
+      let combined = [{ text: '', spans: [] }];
+      for (const group of groups) {
+        const next = [];
+        for (const prefix of combined) {
+          for (const suffix of group.length ? group : [{ text: '', spans: [] }]) {
+            if (!spend()) return [];
+            const shifted = shift(suffix, prefix.text.length);
+            next.push({
+              text: prefix.text + suffix.text,
+              spans: prefix.spans.concat(shifted.spans)
+            });
+            if (next.length >= limit) break;
+          }
+          if (next.length >= limit) break;
+        }
+        combined = next;
+        if (!combined.length || budget.exhausted) break;
+      }
+      return combined;
+    };
+    const layoutsFor = (current) => {
+      if (!current || current.nodeType !== 1 || !spend()) return [];
+      if (cache.has(current)) return cache.get(current);
+      const name = (current.localName || '').toLowerCase();
+      const children = elementChildren(current).filter((child) =>
+        !['annotation', 'annotation-xml', 'mphantom', 'none', 'mspace']
+          .includes((child.localName || '').toLowerCase())
+      );
+      let layouts = [];
+      if (['mi', 'mn', 'mo', 'mtext', 'ms', 'mglyph'].includes(name) && !children.length) {
+        // Layout authentication compares rendered anchors, not requested
+        // typographic variants. Unsupported script/fraktur Greek remains the
+        // same visible Greek token rather than becoming `script(alpha)`.
+        const text = topologyAnchorKey(current.textContent || '');
+        layouts = [{ text, spans: [{ node: current, start: 0, end: text.length }] }];
+      } else if (['mspace', 'annotation', 'annotation-xml', 'mphantom', 'none'].includes(name)) {
+        layouts = [{ text: '', spans: [] }];
+      } else if (name === 'semantics') {
+        layouts = layoutsFor(presentationMathNode(current));
+      } else if (name === 'mfrac' && children.length >= 2) {
+        // KaTeX's visual vlist exposes denominator before numerator.
+        layouts = combine([layoutsFor(children[1]), layoutsFor(children[0])], 32);
+      } else if (name === 'mroot' && children.length >= 2) {
+        layouts = combine([layoutsFor(children[1]), layoutsFor(children[0])], 32);
+      } else if (name === 'mtable') {
+        const rows = children.filter((child) =>
+          ['mtr', 'mlabeledtr'].includes((child.localName || '').toLowerCase())
+        );
+        const cells = rows.map((row) => elementChildren(row).filter((child) =>
+          (child.localName || '').toLowerCase() === 'mtd'
+        ));
+        const groups = [];
+        const columns = Math.max(0, ...cells.map((row) => row.length));
+        for (let column = 0; column < columns; column += 1) {
+          for (let row = 0; row < cells.length; row += 1) {
+            if (cells[row][column]) groups.push(layoutsFor(cells[row][column]));
+          }
+        }
+        layouts = combine(groups, 32);
+      } else if (['mover', 'munder', 'munderover'].includes(name) && children.length) {
+        const base = layoutsFor(children[0]);
+        const marks = children.slice(1).map(layoutsFor);
+        let groups = [base, ...marks];
+        if (name === 'munder') groups = [...marks, base];
+        else if (name === 'munderover' && marks.length >= 2) groups = [marks[0], base, marks[1]];
+        // Many accents and braces are SVG-only, so retain both the complete
+        // textual layout and the independently visible base-only layout.
+        layouts = combine(groups, 24).concat(base).slice(0, 32);
+      } else {
+        layouts = combine(children.map(layoutsFor), 32);
+      }
+      if (!['semantics', 'mspace', 'annotation', 'annotation-xml', 'mphantom', 'none'].includes(name)) {
+        layouts = layouts.map((layout) => ({
+          text: layout.text,
+          spans: layout.spans.concat({ node: current, start: 0, end: layout.text.length })
+        }));
+      }
+      cache.set(current, layouts);
+      return layouts;
+    };
+    const layouts = layoutsFor(node);
+    return budget.exhausted ? null : layouts;
+  }
+
+  const KATEX_TOPOLOGY_MATHML_SELECTOR = [
+    'mfrac', 'msqrt', 'mroot', 'msup', 'msub', 'msubsup',
+    'mover', 'munder', 'munderover', 'mtable', 'menclose', 'mmultiscripts'
+  ].join(',');
+
+  function katexScriptMarkerKind(marker) {
+    const vlistTable = elementChildren(marker).find((child) =>
+      child.classList && child.classList.contains('vlist-t')
+    );
+    if (!vlistTable) return '';
+    const firstRow = elementChildren(vlistTable).find((child) =>
+      child.classList && child.classList.contains('vlist-r')
+    );
+    const vlist = firstRow && elementChildren(firstRow).find((child) =>
+      child.classList && child.classList.contains('vlist')
+    );
+    if (!vlist) return '';
+    const layers = elementChildren(vlist).length;
+    const hasDepthRow = vlistTable.classList.contains('vlist-t2');
+    if (!hasDepthRow && layers === 1) return 'msup';
+    if (hasDepthRow && layers === 1) return 'msub';
+    if (hasDepthRow && layers === 2) return 'msubsup';
+    return '';
+  }
+
+  function katexOverUnderMarkerKind(marker) {
+    const vlistTable = elementChildren(marker).find((child) =>
+      child.classList && child.classList.contains('vlist-t')
+    );
+    const firstRow = vlistTable && elementChildren(vlistTable).find((child) =>
+      child.classList && child.classList.contains('vlist-r')
+    );
+    const vlist = firstRow && elementChildren(firstRow).find((child) =>
+      child.classList && child.classList.contains('vlist')
+    );
+    if (!vlistTable || !vlist) return '';
+    const layers = elementChildren(vlist);
+    if (layers.length === 3) return 'munderover';
+    if (layers.length === 2) {
+      const baselineDistance = (layer) => {
+        const top = String(layer.getAttribute('style') || '').match(/(?:^|;)\s*top:\s*(-?\d+(?:\.\d+)?)em/u);
+        const pstrut = layer.querySelector && layer.querySelector('.pstrut');
+        const height = String(pstrut && pstrut.getAttribute('style') || '')
+          .match(/(?:^|;)\s*height:\s*(\d+(?:\.\d+)?)em/u);
+        return top && height ? Math.abs(Number(top[1]) + Number(height[1])) : Number.POSITIVE_INFINITY;
+      };
+      const firstDistance = baselineDistance(layers[0]);
+      const secondDistance = baselineDistance(layers[1]);
+      if (!Number.isFinite(firstDistance) || firstDistance === secondDistance) return '';
+      return firstDistance < secondDistance ? 'mover' : 'munder';
+    }
+    return '';
+  }
+
+  function katexTableMarkerDetail(marker) {
+    const columns = elementChildren(marker).filter((child) =>
+      Array.from(child.classList || []).some((name) => /^col-align-/u.test(name))
+    );
+    if (!columns.length) return '';
+    const cellsByColumn = [];
+    for (const column of columns) {
+      const vlistTable = elementChildren(column).find((child) =>
+        child.classList && child.classList.contains('vlist-t')
+      );
+      const firstRow = vlistTable && elementChildren(vlistTable).find((child) =>
+        child.classList && child.classList.contains('vlist-r')
+      );
+      const vlist = firstRow && elementChildren(firstRow).find((child) =>
+        child.classList && child.classList.contains('vlist')
+      );
+      const cells = vlist && elementChildren(vlist);
+      if (!cells || !cells.length) return '';
+      cellsByColumn.push(cells);
+    }
+    const rows = cellsByColumn[0].length;
+    if (!rows || cellsByColumn.some((column) => column.length !== rows)) return '';
+    const values = [];
+    for (let row = 0; row < rows; row += 1) {
+      for (let column = 0; column < cellsByColumn.length; column += 1) {
+        values.push(topologyAnchorKey(cellsByColumn[column][row].textContent || ''));
+      }
+    }
+    return rows + 'x' + cellsByColumn.length + ':' + values.join('|');
+  }
+
+  function katexEnclosureMarkerDetails(visualBranch) {
+    const details = new Map();
+    const ownerFor = (node) => {
+      const vlistTable = node && node.closest && node.closest('.vlist-t');
+      const owner = vlistTable && vlistTable.parentElement;
+      return owner && nodeInside(visualBranch, owner) ? owner : null;
+    };
+    for (const line of Array.from(visualBranch.querySelectorAll('svg line'))) {
+      const owner = ownerFor(line);
+      if (!owner) return null;
+      const y1 = line.getAttribute('y1') || '';
+      const y2 = line.getAttribute('y2') || '';
+      let notation = '';
+      if (y1 === '100%' && y2 === '0') notation = 'updiagonalstrike';
+      else if (y1 === '0' && y2 === '100%') notation = 'downdiagonalstrike';
+      else return null;
+      if (!details.has(owner)) details.set(owner, new Set());
+      details.get(owner).add(notation);
+    }
+    for (const frame of Array.from(visualBranch.querySelectorAll('.stretchy.fbox'))) {
+      const owner = ownerFor(frame);
+      if (!owner || !owner.querySelector('.boxpad')) return null;
+      if (!details.has(owner)) details.set(owner, new Set());
+      details.get(owner).add('box');
+    }
+    return Array.from(details, ([owner, values]) => ({
+      owner,
+      detail: Array.from(values).sort().join(' ')
+    }));
+  }
+
+  function accentGlyphKind(value) {
+    const glyph = cleanClipboardText(value || '').trim();
+    return ({
+      '^': 'hat', 'ˆ': 'hat', '~': 'tilde', '˜': 'tilde',
+      '⃗': 'vec-right', '→': 'arrow-right', '←': 'arrow-left',
+      '‾': 'overline', '¯': 'bar', 'ˉ': 'bar',
+      '˙': 'dot', '¨': 'ddot', 'ˊ': 'acute', 'ˋ': 'grave',
+      '˘': 'breve', 'ˇ': 'check', '˚': 'ring',
+      '⏞': 'overbrace', '⏟': 'underbrace'
+    })[glyph] || '';
+  }
+
+  function katexAccentMarkerDetail(marker) {
+    if (marker.classList.contains('overline')) return 'overline';
+    if (marker.classList.contains('underline')) return 'underline';
+    if (marker.classList.contains('mover') && marker.querySelector('.brace-left')) return 'overbrace';
+    if (marker.classList.contains('munder') && marker.querySelector('.brace-left')) return 'underbrace';
+    if (!marker.classList.contains('accent')) return '';
+    const ownedByMarker = (node) => node && node.closest && node.closest('.accent') === marker;
+    const body = Array.from(marker.querySelectorAll('.accent-body')).find(ownedByMarker) || null;
+    if (body && body.querySelector('.overlay svg')) return 'vec-right';
+    const textKind = accentGlyphKind(body && body.textContent || '');
+    if (textKind) return textKind;
+    const path = Array.from(marker.querySelectorAll('svg path')).find(ownedByMarker) || null;
+    const pathData = String(path && path.getAttribute('d') || '').trim();
+    if (/^M400000\s/u.test(pathData)) return 'arrow-left';
+    if (/^M0\s+241/u.test(pathData)) return 'arrow-right';
+    if (/^M\d+\s+0h/u.test(pathData)) return 'widehat';
+    if (/^M200\s+55/u.test(pathData)) return 'widetilde';
+    return '';
+  }
+
+  function semanticAccentDetail(node) {
+    const name = (node.localName || '').toLowerCase();
+    const children = elementChildren(node);
+    if (!['mover', 'munder'].includes(name) || children.length < 2) return '';
+    const mark = children[1];
+    const kind = accentGlyphKind(mark.textContent || '');
+    const accent = name === 'mover'
+      ? node.getAttribute('accent') === 'true'
+      : node.getAttribute('accentunder') === 'true';
+    if (accent && mark.getAttribute && mark.getAttribute('stretchy') === 'true') {
+      if (name === 'munder' && kind === 'overline') return 'underline';
+      if (kind === 'hat') return 'widehat';
+      if (kind === 'tilde') return 'widetilde';
+      if (kind === 'arrow-left' || kind === 'arrow-right' || kind === 'overline') return kind;
+    }
+    if (accent) return name === 'munder' && kind === 'overline' ? 'underline' : kind;
+    if (kind === 'overbrace' || kind === 'underbrace') return kind;
+    return '';
+  }
+
+  function katexVisualTopologyRecords(visualBranch) {
+    if (!visualBranch || !visualBranch.matches || !visualBranch.matches('.katex-html') ||
+        !domTreeWithinBudget(visualBranch, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return null;
+    const documentObject = visualBranch.ownerDocument;
+    const records = [];
+    const add = (kind, marker, owner, detail = '') => {
+      if (!kind || !marker || !owner || !nodeInside(visualBranch, marker)) return false;
+      const prefix = documentObject.createRange();
+      try {
+        prefix.selectNodeContents(visualBranch);
+        prefix.setEndBefore(marker);
+      } catch (_error) {
+        return false;
+      }
+      const prefixText = prefix.toString();
+      const prefixAnchors = topologyAnchorKey(prefixText);
+      const start = prefixAnchors.length;
+      const end = start + topologyAnchorKey(marker.textContent || '').length;
+      if (end <= start || end > MAX_SELECTION_KEY_LENGTH) return false;
+      let baseStart = null;
+      let baseEnd = null;
+      if (['msup', 'msub', 'msubsup'].includes(kind)) {
+        baseEnd = start;
+        const ownerPrefixRange = documentObject.createRange();
+        try {
+          ownerPrefixRange.selectNodeContents(owner);
+          ownerPrefixRange.setEndBefore(marker);
+        } catch (_error) {
+          return false;
+        }
+        const ownerPrefixText = ownerPrefixRange.toString();
+        const ownerAnchors = topologyAnchorKey(ownerPrefixText);
+        baseStart = Math.max(0, baseEnd - ownerAnchors.length);
+
+        // KaTeX splits the last digit of a multi-digit <mn> into the script
+        // owner (`1` + owner `0` for 10^n). Extend only a numeric run; letters
+        // remain separate implicit factors such as x followed by y^2.
+        if (/^\d+$/u.test(ownerAnchors)) {
+          while (baseStart > 0 && /\d/u.test(prefixAnchors[baseStart - 1])) baseStart -= 1;
+        }
+
+        // A script on a closing fence is attached to the whole matched group
+        // in readable notation even though KaTeX makes only the close glyph
+        // the DOM owner. Recover that group without treating an SVG-only
+        // evaluation bar as a fence—the latter has no textual close glyph.
+        const fencePrefix = rendererFenceKey(prefixText);
+        const ownerFence = rendererFenceKey(ownerPrefixText).slice(-1);
+        if (ownerFence && fencePrefix.endsWith(ownerFence)) {
+          const openingIndex = matchingFenceOpeningIndex(fencePrefix, fencePrefix.length - 1);
+          if (openingIndex >= 0) {
+            baseStart = topologyAnchorKey(fencePrefix.slice(0, openingIndex + 1)).length;
+          }
+        }
+      }
+      records.push({ kind, start, end, baseStart, baseEnd, detail, node: marker, owner });
+      return true;
+    };
+    for (const marker of Array.from(visualBranch.querySelectorAll('.mfrac'))) {
+      if (!add('mfrac', marker, marker)) return null;
+    }
+    for (const marker of Array.from(visualBranch.querySelectorAll('.sqrt'))) {
+      const indexed = elementChildren(marker).some((child) =>
+        child.classList && child.classList.contains('root')
+      );
+      if (!add(indexed ? 'mroot' : 'msqrt', marker, marker)) return null;
+    }
+    for (const marker of Array.from(visualBranch.querySelectorAll('.msupsub'))) {
+      if (!add(katexScriptMarkerKind(marker), marker, marker.parentElement)) return null;
+    }
+    for (const marker of Array.from(visualBranch.querySelectorAll('.accent, .overline'))) {
+      const detail = katexAccentMarkerDetail(marker);
+      if (!detail || !add('mover', marker, marker, detail)) return null;
+    }
+    for (const marker of Array.from(visualBranch.querySelectorAll('.underline'))) {
+      const detail = katexAccentMarkerDetail(marker);
+      if (!detail || !add('munder', marker, marker, detail)) return null;
+    }
+    for (const marker of Array.from(visualBranch.querySelectorAll('.mover'))) {
+      const detail = katexAccentMarkerDetail(marker);
+      if (!detail || !add('mover', marker, marker, detail)) return null;
+    }
+    for (const marker of Array.from(visualBranch.querySelectorAll('.munder'))) {
+      const detail = katexAccentMarkerDetail(marker);
+      if (!detail || !add('munder', marker, marker, detail)) return null;
+    }
+    for (const marker of Array.from(visualBranch.querySelectorAll('.op-limits'))) {
+      if (!add(katexOverUnderMarkerKind(marker), marker, marker)) return null;
+    }
+    for (const marker of Array.from(visualBranch.querySelectorAll('.mtable'))) {
+      const detail = katexTableMarkerDetail(marker);
+      if (!detail || !add('mtable', marker, marker, detail)) return null;
+    }
+    const enclosures = katexEnclosureMarkerDetails(visualBranch);
+    if (!enclosures) return null;
+    for (const enclosure of enclosures) {
+      if (!add('menclose', enclosure.owner, enclosure.owner, enclosure.detail)) return null;
+    }
+    return records;
+  }
+
+  function topologyRecordForestSignature(records, semantic) {
+    if (!Array.isArray(records)) return null;
+    const byNode = new Map(records.map((record) => [record.node, record]));
+    const keyFor = (record) => record.kind + ':' + record.start + ':' + record.end +
+      (record.baseStart == null ? '' : ':' + record.baseStart + ':' + record.baseEnd) +
+      (record.detail ? '#' + record.detail : '');
+    const parentFor = (record) => {
+      if (semantic) {
+        let ancestor = record.node.parentElement;
+        while (ancestor) {
+          if (byNode.has(ancestor)) return byNode.get(ancestor);
+          ancestor = ancestor.parentElement;
+        }
+        return null;
+      }
+      const candidates = records.filter((candidate) => candidate !== record &&
+        candidate.owner !== record.owner && candidate.owner.contains &&
+        candidate.owner.contains(record.owner));
+      if (!candidates.length) return null;
+      candidates.sort((left, right) => {
+        if (left.owner.contains(right.owner)) return 1;
+        if (right.owner.contains(left.owner)) return -1;
+        return 0;
+      });
+      const closest = candidates[0];
+      if (candidates[1] && !candidates[1].owner.contains(closest.owner)) return false;
+      return closest;
+    };
+    const children = new Map(records.map((record) => [record, []]));
+    const roots = [];
+    for (const record of records) {
+      const parent = parentFor(record);
+      if (parent === false) return null;
+      if (parent) children.get(parent).push(record);
+      else roots.push(record);
+    }
+    const active = new Set();
+    const serialize = (record) => {
+      if (active.has(record)) return null;
+      active.add(record);
+      const nested = [];
+      for (const child of children.get(record) || []) {
+        const value = serialize(child);
+        if (value === null) return null;
+        nested.push(value);
+      }
+      active.delete(record);
+      nested.sort();
+      return keyFor(record) + '[' + nested.join(',') + ']';
+    };
+    const values = [];
+    for (const root of roots) {
+      const value = serialize(root);
+      if (value === null) return null;
+      values.push(value);
+    }
+    values.sort();
+    return values.join(';');
+  }
+
+  function katexMathMLTopologyAgrees(math, visualBranch) {
+    const presentation = presentationMathNode(math);
+    if (!presentation || !domTreeWithinBudget(presentation, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return false;
+    const visualRecords = katexVisualTopologyRecords(visualBranch);
+    if (!visualRecords) return false;
+    const visualSignature = topologyRecordForestSignature(visualRecords, false);
+    if (visualSignature === null) return false;
+    const visibleKey = topologyAnchorKey(visualBranch.textContent || '');
+    if (visibleKey.length > MAX_SELECTION_KEY_LENGTH) return false;
+    const structureNodes = [];
+    if (presentation.matches && presentation.matches(KATEX_TOPOLOGY_MATHML_SELECTOR)) structureNodes.push(presentation);
+    structureNodes.push(...Array.from(presentation.querySelectorAll(KATEX_TOPOLOGY_MATHML_SELECTOR)));
+    const layouts = rendererOrderedMathMLTopologyLayouts(presentation);
+    if (!layouts) return false;
+    for (const layout of layouts) {
+      if (layout.text !== visibleKey) continue;
+      const semanticRecords = [];
+      let complete = true;
+      for (const node of structureNodes) {
+        const name = (node.localName || '').toLowerCase();
+        const span = layout.spans.find((candidate) => candidate.node === node);
+        if (!span) { complete = false; break; }
+        let start = span.start;
+        let baseStart = null;
+        let baseEnd = null;
+        let detail = '';
+        if (['msup', 'msub', 'msubsup'].includes(name)) {
+          const base = elementChildren(node)[0];
+          const baseSpan = layout.spans.find((candidate) => candidate.node === base);
+          if (!baseSpan) { complete = false; break; }
+          start = baseSpan.end;
+          baseStart = baseSpan.start;
+          baseEnd = baseSpan.end;
+
+          let token = base;
+          while (token && ['mrow', 'mstyle', 'mpadded'].includes((token.localName || '').toLowerCase()) &&
+                 elementChildren(token).length === 1) token = elementChildren(token)[0];
+          const tokenValue = token && (token.localName || '').toLowerCase() === 'mo'
+            ? rendererFenceKey(mathMLTokenText(token))
+            : '';
+          const closing = tokenValue.slice(-1);
+          if ([')', ']', '}', '⟩', '⌉', '⌋', '|', '‖'].includes(closing)) {
+            const tokens = [];
+            if (presentation.matches && presentation.matches('mo')) tokens.push(presentation);
+            tokens.push(...Array.from(presentation.querySelectorAll('mo')));
+            const tokenIndex = tokens.indexOf(token);
+            if (tokenIndex >= 0) {
+              let depth = 1;
+              const openingFor = { ')': '(', ']': '[', '}': '{', '⟩': '⟨', '⌉': '⌈', '⌋': '⌊' };
+              const opening = openingFor[closing] || closing;
+              for (let index = tokenIndex - 1; index >= 0; index -= 1) {
+                const value = rendererFenceKey(mathMLTokenText(tokens[index])).slice(-1);
+                if (opening === closing) {
+                  if (value !== closing) continue;
+                  const openingSpan = layout.spans.find((candidate) => candidate.node === tokens[index]);
+                  if (openingSpan) baseStart = openingSpan.end;
+                  break;
+                }
+                if (value === closing) depth += 1;
+                else if (value === opening) {
+                  depth -= 1;
+                  if (depth === 0) {
+                    const openingSpan = layout.spans.find((candidate) => candidate.node === tokens[index]);
+                    if (openingSpan) baseStart = openingSpan.end;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (name === 'mtable') {
+          const rows = elementChildren(node).filter((row) =>
+            ['mtr', 'mlabeledtr'].includes((row.localName || '').toLowerCase())
+          );
+          const cells = rows.map((row) => elementChildren(row).filter((cell) =>
+            (cell.localName || '').toLowerCase() === 'mtd'
+          ));
+          const columns = cells.length ? cells[0].length : 0;
+          if (!rows.length || !columns || cells.some((row) => row.length !== columns)) {
+            complete = false;
+            break;
+          }
+          const cellValues = [];
+          for (const row of cells) {
+            for (const cell of row) {
+              const cellSpan = layout.spans.find((candidate) => candidate.node === cell);
+              if (!cellSpan) { complete = false; break; }
+              cellValues.push(layout.text.slice(cellSpan.start, cellSpan.end));
+            }
+            if (!complete) break;
+          }
+          if (!complete) break;
+          detail = rows.length + 'x' + columns + ':' + cellValues.join('|');
+        }
+        if (name === 'menclose') {
+          detail = String(node.getAttribute('notation') || '')
+            .trim().split(/\s+/u).filter(Boolean).sort().join(' ');
+          if (!detail) { complete = false; break; }
+        }
+        if (name === 'mover' || name === 'munder') detail = semanticAccentDetail(node);
+        if (span.end <= start) { complete = false; break; }
+        semanticRecords.push({
+          kind: name, start, end: span.end, baseStart, baseEnd, detail, node, owner: node
+        });
+      }
+      if (!complete) continue;
+      const semanticSignature = topologyRecordForestSignature(semanticRecords, true);
+      if (semanticSignature !== null && semanticSignature === visualSignature) return true;
+    }
+    return false;
+  }
+
+  function isGenuineKatexVisualBranch(visualBranch) {
+    if (!visualBranch || !visualBranch.matches || !visualBranch.matches('.katex-html')) return false;
+    const bases = elementChildren(visualBranch).filter((child) =>
+      child.classList && child.classList.contains('base')
+    );
+    return Boolean(bases.length && bases.every((base) => elementChildren(base).some((child) =>
+      child.classList && child.classList.contains('strut')
+    )));
   }
 
   function sliceMathMLSurfaceNode(node, surface, start, end, documentObject) {
@@ -4374,6 +5106,21 @@
         if (source) return source;
       }
     }
+    // MathJax v3 CHTML keeps the original TeX on the one direct mjx-math
+    // child, while the public root is mjx-container. Userscript isolation or
+    // a page CSP can make the page-world MathJax object unavailable, so use
+    // this renderer-owned metadata only in that exact, bounded shape. Every
+    // clipboard path still requires independent visible-anchor agreement
+    // before this source may replace selected content.
+    if (root.matches && root.matches('mjx-container')) {
+      const directMathChildren = Array.from(root.children || []).filter((child) =>
+        child.matches && child.matches('mjx-math[data-latex]')
+      );
+      if (directMathChildren.length === 1) {
+        const source = bounded(directMathChildren[0].getAttribute('data-latex'));
+        if (source) return source;
+      }
+    }
     const annotated = findTexAnnotation(root);
     if (annotated) return bounded(annotated);
     const math = (root.matches && root.matches('math')) ? root : (root.querySelector && root.querySelector('math'));
@@ -4460,32 +5207,935 @@
       : (rendered || faithfulSource);
   }
 
+  function cssColorIsFullyTransparent(input) {
+    const value = String(input || '').replace(/\s+/g, '').toLowerCase();
+    if (!value) return false;
+    if (value === 'transparent') return true;
+    if (/^#[0-9a-f]{4}$/u.test(value)) return value[4] === '0';
+    if (/^#[0-9a-f]{8}$/u.test(value)) return value.slice(-2) === '00';
+    return /^(?:rgba|hsla|hsva)\([^)]*,0(?:\.0+)?%?\)$/u.test(value) ||
+      /^(?:rgba?|hsla?|hsva?|hwb|lab|lch|oklab|oklch|color)\([^)]*\/0(?:\.0+)?%?\)$/u.test(value);
+  }
+
+  function cssPolygonHasVisibleArea(input) {
+    const match = String(input || '').trim().toLowerCase().match(/^polygon\((.*)\)(?:\s+padding-box)?$/u);
+    if (!match) return false;
+    let body = match[1].trim();
+    body = body.replace(/^(?:nonzero|evenodd)\s*,\s*/u, '');
+    const rawPoints = body.split(',');
+    if (rawPoints.length < 3 || rawPoints.length > 256) return false;
+    const points = [];
+    const number = '-?(?:\\d+(?:\\.\\d*)?|\\.\\d+)';
+    const coordinate = '(?:' + number + '(?:%|px)?|calc\\(\\s*100%\\s*[+-]\\s*' + number + 'px\\s*\\))';
+    const pointPattern = new RegExp('^(' + coordinate + ')\\s+(' + coordinate + ')$', 'u');
+    const parseCoordinate = (source) => {
+      const calc = source.match(/^calc\(\s*100%\s*([+-])\s*(-?(?:\d+(?:\.\d*)?|\.\d+))px\s*\)$/u);
+      if (calc) {
+        const offset = Number(calc[2]) * (calc[1] === '-' ? -1 : 1);
+        return Number.isFinite(offset) ? { percent: 1, px: offset } : null;
+      }
+      const simple = source.match(/^(-?(?:\d+(?:\.\d*)?|\.\d+))(%|px)?$/u);
+      if (!simple) return null;
+      const amount = Number(simple[1]);
+      if (!Number.isFinite(amount)) return null;
+      if (simple[2] === '%') return { percent: amount / 100, px: 0 };
+      return { percent: 0, px: amount };
+    };
+    for (const rawPoint of rawPoints) {
+      const point = rawPoint.trim().match(pointPattern);
+      if (!point) return false;
+      const x = parseCoordinate(point[1]);
+      const y = parseCoordinate(point[2]);
+      if (!x || !y) return false;
+      points.push([x, y]);
+    }
+    const key = (coordinateValue) => coordinateValue.percent + ':' + coordinateValue.px;
+    const uniqueX = new Map(points.map((point) => [key(point[0]), point[0]]));
+    const uniqueY = new Map(points.map((point) => [key(point[1]), point[1]]));
+    const provablySeparated = (values) => {
+      if (values.size !== 2) return false;
+      const [first, second] = Array.from(values.values());
+      const percent = second.percent - first.percent;
+      const pixels = second.px - first.px;
+      return (percent >= 0 && pixels >= 0 && (percent > 0 || pixels > 0)) ||
+        (percent <= 0 && pixels <= 0 && (percent < 0 || pixels < 0));
+    };
+    if (uniqueX.size === 2 && uniqueY.size === 2 &&
+        provablySeparated(uniqueX) && provablySeparated(uniqueY)) {
+      const corners = new Set(points.map((point) => key(point[0]) + '|' + key(point[1])));
+      if (corners.size === 4) return true;
+    }
+    // A non-rectangular polygon is accepted only when all coordinates share a
+    // single percentage or pixel basis and its shoelace area is nonzero.
+    for (const basis of ['percent', 'px']) {
+      const other = basis === 'percent' ? 'px' : 'percent';
+      if (points.some((point) => point[0][other] !== 0 || point[1][other] !== 0)) continue;
+      let doubledArea = 0;
+      for (let index = 0; index < points.length; index += 1) {
+        const next = points[(index + 1) % points.length];
+        doubledArea += (points[index][0][basis] * next[1][basis]) -
+          (next[0][basis] * points[index][1][basis]);
+      }
+      if (Math.abs(doubledArea) > 1e-9) return true;
+    }
+    return false;
+  }
+
+  function computedStyleHasUnsafeVisibleLayout(computed, allowNonzeroPolygonClip) {
+    if (!computed) return true;
+    const value = (name, property) => String(
+      computed[name] || (computed.getPropertyValue && computed.getPropertyValue(property || name)) || ''
+    ).trim().toLowerCase();
+    const compact = (name, property) => value(name, property).replace(/\s+/g, '');
+    const display = value('display');
+    const visibility = value('visibility');
+    const contentVisibility = value('contentVisibility', 'content-visibility');
+    if (display === 'none' || contentVisibility === 'hidden' ||
+        visibility === 'hidden' || visibility === 'collapse') return true;
+
+    const opacity = Number.parseFloat(value('opacity') || '1');
+    const fontSize = Number.parseFloat(value('fontSize', 'font-size'));
+    if ((Number.isFinite(opacity) && opacity <= 0) ||
+        (Number.isFinite(fontSize) && fontSize <= 0) ||
+        cssColorIsFullyTransparent(value('color')) ||
+        cssColorIsFullyTransparent(value('webkitTextFillColor', '-webkit-text-fill-color'))) return true;
+
+    const clip = value('clip');
+    const clipPath = value('clipPath', 'clip-path') || value('webkitClipPath', '-webkit-clip-path');
+    if (clip && clip !== 'auto') return true;
+    if (clipPath && clipPath !== 'none' &&
+        !(allowNonzeroPolygonClip && cssPolygonHasVisibleArea(clipPath))) return true;
+
+    const position = value('position');
+    const floatValue = value('cssFloat', 'float') || value('float');
+    const filter = compact('filter');
+    const transform = compact('transform');
+    const scale = compact('scale');
+    const rotate = compact('rotate');
+    const translate = compact('translate');
+    const perspective = compact('perspective');
+    const safeScale = !scale || scale === 'none' || /^(?:1|1\.0+)(?:\s+(?:1|1\.0+))?$/u.test(scale);
+    const safeRotate = !rotate || rotate === 'none' || /^(?:0|0(?:deg|grad|rad|turn))$/u.test(rotate);
+    const safeTranslate = !translate || translate === 'none' ||
+      /^(?:0|0(?:px|em|rem|%))(?:\s+(?:0|0(?:px|em|rem|%)))?$/u.test(translate);
+    if (/^(?:absolute|fixed)$/u.test(position) || (floatValue && floatValue !== 'none') ||
+        (filter && filter !== 'none') || (transform && transform !== 'none') ||
+        !safeScale || !safeRotate || !safeTranslate ||
+        (perspective && perspective !== 'none')) return true;
+
+    const zoom = compact('zoom');
+    if (zoom && !/^(?:normal|1|1\.0+|100%)$/u.test(zoom)) return true;
+    const maskImage = compact('maskImage', 'mask-image');
+    const webkitMaskImage = compact('webkitMaskImage', '-webkit-mask-image');
+    if ((maskImage && maskImage !== 'none') || (webkitMaskImage && webkitMaskImage !== 'none')) return true;
+    const overflow = value('overflow');
+    const overflowX = value('overflowX', 'overflow-x');
+    const overflowY = value('overflowY', 'overflow-y');
+    const clippedOverflow = [overflow, overflowX, overflowY]
+      .some((item) => /^(?:hidden|clip|scroll|auto)$/u.test(item));
+    const width = Number.parseFloat(value('width'));
+    const height = Number.parseFloat(value('height'));
+    if (clippedOverflow && ((Number.isFinite(width) && width <= 0) ||
+        (Number.isFinite(height) && height <= 0))) return true;
+    const contain = value('contain');
+    if (contain && contain !== 'none') return true;
+    const textIndent = compact('textIndent', 'text-indent');
+    if (textIndent && !/^(?:0|0(?:px|em|rem|%))$/u.test(textIndent)) return true;
+
+    const textTransform = value('textTransform', 'text-transform');
+    const textSecurity = value('webkitTextSecurity', '-webkit-text-security');
+    const fontVariant = value('fontVariant', 'font-variant');
+    const fontVariantCaps = value('fontVariantCaps', 'font-variant-caps');
+    if ((textTransform && textTransform !== 'none') || (textSecurity && textSecurity !== 'none') ||
+        (fontVariant && fontVariant !== 'normal' && fontVariant !== 'none') ||
+        (fontVariantCaps && fontVariantCaps !== 'normal')) return true;
+    return false;
+  }
+
   function independentVisibleMathText(root) {
     if (!root || !root.querySelector) return '';
     const candidate = (root.matches && root.matches('.katex-html, mjx-container, .visual-layout, .math-visual, svg'))
       ? root
       : root.querySelector('.katex-html, mjx-container, .visual-layout, .math-visual, svg, [aria-hidden="true"]');
-    const candidateText = cleanClipboardText(candidate && candidate.textContent || '');
+    const independentlyVisibleText = (container) => {
+      if (!container) return '';
+      const view = container.ownerDocument && container.ownerDocument.defaultView;
+      if (!view || typeof view.getComputedStyle !== 'function') return '';
+      const chunks = [];
+      let length = 0;
+      let visited = 0;
+      const stack = [container];
+      while (stack.length) {
+        const node = stack.pop();
+        if (!node) continue;
+        visited += 1;
+        if (visited > MAX_MATHML_NODES) return '';
+        if (node.nodeType === 3) {
+          const value = node.nodeValue || '';
+          length += value.length;
+          if (length > MAX_MATH_SOURCE_LENGTH) return '';
+          chunks.push(value);
+          continue;
+        }
+        if (node.nodeType !== 1 && node.nodeType !== 11) continue;
+        if (node.nodeType === 1) {
+          if (isVisuallyHiddenElement(node)) continue;
+          try {
+            const computed = view.getComputedStyle(node);
+            // MathJax clips each visible font glyph to a nonzero polygon. It
+            // is the sole clip shape accepted here; every other clip/mask or
+            // layout transform is ambiguous and must not authenticate hidden
+            // source metadata.
+            if (computedStyleHasUnsafeVisibleLayout(computed, true)) continue;
+          } catch (_error) {
+            return '';
+          }
+        }
+        for (let child = node.lastChild; child; child = child.previousSibling) stack.push(child);
+      }
+      return chunks.join('');
+    };
+    const candidateText = cleanClipboardText(independentlyVisibleText(candidate));
     if (candidateText) return candidateText;
     // With no semantic MathML present, ordinary descendant text is the only
     // independent evidence for a data-latex/data-tex annotation. Attribute-
     // only image/ARIA formulas intentionally return empty here because their
     // source is also their sole accessible representation.
-    return cleanClipboardText(root.textContent || '');
+    return cleanClipboardText(independentlyVisibleText(root));
+  }
+
+  function semanticOrderedMathJaxVisibleText(root) {
+    if (!root || !root.querySelectorAll) return '';
+    const leaves = Array.from(root.querySelectorAll('[data-semantic-id]')).filter((element) =>
+      !element.querySelector('[data-semantic-id]')
+    );
+    if (!leaves.length || leaves.length > MAX_MATHML_NODES) return '';
+    const ordered = [];
+    const ids = new Set();
+    for (const leaf of leaves) {
+      const id = Number(leaf.getAttribute('data-semantic-id'));
+      if (!Number.isSafeInteger(id) || id < 0 || ids.has(id)) return '';
+      ids.add(id);
+      const raw = cleanClipboardText(leaf.textContent || '');
+      if (!raw) continue;
+      let visible = independentVisibleMathText(leaf);
+      if (!visible) return '';
+      if (leaf.closest) {
+        const scripted = leaf.closest('mjx-mover, mjx-munder');
+        if (scripted) {
+          if (/^[―‾¯]+$/u.test(visible)) {
+            visible = scripted.localName === 'mjx-munder' ? '\u0332' : '\u0305';
+          } else if (/^⏞+$/u.test(visible) && scripted.localName === 'mjx-mover') {
+            visible = '\u0305';
+          } else if (/^⏟+$/u.test(visible) && scripted.localName === 'mjx-munder') {
+            visible = '\u0332';
+          } else if (/^[−-]*→$/u.test(visible) && scripted.localName === 'mjx-mover') {
+            visible = '\u20d7';
+          } else if (/^←[−-]*$/u.test(visible) && scripted.localName === 'mjx-mover') {
+            visible = '\u20d6';
+          }
+        }
+      }
+      ordered.push({ id, text: visible });
+    }
+    ordered.sort((left, right) => left.id - right.id);
+    return ordered.map((item) => item.text).join('').replace(/[\u2061-\u2064]/g, '');
+  }
+
+  const MATHJAX_CHTML_STRUCTURAL_SELECTOR = [
+    'mjx-msup', 'mjx-msub', 'mjx-msubsup', 'mjx-mmultiscripts',
+    'mjx-mfrac', 'mjx-msqrt', 'mjx-mroot',
+    'mjx-mover', 'mjx-munder', 'mjx-munderover', 'mjx-mtable'
+  ].join(',');
+
+  const LATEX_OVER_STRUCTURE_COMMANDS = new Set([
+    'acute', 'bar', 'breve', 'check', 'ddot', 'dot', 'grave', 'hat',
+    'mathring', 'overbrace', 'overgroup', 'overleftarrow',
+    'overleftrightarrow', 'overline', 'overlinesegment', 'overparen',
+    'overrightarrow', 'overset', 'stackrel', 'tilde', 'vec', 'widehat',
+    'widetilde'
+  ]);
+
+  const LATEX_UNDER_STRUCTURE_COMMANDS = new Set([
+    'underbar', 'underbrace', 'undergroup', 'underleftarrow',
+    'underleftrightarrow', 'underline', 'underlinesegment', 'underparen',
+    'underrightarrow', 'underset'
+  ]);
+
+  const LATEX_FRACTION_STRUCTURE_COMMANDS = new Set([
+    'above', 'atop', 'binom', 'brace', 'brack', 'cfrac', 'choose', 'dbinom',
+    'dfrac', 'frac', 'genfrac', 'over', 'tbinom', 'tfrac'
+  ]);
+
+  const LATEX_TABLE_ENVIRONMENTS = new Set([
+    'align', 'align*', 'aligned', 'alignedat', 'array', 'bmatrix', 'bmatrix*',
+    'cases', 'dcases', 'displaylines', 'eqnarray', 'eqnarray*', 'gather',
+    'gather*', 'gathered', 'matrix', 'matrix*', 'multline', 'multline*',
+    'pmatrix', 'pmatrix*', 'smallmatrix', 'split', 'subarray', 'vmatrix',
+    'vmatrix*', 'vsmallmatrix'
+  ]);
+
+  const LATEX_TEXT_STRUCTURE_COMMANDS = new Set([
+    'hbox', 'mbox', 'operatorname', 'operatorname*', 'text', 'textnormal',
+    'textrm', 'textsf', 'texttt'
+  ]);
+
+  function emptyMathJaxChtmlStructure() {
+    return {
+      sup: 0, sub: 0, fraction: 0, squareRoot: 0, indexedRoot: 0,
+      over: 0, under: 0, table: 0, overKinds: [], underKinds: [], invalid: false
+    };
+  }
+
+  function skipLatexBalancedStructure(source, position, opening, closing, budget) {
+    if (source[position] !== opening) return position;
+    let depth = 1;
+    let cursor = position + 1;
+    while (cursor < source.length && depth > 0) {
+      budget.steps += 1;
+      if (budget.steps > MAX_LATEX_PARSE_STEPS) return -1;
+      const character = source[cursor];
+      if (character === '\\') {
+        cursor += Math.min(2, source.length - cursor);
+        continue;
+      }
+      if (character === opening) depth += 1;
+      else if (character === closing) depth -= 1;
+      cursor += 1;
+    }
+    return depth === 0 ? cursor : -1;
+  }
+
+  function readLatexStructureCommand(source, position) {
+    if (source[position] !== '\\' || position + 1 >= source.length) {
+      return { name: '', end: position + 1 };
+    }
+    const next = source[position + 1];
+    if (!/[A-Za-z]/u.test(next)) return { name: next, end: position + 2 };
+    let cursor = position + 2;
+    while (cursor < source.length && /[A-Za-z]/u.test(source[cursor])) cursor += 1;
+    if (source[cursor] === '*') cursor += 1;
+    return { name: source.slice(position + 1, cursor), end: cursor };
+  }
+
+  function latexStructuralSignature(input, topLevelOnly, aggregate) {
+    if (aggregate) {
+      const rawInput = String(input == null ? '' : input);
+      if (aggregate.exhausted) {
+        const rejected = emptyMathJaxChtmlStructure();
+        rejected.invalid = true;
+        return rejected;
+      }
+      const cache = topLevelOnly ? aggregate.topLevel : aggregate.complete;
+      if (cache.has(rawInput)) return cache.get(rawInput);
+      if (rawInput.length > aggregate.remainingCharacters) {
+        aggregate.exhausted = true;
+        const rejected = emptyMathJaxChtmlStructure();
+        rejected.invalid = true;
+        return rejected;
+      }
+      aggregate.remainingCharacters -= rawInput.length;
+      const parsed = latexStructuralSignature(rawInput, topLevelOnly, null);
+      cache.set(rawInput, parsed);
+      return parsed;
+    }
+    const signature = emptyMathJaxChtmlStructure();
+    const source = stripLatexDelimiters(String(input == null ? '' : input));
+    if (!source || source.length > MAX_MATH_SOURCE_LENGTH) {
+      signature.invalid = true;
+      return signature;
+    }
+    const budget = { steps: 0 };
+    let braceDepth = 0;
+    let cursor = 0;
+    const atRequestedDepth = () => !topLevelOnly || braceDepth === 0;
+    const characterIsEscaped = (position) => {
+      let slashes = 0;
+      for (let index = position - 1; index >= 0 && source[index] === '\\'; index -= 1) slashes += 1;
+      return slashes % 2 === 1;
+    };
+    while (cursor < source.length) {
+      budget.steps += 1;
+      if (budget.steps > MAX_LATEX_PARSE_STEPS) {
+        signature.invalid = true;
+        return signature;
+      }
+      const character = source[cursor];
+      if (character === '%' && !characterIsEscaped(cursor)) {
+        const newline = source.slice(cursor).search(/[\r\n]/u);
+        cursor = newline < 0 ? source.length : cursor + newline + 1;
+        continue;
+      }
+      if (character === '{') {
+        braceDepth += 1;
+        if (braceDepth > MAX_LATEX_PARSE_DEPTH) signature.invalid = true;
+        cursor += 1;
+        continue;
+      }
+      if (character === '}') {
+        if (braceDepth === 0) signature.invalid = true;
+        else braceDepth -= 1;
+        cursor += 1;
+        continue;
+      }
+      if ((character === '^' || character === '_') && atRequestedDepth()) {
+        signature[character === '^' ? 'sup' : 'sub'] += 1;
+        cursor += 1;
+        continue;
+      }
+      if (character === "'" && atRequestedDepth()) {
+        signature.sup += 1;
+        do { cursor += 1; } while (source[cursor] === "'");
+        continue;
+      }
+      if (character !== '\\') {
+        cursor += 1;
+        continue;
+      }
+      const command = readLatexStructureCommand(source, cursor);
+      cursor = command.end;
+      if (!command.name) continue;
+      const commandAtRequestedDepth = atRequestedDepth();
+      if (LATEX_TEXT_STRUCTURE_COMMANDS.has(command.name)) {
+        while (cursor < source.length && /\s/u.test(source[cursor])) cursor += 1;
+        if (source[cursor] === '{') {
+          const end = skipLatexBalancedStructure(source, cursor, '{', '}', budget);
+          if (end < 0) {
+            signature.invalid = true;
+            return signature;
+          }
+          cursor = end;
+        }
+        continue;
+      }
+      if (command.name === 'verb' || command.name === 'verb*') {
+        const delimiter = source[cursor] || '';
+        if (delimiter) {
+          const end = source.indexOf(delimiter, cursor + 1);
+          cursor = end < 0 ? source.length : end + 1;
+        }
+        continue;
+      }
+      if (command.name === 'begin' || command.name === 'end') {
+        while (cursor < source.length && /\s/u.test(source[cursor])) cursor += 1;
+        if (source[cursor] !== '{') {
+          signature.invalid = true;
+          return signature;
+        }
+        const end = skipLatexBalancedStructure(source, cursor, '{', '}', budget);
+        if (end < 0) {
+          signature.invalid = true;
+          return signature;
+        }
+        const environment = source.slice(cursor + 1, end - 1).trim().toLowerCase();
+        if (command.name === 'begin' && commandAtRequestedDepth && LATEX_TABLE_ENVIRONMENTS.has(environment)) {
+          signature.table += 1;
+        }
+        cursor = end;
+        continue;
+      }
+      if (!commandAtRequestedDepth) continue;
+      const bareName = command.name.replace(/\*$/u, '');
+      if (bareName === 'sp') signature.sup += 1;
+      if (bareName === 'sb') signature.sub += 1;
+      if (bareName === 'prescript') {
+        signature.sup += 1;
+        signature.sub += 1;
+      }
+      if (LATEX_FRACTION_STRUCTURE_COMMANDS.has(command.name) ||
+          LATEX_FRACTION_STRUCTURE_COMMANDS.has(bareName)) signature.fraction += 1;
+      if (bareName === 'sqrt') {
+        let optional = cursor;
+        while (optional < source.length && /\s/u.test(source[optional])) optional += 1;
+        signature[source[optional] === '[' ? 'indexedRoot' : 'squareRoot'] += 1;
+      }
+      if (LATEX_OVER_STRUCTURE_COMMANDS.has(command.name) ||
+          LATEX_OVER_STRUCTURE_COMMANDS.has(bareName)) {
+        signature.over += 1;
+        signature.overKinds.push(bareName);
+      }
+      if (LATEX_UNDER_STRUCTURE_COMMANDS.has(command.name) ||
+          LATEX_UNDER_STRUCTURE_COMMANDS.has(bareName)) {
+        signature.under += 1;
+        signature.underKinds.push(bareName);
+      }
+      if (bareName === 'substack') signature.table += 1;
+    }
+    if (braceDepth !== 0) signature.invalid = true;
+    return signature;
+  }
+
+  function mathJaxChtmlStructuralSignature(root, aggregate) {
+    const signature = emptyMathJaxChtmlStructure();
+    if (!root || !root.querySelectorAll ||
+        !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) {
+      signature.invalid = true;
+      return signature;
+    }
+    const nodes = Array.from(root.querySelectorAll(MATHJAX_CHTML_STRUCTURAL_SELECTOR));
+    if (nodes.length > MAX_MATHML_NODES) {
+      signature.invalid = true;
+      return signature;
+    }
+    for (const node of nodes) {
+      const name = String(node.localName || '').toLowerCase();
+      if (name === 'mjx-msup') signature.sup += 1;
+      else if (name === 'mjx-msub') signature.sub += 1;
+      else if (name === 'mjx-msubsup') {
+        signature.sub += 1;
+        signature.sup += 1;
+      } else if (name === 'mjx-mmultiscripts') {
+        const ownSource = node.getAttribute && node.getAttribute('data-latex');
+        const scripts = ownSource ? latexStructuralSignature(ownSource, true, aggregate) : null;
+        if (!scripts || scripts.invalid || (!scripts.sup && !scripts.sub)) signature.invalid = true;
+        else {
+          signature.sup += scripts.sup;
+          signature.sub += scripts.sub;
+        }
+      } else if (name === 'mjx-mfrac') signature.fraction += 1;
+      else if (name === 'mjx-msqrt') signature.squareRoot += 1;
+      else if (name === 'mjx-mroot') signature.indexedRoot += 1;
+      else if (name === 'mjx-mtable') signature.table += 1;
+      else {
+        const structuralAncestor = node.parentElement &&
+          node.parentElement.closest(MATHJAX_CHTML_STRUCTURAL_SELECTOR);
+        const associatedSourceFor = (candidate) => {
+          let sourceOwner = candidate;
+          while (sourceOwner && sourceOwner !== root &&
+                 !(sourceOwner.getAttribute && sourceOwner.getAttribute('data-latex'))) {
+            sourceOwner = sourceOwner.parentElement;
+          }
+          return sourceOwner && sourceOwner.getAttribute && sourceOwner.getAttribute('data-latex');
+        };
+        const associatedSource = associatedSourceFor(node);
+        const ownSource = node.getAttribute && node.getAttribute('data-latex');
+        const wrapper = associatedSource ? latexStructuralSignature(associatedSource, true, aggregate) : null;
+        const ownScripts = ownSource ? latexStructuralSignature(ownSource, true, aggregate) : null;
+        if (structuralAncestor && structuralAncestor.localName === name && wrapper) {
+          const ancestorSource = associatedSourceFor(structuralAncestor);
+          const ancestorWrapper = ancestorSource
+            ? latexStructuralSignature(ancestorSource, true, aggregate)
+            : null;
+          const direction = name === 'mjx-munder' ? 'under' : 'over';
+          const sameWrapperKind = ancestorWrapper && !ancestorWrapper.invalid &&
+            wrapper[direction + 'Kinds'].length === 1 &&
+            ancestorWrapper[direction + 'Kinds'].length === 1 &&
+            wrapper[direction + 'Kinds'][0] === ancestorWrapper[direction + 'Kinds'][0];
+          // overbrace/underbrace with an attached annotation is represented
+          // by an outer mover/munder for the annotation and an inner node for
+          // the same brace. Count that authored wrapper once. Truly nested
+          // accents (including hat(vec(x)) and even hat(hat(x))) have no such
+          // top-level script on their ancestor and both remain structural.
+          if (sameWrapperKind && (ancestorWrapper.sup || ancestorWrapper.sub)) continue;
+        }
+        // MathJax uses an unannotated munder inside munderover solely to place
+        // a large operator's lower limit. It is not a second authored under
+        // structure. A genuine nested underline/underbrace has its own
+        // intervening annotated TeX atom and therefore a matching wrapper.
+        if (name === 'mjx-munder' && structuralAncestor &&
+            structuralAncestor.localName === 'mjx-munderover' &&
+            (!wrapper || !wrapper.under)) continue;
+        if (!wrapper || wrapper.invalid) {
+          signature.invalid = true;
+          continue;
+        }
+        if (name === 'mjx-mover') {
+          if (wrapper.over === 1 && !wrapper.under) signature.over += 1;
+          else if (!(ownScripts && !ownScripts.invalid && (ownScripts.sup || ownScripts.sub) &&
+                     wrapper.under === 1 && !wrapper.over)) signature.invalid = true;
+        } else if (name === 'mjx-munder') {
+          if (wrapper.under === 1 && !wrapper.over) signature.under += 1;
+          else if (!(ownScripts && !ownScripts.invalid && (ownScripts.sup || ownScripts.sub) &&
+                     ((wrapper.over === 1 && !wrapper.under) ||
+                      (ownScripts.sub && !ownScripts.sup && !wrapper.over && !wrapper.under)))) {
+            signature.invalid = true;
+          }
+        } else if (name === 'mjx-munderover') {
+          // Large operators carry authored limits in this layout tag. An
+          // annotation-based over/under pair is also accepted when the root
+          // metadata explicitly describes both wrappers.
+          if (wrapper.over || wrapper.under) {
+            signature.over += wrapper.over;
+            signature.under += wrapper.under;
+          } else if (!ownSource) signature.invalid = true;
+        }
+        if (ownScripts) {
+          if (ownScripts.invalid) signature.invalid = true;
+          else {
+            signature.sup += ownScripts.sup;
+            signature.sub += ownScripts.sub;
+          }
+        }
+      }
+      if (Object.values(signature).some((value) => typeof value === 'number' && value > MAX_MATHML_NODES)) {
+        signature.invalid = true;
+      }
+      if (signature.invalid) break;
+    }
+    return signature;
+  }
+
+  const LATEX_LITERAL_PUNCTUATION_COMMANDS = new Map([
+    ['lparen', '('], ['rparen', ')'], ['lbrack', '['], ['rbrack', ']'],
+    ['lbrace', '{'], ['rbrace', '}'], ['langle', '⟨'], ['rangle', '⟩'],
+    ['lvert', '|'], ['rvert', '|'], ['vert', '|'], ['mid', '|'],
+    ['lVert', '‖'], ['rVert', '‖'], ['Vert', '‖'], ['parallel', '‖'],
+    ['colon', ':'], ['slash', '/'], ['ldotp', '.']
+  ]);
+
+  const LATEX_ENVIRONMENT_PUNCTUATION = new Map([
+    ['cases', ['{', '']], ['dcases', ['{', '']],
+    ['pmatrix', ['(', ')']], ['pmatrix*', ['(', ')']],
+    ['bmatrix', ['[', ']']], ['bmatrix*', ['[', ']']],
+    ['Bmatrix', ['{', '}']], ['Bmatrix*', ['{', '}']],
+    ['vmatrix', ['|', '|']], ['vmatrix*', ['|', '|']],
+    ['Vmatrix', ['‖', '‖']], ['Vmatrix*', ['‖', '‖']]
+  ]);
+
+  const LATEX_GENERATED_PUNCTUATION_COMMANDS = new Map([
+    ['binom', '()'], ['dbinom', '()'], ['tbinom', '()'],
+    ['choose', '()'], ['brace', '{}'], ['brack', '[]']
+  ]);
+
+  function punctuationProfile(characters, orderReliable = true) {
+    const ordered = characters.join('');
+    return {
+      ordered,
+      sorted: Array.from(characters).sort().join(''),
+      orderReliable
+    };
+  }
+
+  function punctuationProfilesAgree(expected, visible) {
+    if (!expected || !visible || expected.sorted !== visible.sorted) return false;
+    if (expected.orderReliable) return expected.ordered === visible.ordered;
+    // Generated fences such as \binom are encountered before their arguments
+    // by this bounded scanner, so their complete punctuation order is not
+    // reliable. Still reject reversed `)x(` surfaces: every delimiter family
+    // that is balanced in the source profile must be balanced and oriented in
+    // the independently visible sequence too.
+    for (const [opening, closing] of [['(', ')'], ['[', ']'], ['{', '}'], ['⟨', '⟩']]) {
+      const expectedOpening = Array.from(expected.ordered).filter((value) => value === opening).length;
+      const expectedClosing = Array.from(expected.ordered).filter((value) => value === closing).length;
+      if (!expectedOpening || expectedOpening !== expectedClosing) continue;
+      let depth = 0;
+      for (const value of visible.ordered) {
+        if (value === opening) depth += 1;
+        else if (value === closing) {
+          depth -= 1;
+          if (depth < 0) return false;
+        }
+      }
+      if (depth !== 0) return false;
+    }
+    return true;
+  }
+
+  function canonicalVisiblePunctuationProfile(input) {
+    let value = String(input == null ? '' : input);
+    try { value = value.normalize('NFKC'); } catch (_error) { /* retain source */ }
+    const punctuation = [];
+    for (const character of value) {
+      if (/[|∣❘]/u.test(character)) punctuation.push('|');
+      else if (/[∥‖]/u.test(character)) punctuation.push('‖');
+      else if ('()[]{}⟨⟩/.,:;'.includes(character)) punctuation.push(character);
+    }
+    return punctuationProfile(punctuation);
+  }
+
+  function latexVisiblePunctuationProfile(input) {
+    const source = stripLatexDelimiters(String(input == null ? '' : input));
+    if (!source || source.length > MAX_MATH_SOURCE_LENGTH) return null;
+    const punctuation = [];
+    let orderReliable = true;
+    const ignoredSquareBrackets = new Set();
+    let cursor = 0;
+    let steps = 0;
+    const add = (value) => {
+      for (const character of value || '') punctuation.push(character);
+    };
+    const skipWhitespace = (position) => {
+      while (position < source.length && /\s/u.test(source[position])) position += 1;
+      return position;
+    };
+    const markOptionalSquareBrackets = (position) => {
+      const opening = skipWhitespace(position);
+      if (source[opening] !== '[') return;
+      let depth = 1;
+      let index = opening + 1;
+      while (index < source.length && depth > 0) {
+        steps += 1;
+        if (steps > MAX_LATEX_PARSE_STEPS) return;
+        if (source[index] === '\\') {
+          index += Math.min(2, source.length - index);
+          continue;
+        }
+        if (source[index] === '[') depth += 1;
+        else if (source[index] === ']') depth -= 1;
+        index += 1;
+      }
+      if (depth === 0) {
+        ignoredSquareBrackets.add(opening);
+        ignoredSquareBrackets.add(index - 1);
+      }
+    };
+    while (cursor < source.length) {
+      steps += 1;
+      if (steps > MAX_LATEX_PARSE_STEPS) return null;
+      const character = source[cursor];
+      if (character === '%') {
+        let slashes = 0;
+        for (let index = cursor - 1; index >= 0 && source[index] === '\\'; index -= 1) slashes += 1;
+        if (slashes % 2 === 0) {
+          const newline = source.slice(cursor).search(/[\r\n]/u);
+          cursor = newline < 0 ? source.length : cursor + newline + 1;
+          continue;
+        }
+      }
+      if (character !== '\\') {
+        if (!ignoredSquareBrackets.has(cursor) && !'{}'.includes(character) &&
+            '()[]⟨⟩|/.,:;'.includes(character)) add(character);
+        cursor += 1;
+        continue;
+      }
+      const command = readLatexStructureCommand(source, cursor);
+      cursor = command.end;
+      if (!command.name) continue;
+      if (command.name.length === 1 && !/[A-Za-z]/u.test(command.name)) {
+        if (command.name === '{' || command.name === '}') add(command.name);
+        else if (command.name === '|') add('‖');
+        continue;
+      }
+      const bareName = command.name.replace(/\*$/u, '');
+      if (LATEX_LITERAL_PUNCTUATION_COMMANDS.has(command.name)) {
+        add(LATEX_LITERAL_PUNCTUATION_COMMANDS.get(command.name));
+      } else if (LATEX_LITERAL_PUNCTUATION_COMMANDS.has(bareName)) {
+        add(LATEX_LITERAL_PUNCTUATION_COMMANDS.get(bareName));
+      }
+      // TeX supplies these fences around operands that appear before/after
+      // the command or in later arguments. Count the exact generated pair,
+      // then use the bounded visible-balance check above for orientation.
+      const generatedPair = LATEX_GENERATED_PUNCTUATION_COMMANDS.get(bareName);
+      if (generatedPair) {
+        add(generatedPair);
+        orderReliable = false;
+      }
+      // \genfrac's first two arguments carry its optional delimiters. The
+      // ordinary scan below observes literal or command delimiters, but they
+      // precede the numerator and denominator in source order.
+      if (bareName === 'genfrac') orderReliable = false;
+      if (bareName === 'sqrt') markOptionalSquareBrackets(cursor);
+      if (['left', 'right', 'middle', 'big', 'Big', 'bigg', 'Bigg',
+        'bigl', 'bigr', 'Bigl', 'Bigr', 'biggl', 'biggr', 'Biggl', 'Biggr'].includes(command.name)) {
+        const delimiter = skipWhitespace(cursor);
+        if (source[delimiter] === '.') cursor = delimiter + 1;
+      }
+      if (command.name === 'begin' || command.name === 'end') {
+        const opening = skipWhitespace(cursor);
+        if (source[opening] !== '{') return null;
+        const budget = { steps };
+        const end = skipLatexBalancedStructure(source, opening, '{', '}', budget);
+        steps = budget.steps;
+        if (end < 0) return null;
+        const environment = source.slice(opening + 1, end - 1).trim();
+        const generated = LATEX_ENVIRONMENT_PUNCTUATION.get(environment);
+        if (generated) add(generated[command.name === 'begin' ? 0 : 1]);
+        cursor = end;
+      }
+    }
+    return punctuationProfile(punctuation, orderReliable);
+  }
+
+  function normalizeMathJaxStructuralSource(source) {
+    const value = String(source == null ? '' : source).trim();
+    const subarray = value.match(/^\\begin\{subarray\}\{[^{}]*\}([\s\S]*)\\end\{subarray\}$/u);
+    return subarray ? '\\substack{' + subarray[1] + '}' : value;
+  }
+
+  function latexSubstackSources(input) {
+    const source = stripLatexDelimiters(String(input == null ? '' : input));
+    const values = [];
+    let cursor = 0;
+    let steps = 0;
+    while (cursor < source.length && values.length < MAX_LATEX_PARSE_DEPTH) {
+      steps += 1;
+      if (steps > MAX_LATEX_PARSE_STEPS) return [];
+      const match = source.slice(cursor).match(/\\substack\s*\{/u);
+      if (!match) break;
+      const start = cursor + match.index;
+      const opening = start + match[0].lastIndexOf('{');
+      const budget = { steps };
+      const end = skipLatexBalancedStructure(source, opening, '{', '}', budget);
+      steps = budget.steps;
+      if (end < 0) return [];
+      values.push(source.slice(start, end));
+      cursor = end;
+    }
+    return values;
+  }
+
+  function directMathJaxChtmlTopologyAgrees(root, source, aggregate) {
+    const directMath = root && root.matches && root.matches('mjx-container')
+      ? Array.from(root.children || []).find((child) => child.matches && child.matches('mjx-math[data-latex]'))
+      : null;
+    if (!directMath) return false;
+    const rootFaithful = faithfulAgreementKey(latexToFaithful(source));
+    const rootCalculator = faithfulAgreementKey(latexToCalculator(source));
+    if (!rootFaithful || rootFaithful.includes('\\') || !rootCalculator || rootCalculator.includes('\\')) return false;
+    const nodes = Array.from(root.querySelectorAll(MATHJAX_CHTML_STRUCTURAL_SELECTOR));
+    const substackSources = latexSubstackSources(source);
+    const cache = new Map();
+    let remainingCharacters = MAX_LATEX_PARSE_STEPS * 4;
+    const canonicalCandidate = (rawSource) => {
+      const normalizedSource = normalizeMathJaxStructuralSource(rawSource);
+      if (cache.has(normalizedSource)) return cache.get(normalizedSource);
+      if (!normalizedSource || normalizedSource.length > remainingCharacters) return null;
+      remainingCharacters -= normalizedSource.length;
+      const value = {
+        faithful: faithfulAgreementKey(latexToFaithful(normalizedSource)),
+        calculator: faithfulAgreementKey(latexToCalculator(normalizedSource))
+      };
+      cache.set(normalizedSource, value);
+      return value;
+    };
+    for (const node of nodes) {
+      const name = String(node.localName || '').toLowerCase();
+      // MathJax emits prime scripts as layout-only msup nodes without their own
+      // TeX annotation. Their visible prime glyph plus the global script count
+      // and ordered anchors fully identify them; every other structural node
+      // must have a renderer-owned subexpression below the direct root source.
+      if (/^mjx-msu(?:p|b|bsup)$/u.test(name)) {
+        const script = node.querySelector && node.querySelector('mjx-script');
+        const scriptText = cleanClipboardText(script && script.textContent || '');
+        if (scriptText && /^[\u2032-\u2034']+$/u.test(scriptText)) continue;
+      }
+      let owner = node;
+      while (owner && owner !== directMath &&
+             !(owner.getAttribute && owner.getAttribute('data-latex'))) owner = owner.parentElement;
+      if (!owner || owner === directMath) return false;
+      const rawCandidate = owner.getAttribute('data-latex');
+      const hasSubarrayPlaceholder = /(?:^|[^A-Za-z])\{subarray\}/u.test(rawCandidate);
+      const candidateSources = hasSubarrayPlaceholder && substackSources.length
+        ? substackSources.map((substack) => rawCandidate.replace(
+          /(^|[^A-Za-z])\{subarray\}/gu,
+          (_match, prefix) => prefix + substack
+        ))
+        : [rawCandidate];
+      const requiresCalculator = [
+        'mjx-msup', 'mjx-msub', 'mjx-msubsup', 'mjx-mmultiscripts', 'mjx-mfrac'
+      ].includes(name);
+      const candidateAgrees = candidateSources.some((candidateSource) => {
+        const candidate = canonicalCandidate(candidateSource);
+        if (!candidate || !candidate.faithful || candidate.faithful.includes('\\') ||
+            !rootFaithful.includes(candidate.faithful)) return false;
+        return !requiresCalculator || (candidate.calculator && !candidate.calculator.includes('\\') &&
+          rootCalculator.includes(candidate.calculator));
+      });
+      if (!candidateAgrees) return false;
+    }
+    if (aggregate && aggregate.exhausted) return false;
+    return true;
+  }
+
+  function directMathJaxChtmlStructureAgrees(root, source) {
+    // A root and its renderer-owned subexpression annotations often repeat
+    // the same TeX. Memoize those parses, and cap the total amount of unique
+    // metadata inspected so a hostile tree cannot force nodes × source-length
+    // work. Exhaustion declines the rewrite instead of partially agreeing.
+    const aggregate = {
+      remainingCharacters: MAX_LATEX_PARSE_STEPS * 4,
+      complete: new Map(),
+      topLevel: new Map(),
+      exhausted: false
+    };
+    const expected = latexStructuralSignature(source, false, aggregate);
+    if (expected.invalid) return false;
+    const visible = mathJaxChtmlStructuralSignature(root, aggregate);
+    if (visible.invalid) return false;
+    if (!['sup', 'sub', 'fraction', 'squareRoot', 'indexedRoot', 'over', 'under', 'table']
+      .every((key) => expected[key] === visible[key])) return false;
+    if (!directMathJaxChtmlTopologyAgrees(root, source, aggregate)) return false;
+    return true;
   }
 
   function sourceOnlyMathAgreesWithVisible(root, pageWindow) {
     const source = getMathSource(root, pageWindow);
     const visible = independentVisibleMathText(root);
-    if (!source || !visible) return true;
+    if (!source) return true;
+    // Metadata with no independently selected surface is not a formula the
+    // user could see or drag across. Never inject a hidden data-latex value
+    // into otherwise ordinary prose merely because an empty renderer-shaped
+    // container intersects the range.
+    if (!visible) return false;
     const faithfulSource = latexToFaithful(source);
     if (!faithfulSource || faithfulSource.includes('\\')) return false;
-    const sourceSignature = semanticVisibleAnchorSignature(faithfulSource);
+    // Authored punctuation is semantic content too. Apply this check to every
+    // source-backed renderer, not only direct MathJax CHTML: otherwise stale
+    // SVG/data-latex metadata could inject a slash, decimal point, fence, or
+    // separator that the selected surface did not contain. A renderer may
+    // already expose this userscript's exact faithful linearization, which
+    // legitimately synthesizes a fraction slash and grouping parentheses;
+    // that complete text equality authenticates the surface directly.
+    if (mathSelectionKey(faithfulSource) !== mathSelectionKey(visible)) {
+      const expectedPunctuation = latexVisiblePunctuationProfile(source);
+      const visiblePunctuation = canonicalVisiblePunctuationProfile(visible);
+      if (!punctuationProfilesAgree(expectedPunctuation, visiblePunctuation)) return false;
+    }
+    // Unicode linearization carries the same operand anchors without adding
+    // readable structural words such as `overline(...)` or `hat(...)` for a
+    // compound base. Those words belong in the copied result, not in the
+    // source-versus-glyph agreement signature.
+    const unicodeSource = latexToVisibleAgreement(source);
+    const sourceAnchorText = unicodeSource && !unicodeSource.includes('\\')
+      ? unicodeSource
+      : faithfulSource;
+    const sourceSignature = semanticVisibleAnchorSignature(sourceAnchorText);
     const visibleSignature = semanticVisibleAnchorSignature(visible);
     if (sourceSignature.overBudget || visibleSignature.overBudget) return false;
+    const directChtmlSources = root.matches && root.matches('mjx-container')
+      ? Array.from(root.children || []).filter((child) =>
+        child.matches && child.matches('mjx-math[data-latex]'))
+      : [];
+    let accentVisibleSignature = visibleSignature;
+    if (directChtmlSources.length === 1) {
+      if (!directMathJaxChtmlStructureAgrees(root, source)) return false;
+      // MathJax CHTML keeps ordinary token order in its visible glyph tree;
+      // only layout marks such as an overscript move around their base. For
+      // this exact renderer shape, order-free multisets would let stale `x-y`
+      // metadata replace visible `y-x`, so require the ordered anchors too.
+      const layoutReordersText = Boolean(root.querySelector && root.querySelector(
+        'mjx-msubsup, mjx-mmultiscripts, mjx-munderover, mjx-mover, mjx-munder'
+      ));
+      const orderedVisibleText = layoutReordersText
+        ? semanticOrderedMathJaxVisibleText(root)
+        : visible;
+      if (!orderedVisibleText) return false;
+      const orderedVisibleSignature = semanticVisibleAnchorSignature(orderedVisibleText);
+      accentVisibleSignature = orderedVisibleSignature;
+      if (orderedVisibleSignature.overBudget ||
+          sourceSignature.orderedIdentifiers !== orderedVisibleSignature.orderedIdentifiers ||
+          sourceSignature.orderedAccents !== orderedVisibleSignature.orderedAccents) return false;
+      if (!sourceSignature.uncertainOperators && !orderedVisibleSignature.uncertainOperators &&
+          sourceSignature.orderedOperators !== orderedVisibleSignature.orderedOperators) return false;
+    } else {
+      // SVG and generic source-backed renderers can expose vertical fraction
+      // or table boxes in a different DOM order. Outside those two explicit
+      // layouts, however, source order is visible order: stale x-y metadata
+      // must never authenticate glyphs that actually read y-x.
+      const structure = latexStructuralSignature(source, false, null);
+      if (structure.invalid) return false;
+      const surfaceMayReorder = Boolean(structure.fraction || structure.table);
+      if (!surfaceMayReorder && (
+        sourceSignature.orderedIdentifiers !== visibleSignature.orderedIdentifiers ||
+        sourceSignature.orderedAccents !== visibleSignature.orderedAccents ||
+        (!sourceSignature.uncertainOperators && !visibleSignature.uncertainOperators &&
+         sourceSignature.orderedOperators !== visibleSignature.orderedOperators)
+      )) return false;
+    }
     if (sourceSignature.identifiers !== visibleSignature.identifiers) return false;
-    if (!sourceSignature.uncertainOperators && !visibleSignature.uncertainOperators &&
-        sourceSignature.operators !== visibleSignature.operators) return false;
+    if (sourceSignature.accents !== accentVisibleSignature.accents) return false;
+    if (!sourceSignature.uncertainOperators && !accentVisibleSignature.uncertainOperators &&
+        sourceSignature.operators !== accentVisibleSignature.operators) return false;
     if (sourceSignature.identifiers || visibleSignature.identifiers) {
       // Grouping symbols such as a fraction slash or radical are synthesized
       // from TeX but often drawn only with CSS/SVG, so compare the order-free
@@ -4503,6 +6153,46 @@
     const sourceKey = mathSelectionKey(faithfulSource);
     const visibleKey = mathSelectionKey(visible);
     return Boolean(sourceKey && sourceKey === visibleKey);
+  }
+
+  function sourceOnlyFallbackLayoutIsSafe(root) {
+    if (!root || root.nodeType !== 1 ||
+        !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return false;
+    // An explicit accessible label is the representation itself; descendant
+    // renderer boxes are irrelevant once the bounded label is selected.
+    const visible = independentVisibleMathText(root);
+    const accessible = root.getAttribute && (root.getAttribute('aria-label') || root.getAttribute('alt'));
+    if (accessible && accessible.length <= MAX_MATH_SOURCE_LENGTH && visible &&
+        mathSelectionKey(accessible) !== mathSelectionKey(visible)) return false;
+    const image = root.querySelector && root.querySelector('img[alt]');
+    const imageAlt = image && image.getAttribute('alt') || '';
+    if (imageAlt && imageAlt.length <= MAX_MATH_SOURCE_LENGTH && visible &&
+        mathSelectionKey(imageAlt) !== mathSelectionKey(visible)) return false;
+
+    const stack = [root];
+    let visited = 0;
+    while (stack.length) {
+      const element = stack.pop();
+      if (!element || element.nodeType !== 1) continue;
+      visited += 1;
+      if (visited > MAX_MATHML_NODES) return false;
+      const tag = (element.localName || '').toLowerCase();
+      // Raw textContent would include these nodes even though the ordinary
+      // serializer correctly drops them. Never promote that hidden content
+      // through a source-less element that merely resembles rendered math.
+      if ((isVisuallyHiddenElement(element) || SKIP_TAGS.has(tag) ||
+          ORDINARY_DROP_CONTENT_TAGS.has(tag)) && (element.textContent || '').trim()) return false;
+      for (let child = element.lastElementChild; child; child = child.previousElementSibling) stack.push(child);
+    }
+    const documentObject = root.ownerDocument;
+    if (!documentObject || !documentObject.createRange) return false;
+    const range = documentObject.createRange();
+    try {
+      range.selectNodeContents(root);
+    } catch (_error) {
+      return false;
+    }
+    return !ordinaryComputedLayoutRisk(range, documentObject);
   }
 
   function extractMathText(root, outputMode, pageWindow) {
@@ -5135,6 +6825,42 @@
         if (!keep) element.removeAttribute(attribute.name);
       }
     }
+    // Plain rewritten text drops boundary-only trailing whitespace and leading
+    // line breaks. Mirror those exact rules in rich HTML so a paste target that
+    // prefers text/html cannot resurrect end-of-selection spaces. Trimming the
+    // boundary text nodes (rather than serialized markup) preserves intentional
+    // whitespace inside paragraphs, tables, formulas, and preformatted islands.
+    const boundaryTextNodes = [];
+    const boundaryStack = Array.from(fragment.childNodes || []).reverse();
+    while (boundaryStack.length && boundaryTextNodes.length <= MAX_RICH_SELECTION_NODES) {
+      const node = boundaryStack.pop();
+      if (!node) continue;
+      if (node.nodeType === 3) boundaryTextNodes.push(node);
+      else {
+        const children = Array.from(node.childNodes || []);
+        for (let index = children.length - 1; index >= 0; index -= 1) boundaryStack.push(children[index]);
+      }
+    }
+    if (boundaryTextNodes.length <= MAX_RICH_SELECTION_NODES) {
+      for (const node of boundaryTextNodes) {
+        const value = String(node.nodeValue || '').replace(/^\n+/u, '');
+        if (value) {
+          node.nodeValue = value;
+          break;
+        }
+        node.remove();
+      }
+      for (let index = boundaryTextNodes.length - 1; index >= 0; index -= 1) {
+        const node = boundaryTextNodes[index];
+        if (!node.parentNode) continue;
+        const value = String(node.nodeValue || '').replace(/[ \t\n]+$/u, '');
+        if (value) {
+          node.nodeValue = value;
+          break;
+        }
+        node.remove();
+      }
+    }
     const documentObject = fragment.ownerDocument;
     const wrapper = documentObject.createElement('div');
     wrapper.appendChild(fragment);
@@ -5303,22 +7029,97 @@
   function semanticVisibleAnchorSignature(input) {
     const rawValue = String(input == null ? '' : input);
     if (rawValue.length > MAX_SELECTION_KEY_LENGTH) {
-      return { identifiers: '', operators: '', glyphs: '', uncertainOperators: true, overBudget: true };
+      return {
+        identifiers: '', orderedIdentifiers: '',
+        operators: '', orderedOperators: '',
+        accents: '', orderedAccents: '',
+        glyphs: '', uncertainOperators: true, overBudget: true
+      };
     }
     let value = rawValue;
     try { value = value.normalize('NFKD'); } catch (_error) { /* keep original */ }
     const identifiers = [];
     const operators = [];
+    const accents = [];
     const glyphs = [];
     let uncertainOperators = /\ue020/u.test(rawValue);
     const canonicalOperators = {
       '-': '−', '−': '−',
-      '·': '⋅', '⋅': '⋅', '∗': '*'
+      '·': '⋅', '⋅': '⋅', '∗': '*',
+      '⁺': '+', '₊': '+', '⁻': '−', '₋': '−', '⁼': '=', '₌': '='
     };
     const stableOperators = new Set(Array.from(
-      '=≠≈≃≅≡<>≤≥±∓+−-×⋅·*∗÷∝∈∉∋∌⊂⊃⊆⊇⊊⊋⊄⊅⊈⊉∪∩∧∨∑∏∐∫∬∭∮∞%!?→←↦⇒⇔⟶⟹⟺'
+      '=⁼₌≠≈≃≅≡<>≤≥±∓+⁺₊−-⁻₋×⋅·*∗÷∝∈∉∋∌⊂⊃⊆⊇⊊⊋⊄⊅⊈⊉∪∩∧∨∑∏∐∫∬∭∮∞%!?→←↦⇒⇔⟶⟹⟺'
     ));
-    for (const character of Array.from(value)) {
+    const accentNames = new Map([
+      ['\u02c6', 'hat'], ['\u0302', 'hat'],
+      ['\u02dc', 'tilde'], ['\u0303', 'tilde'],
+      ['\u00af', 'bar'], ['\u02c9', 'bar'], ['\u0304', 'bar'], ['\u0305', 'bar'],
+      ['\u20d7', 'vec-right'], ['\u20d6', 'vec-left'],
+      ['\u02d9', 'dot'], ['\u0307', 'dot'],
+      ['\u00a8', 'ddot'], ['\u0308', 'ddot'],
+      ['\u00b4', 'acute'], ['\u02ca', 'acute'], ['\u0301', 'acute'],
+      ['`', 'grave'], ['\u02cb', 'grave'], ['\u0300', 'grave'],
+      ['\u02d8', 'breve'], ['\u0306', 'breve'],
+      ['\u02c7', 'check'], ['\u030c', 'check'],
+      ['\u02da', 'ring'], ['\u030a', 'ring'],
+      ['\u02cd', 'underline'], ['\u0332', 'underline']
+    ]);
+    const standaloneAccentGlyphs = new Set(Array.from('ˆ˜¯ˉ˙¨´ˊˋ˘ˇ˚ˍ'));
+    const characters = Array.from(value);
+    const isIdentifierAnchor = (character) =>
+      Boolean(character && !accentNames.has(character) && /^[\p{L}\p{N}]$/u.test(character));
+    const adjacentIdentifier = (start, direction) => {
+      for (let index = start + direction; index >= 0 && index < characters.length; index += direction) {
+        const character = characters[index];
+        if (isIdentifierAnchor(character)) return character;
+        if (accentNames.has(character) || /^[\p{M}\p{Z}]$/u.test(character) ||
+            (/^\p{Cf}$/u.test(character) && !/[\u2061-\u2064]/u.test(character))) continue;
+        return '';
+      }
+      return '';
+    };
+    const groupedPreviousIdentifier = (start) => {
+      let cursor = start - 1;
+      while (cursor >= 0 && (accentNames.has(characters[cursor]) ||
+             /^[\p{M}\p{Z}]$/u.test(characters[cursor]))) cursor -= 1;
+      const openingFor = { ')': '(', ']': '[', '}': '{', '⟩': '⟨', '⌉': '⌈', '⌋': '⌊' };
+      const closing = characters[cursor];
+      const opening = openingFor[closing];
+      if (!opening) return '';
+      let depth = 1;
+      let anchor = '';
+      for (cursor -= 1; cursor >= 0; cursor -= 1) {
+        const character = characters[cursor];
+        if (character === closing) depth += 1;
+        else if (character === opening) {
+          depth -= 1;
+          if (depth === 0) return anchor;
+        } else if (!anchor && isIdentifierAnchor(character)) anchor = character;
+      }
+      return '';
+    };
+    for (let index = 0; index < characters.length; index += 1) {
+      const character = characters[index];
+      const accentName = accentNames.get(character);
+      if (accentName) {
+        // Faithful text stores accents after their base (`z` + U+0302), while
+        // MathJax CHTML places its overscript box first (`ˆ` + `z`). Preserve
+        // the base/accent association so omitted, swapped, or changed accents
+        // can never pass merely because their identifier counts still match.
+        // Compatibility decomposition of a spacing accent such as `¯x`
+        // yields SPACE + combining-mark + `x`; that inserted space proves the
+        // mark is preposed. Otherwise use the previous base when present, so
+        // postposed SVG/MathML text such as `xˊ` remains equivalent too.
+        const explicitlyPreposed = index > 0 && characters[index - 1] === ' ' &&
+          isIdentifierAnchor(characters[index + 1]);
+        const previous = explicitlyPreposed
+          ? ''
+          : (groupedPreviousIdentifier(index) || adjacentIdentifier(index, -1));
+        const anchor = previous || adjacentIdentifier(index, 1) || '?';
+        accents.push(anchor + ':' + accentName);
+        if (standaloneAccentGlyphs.has(character)) continue;
+      }
       if (/^[\p{L}\p{N}]$/u.test(character)) {
         identifiers.push(character);
       }
@@ -5343,18 +7144,26 @@
           structuralGlyphs.has(character)) continue;
       glyphs.push(character);
     }
+    const orderedIdentifiers = identifiers.join('');
+    const orderedOperators = operators.join('');
+    const orderedAccents = accents.join('|');
     identifiers.sort();
     operators.sort();
+    accents.sort();
     glyphs.sort();
     return {
       identifiers: identifiers.join(''),
+      orderedIdentifiers,
       operators: operators.join(''),
+      orderedOperators,
+      accents: accents.join('|'),
+      orderedAccents,
       glyphs: glyphs.join(''),
       uncertainOperators
     };
   }
 
-  function semanticMathAgreesWithVisibleText(math, visibleText) {
+  function semanticMathAgreesWithVisibleText(math, visibleText, requireLinearOrder) {
     if (!math) return true;
     const presentation = presentationMathNode(math);
     if (!presentation) return true;
@@ -5367,15 +7176,66 @@
     // or forged hidden MathML (`x` behind visible `y`) without reintroducing
     // the exact-order bug this userscript exists to repair.
     if (semantic.identifiers !== visible.identifiers) return false;
+    if (visible.accents && semantic.accents !== visible.accents) return false;
     if (!semantic.uncertainOperators && !visible.uncertainOperators &&
         semantic.operators !== visible.operators) return false;
+    if (requireLinearOrder) {
+      if (semantic.orderedIdentifiers !== visible.orderedIdentifiers) return false;
+      if (semantic.orderedAccents !== visible.orderedAccents) return false;
+      if (!semantic.uncertainOperators && !visible.uncertainOperators &&
+          semantic.orderedOperators !== visible.orderedOperators) return false;
+    }
     if (semantic.identifiers || semantic.operators || visible.identifiers || visible.operators) return true;
     return Boolean(semantic.glyphs && semantic.glyphs === visible.glyphs);
   }
 
   function semanticMathAgreesWithVisibleBranch(math, visualBranch) {
     if (!math || !visualBranch || nodeInside(math, visualBranch)) return true;
-    return semanticMathAgreesWithVisibleText(math, visualBranch.textContent || '');
+    const presentation = presentationMathNode(math);
+    // Fractions, indexed roots, accents, tables, and multiscripts can expose a
+    // renderer's vertical box order through Selection. Accept those only for
+    // renderer branches whose deterministic box order we model explicitly;
+    // never fall back to a sorted anchor multiset.
+    const reorderedLayoutSelector = 'mfrac, mroot, mover, munder, munderover, mmultiscripts, mtable';
+    const layoutCanReorder = Boolean(presentation && (
+      (presentation.matches && presentation.matches(reorderedLayoutSelector)) ||
+      (presentation.querySelector && presentation.querySelector(reorderedLayoutSelector))
+    ));
+    const visibleText = visualBranch.textContent || '';
+    const isKatexVisual = Boolean(visualBranch.matches && visualBranch.matches('.katex-html'));
+    const strictKatexVisual = isGenuineKatexVisualBranch(visualBranch);
+    if (!semanticMathAgreesWithVisibleText(math, visibleText, !layoutCanReorder)) return false;
+    if (layoutCanReorder) {
+      const modeledRendererBranch = Boolean(visualBranch.matches && visualBranch.matches(
+        '.katex-html, .visual-layout, .math-visual'
+      ));
+      if (!modeledRendererBranch || !domTreeWithinBudget(presentation, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return false;
+      // KaTeX may build a tall delimiter from Unicode extender pieces next to
+      // the actual semantic fence. Those pieces are renderer scaffolding, not
+      // additional selected math tokens.
+      const visibleKey = mathSelectionKey(visibleText)
+        .replace(/[\u239b-\u239d]+/gu, '(')
+        .replace(/[\u239e-\u23a0]+/gu, ')')
+        .replace(/[\u23a1-\u23a3]+/gu, '[')
+        .replace(/[\u23a4-\u23a6]+/gu, ']')
+        .replace(/[\u23a7-\u23ad]+/gu, (pieces) =>
+          /[\u23a7-\u23a9]/u.test(pieces) ? '{' : (/[\u23ab-\u23ad]/u.test(pieces) ? '}' : '')
+        );
+      if (!visibleKey || visibleKey.length > MAX_SELECTION_KEY_LENGTH ||
+          !rendererOrderedMathMLSurfaceVariants(
+            presentation,
+            isKatexVisual,
+            strictKatexVisual
+          ).includes(visibleKey)) return false;
+    }
+    if (strictKatexVisual) {
+      const visibleSurface = rendererFenceKey(visibleText);
+      const surfaceVariants = rendererOrderedMathMLSurfaceVariants(presentation, true, true)
+        .map(rendererFenceKey);
+      if (!surfaceVariants.includes(visibleSurface) ||
+          !katexMathMLTopologyAgrees(math, visualBranch)) return false;
+    }
+    return true;
   }
 
   function wikipediaMathAgreesWithFallback(root, math) {
@@ -5399,6 +7259,16 @@
       faithfulAgreementKey(unicodeToCalculator(semantic));
   }
 
+  function semanticMathRootAgreesWithVisible(root, math) {
+    if (!wikipediaMathAgreesWithFallback(root, math)) return false;
+    if (!root || !math || !root.querySelector) return true;
+    const katexVisual = root.matches && root.matches('.katex-html')
+      ? root
+      : root.querySelector('.katex-html');
+    return !katexVisual || !isGenuineKatexVisualBranch(katexVisual) || nodeInside(math, katexVisual) ||
+      semanticMathAgreesWithVisibleBranch(math, katexVisual);
+  }
+
   function semanticMathSelectionPayload(root, range, settings, pageWindow) {
     const math = getMathElement(root);
     const selectedText = cleanClipboardText(range.toString());
@@ -5417,7 +7287,14 @@
     if (!domTreeWithinBudget(math, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) {
       return { kind: 'unmatched' };
     }
-    if (!wikipediaMathAgreesWithFallback(root, math)) return { kind: 'unmatched' };
+    // Native MathML is both the semantic source and the visible surface. A
+    // hidden descendant must therefore invalidate every semantic rewrite of
+    // that root; otherwise sanitized MathML would promote text the user could
+    // not see (for example, <mi style="display:none">SECRET</mi>).
+    if (root === math && nativeMathMLPresentationLayoutIsRisky(math)) {
+      return { kind: 'unmatched' };
+    }
+    if (!semanticMathRootAgreesWithVisible(root, math)) return { kind: 'unmatched' };
     const visualBranch = visibleMathBranchForRange(root, range);
     const selectsWholeVisualBranch = visualBranch && visualBranchRepresentsWholeMath(root, visualBranch) &&
       range.startContainer === visualBranch && range.startOffset === 0 &&
@@ -5488,8 +7365,12 @@
   function wholeMathRootPayload(root, settings, pageWindow) {
     const sourceMath = getMathElement(root);
     if (!sourceMath && !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return null;
-    if (!sourceMath && !sourceOnlyMathAgreesWithVisible(root, pageWindow)) return null;
-    if (sourceMath && !wikipediaMathAgreesWithFallback(root, sourceMath)) return null;
+    const sourceText = sourceMath ? '' : getMathSource(root, pageWindow);
+    if (!sourceMath && (!sourceText
+      ? !sourceOnlyFallbackLayoutIsSafe(root)
+      : !sourceOnlyMathAgreesWithVisible(root, pageWindow))) return null;
+    if (sourceMath && root === sourceMath && nativeMathMLPresentationLayoutIsRisky(sourceMath)) return null;
+    if (sourceMath && !semanticMathRootAgreesWithVisible(root, sourceMath)) return null;
     const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
     if (sourceMath && !safeMath) return null;
     const text = settings.outputMode === 'faithful' && safeMath
@@ -5578,6 +7459,55 @@
       .replace(/'/g, '&#39;')
       .replace(/\n/g, '<br>');
     return '<!--StartFragment-->' + escaped + '<!--EndFragment-->';
+  }
+
+  function semanticTextClipboardHTML(input, outputMode) {
+    const source = cleanClipboardText(input);
+    if (outputMode !== 'faithful' && outputMode !== 'unicode') {
+      return plainTextClipboardHTML(source);
+    }
+    const superscriptReverse = Object.fromEntries(
+      Object.entries(SUPERSCRIPTS).map(([plain, script]) => [script, plain])
+    );
+    const subscriptReverse = Object.fromEntries(
+      Object.entries(SUBSCRIPTS).map(([plain, script]) => [script, plain])
+    );
+    // The conversion maps use descriptive keys for Greek subscripts. Rich
+    // HTML should contain the authored glyph, not the word "beta" or "phi".
+    Object.assign(subscriptReverse, {
+      'ₔ': 'ə', 'ᵦ': 'β', 'ᵧ': 'γ', 'ᵨ': 'ρ', 'ᵩ': 'φ', 'ᵪ': 'χ'
+    });
+    const escape = (value) => String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+      .replace(/\n/g, '<br>');
+    let html = '';
+    let scriptKind = '';
+    let scriptText = '';
+    const flushScript = () => {
+      if (!scriptKind) return;
+      html += '<' + scriptKind + '>' + escape(scriptText) + '</' + scriptKind + '>';
+      scriptKind = '';
+      scriptText = '';
+    };
+    for (const character of source) {
+      const nextKind = Object.prototype.hasOwnProperty.call(superscriptReverse, character)
+        ? 'sup'
+        : (Object.prototype.hasOwnProperty.call(subscriptReverse, character) ? 'sub' : '');
+      if (!nextKind) {
+        flushScript();
+        html += escape(character);
+        continue;
+      }
+      if (scriptKind && scriptKind !== nextKind) flushScript();
+      scriptKind = nextKind;
+      scriptText += nextKind === 'sup' ? superscriptReverse[character] : subscriptReverse[character];
+    }
+    flushScript();
+    return '<!--StartFragment-->' + html + '<!--EndFragment-->';
   }
 
   function utf8ByteLength(input) {
@@ -5730,13 +7660,14 @@
       MAX_RICH_SELECTION_NODES,
       MAX_RICH_SELECTION_DEPTH,
       MAX_ORDINARY_SELECTION_MARKUP_LENGTH
-    ) || ordinaryComputedLayoutRisk(expanded, expanded.startContainer.ownerDocument || null)) return null;
+    )) return null;
     const values = originalRoots.map((root) => {
       const sourceMath = getMathElement(root);
       const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
+      const sourceText = sourceMath ? '' : getMathSource(root, pageWindow);
       const sourceAgreement = sourceMath
-        ? wikipediaMathAgreesWithFallback(root, sourceMath)
-        : sourceOnlyMathAgreesWithVisible(root, pageWindow);
+        ? semanticMathRootAgreesWithVisible(root, sourceMath)
+        : Boolean(sourceText) && sourceOnlyMathAgreesWithVisible(root, pageWindow);
       return {
         text: !sourceAgreement || (sourceMath && !safeMath)
           ? ''
@@ -5747,13 +7678,22 @@
               : extractMathText(root, settings.outputMode, pageWindow))),
         display: isDisplayMath(root),
         root,
-        safeMath
+        safeMath,
+        // Only independently sourced semantic math may bypass renderer CSS
+        // inspection. A source-less element that merely resembles a math
+        // container could otherwise hide arbitrary selected prose inside its
+        // subtree and have that hidden text serialized.
+        replaceableForLayout: Boolean((sourceMath && safeMath) || (sourceText && sourceAgreement))
       };
     });
     if (values.some((value) => !value.text || !value.text.trim())) return null;
 
     const documentObject = expanded.startContainer.ownerDocument || null;
-    const textFragment = cloneOrdinaryRangeWithContext(expanded, documentObject);
+    const replaceableMathRoots = new Set(values
+      .filter((value) => value.replaceableForLayout)
+      .map((value) => value.root));
+    if (ordinaryComputedLayoutRisk(expanded, documentObject, replaceableMathRoots)) return null;
+    const textFragment = cloneOrdinaryRangeWithContext(expanded, documentObject, replaceableMathRoots);
     if (!textFragment) return null;
     canonicalMathRoots(textFragment).forEach((root, index) => {
       const value = values[index] || {
@@ -5766,7 +7706,7 @@
     });
     const text = serializeOrdinaryFragment(textFragment).text;
 
-    const richFragment = cloneOrdinaryRangeWithContext(expanded, documentObject);
+    const richFragment = cloneOrdinaryRangeWithContext(expanded, documentObject, replaceableMathRoots);
     if (!richFragment) return null;
     canonicalMathRoots(richFragment).forEach((root, index) => {
       const value = values[index];
@@ -6076,6 +8016,13 @@
     const exact = (count) => Array.isArray(args) && args.length === count;
     const scriptBase = (value) => {
       const base = String(value == null ? '' : value).trim();
+      // Google Docs can put a closing literal fence inside the script
+      // function while leaving its opening fence in the surrounding row. A
+      // lone closing/vertical fence is already an atomic TeX script base;
+      // wrapping it in `{...}` makes the faithful renderer invent parentheses.
+      // Google uses raw Unicode glyphs for several of these, just as it used
+      // a raw `)` in the captured clipboard slice.
+      if (/^\p{Pe}$/u.test(base) || /^(?:\\\}|[|∣❘∥‖‗⌉⌋»])$/u.test(base)) return base;
       if (/^(?:[\p{L}\p{N}\p{M}.]+|\\[A-Za-z]+\s*)$/u.test(base) ||
           (/^\([\s\S]*\)$/u.test(base)) || (/^\[[\s\S]*\]$/u.test(base))) return base;
       return '{' + base + '}';
@@ -6167,6 +8114,18 @@
           }
           const latex = googleDocsFunctionLatex(command, functionArgs, true);
           if (!latex) throw new Error('Invalid Google Docs equation function');
+          // When Docs moves only the closing fence into a script base, close
+          // the matching raw-literal fence in this surrounding sequence too.
+          // This keeps later empty-fence placeholder detection contextual.
+          const scriptedClosingFence = {
+            ')': '(',
+            ']': '[',
+            '\\}': '{'
+          }[functionArgs[0]];
+          if ((command === '\\superscript' || command === '\\subscript' || command === '\\subsuperscript') &&
+              scriptedClosingFence && literalStack[literalStack.length - 1] === scriptedClosingFence) {
+            literalStack.pop();
+          }
           append(latex);
           continue;
         }
@@ -6304,7 +8263,7 @@
     if (!text.trim()) return null;
     return {
       text,
-      html: '',
+      html: semanticTextClipboardHTML(text, settings.outputMode),
       mathML: '',
       reason: 'google-docs-semantic-clipboard',
       mathRanges: equations
@@ -6813,7 +8772,92 @@
     };
   }
 
-  function ordinaryComputedLayoutRisk(range, documentObject) {
+  function replaceableMathMLRootLayoutIsRisky(element, view, documentObject) {
+    if (!element || element.nodeType !== 1 || isVisuallyHiddenElement(element)) return true;
+    let computed;
+    try {
+      computed = view.getComputedStyle(element);
+    } catch (_error) {
+      // jsdom and a few older browser engines cannot compute a declaration
+      // for native MathML. Preserve visible MathML in those engines, but still
+      // parse every authored inline declaration through an HTML CSSStyleDeclaration
+      // so a hidden or repositioned root cannot use that limitation as a bypass.
+      try {
+        const probe = documentObject.createElement('span');
+        probe.setAttribute('style', String(element.getAttribute('style') || ''));
+        computed = probe.style;
+      } catch (_fallbackError) {
+        return true;
+      }
+    }
+    if (computedStyleHasUnsafeVisibleLayout(computed, false)) return true;
+    const visibility = String(computed && computed.visibility || '').toLowerCase();
+    const display = String(computed && computed.display || '').toLowerCase();
+    const contentVisibility = String(computed && computed.contentVisibility || '').toLowerCase();
+    if (display === 'none' || contentVisibility === 'hidden' ||
+        visibility === 'hidden' || visibility === 'collapse') return true;
+
+    const opacity = Number.parseFloat(String(computed && computed.opacity || '1'));
+    const fontSize = Number.parseFloat(String(computed && computed.fontSize || ''));
+    const color = String(computed && computed.color || '').replace(/\s+/g, '').toLowerCase();
+    const textFill = String(computed && (computed.webkitTextFillColor || computed.getPropertyValue &&
+      computed.getPropertyValue('-webkit-text-fill-color')) || '').replace(/\s+/g, '').toLowerCase();
+    if ((Number.isFinite(opacity) && opacity <= 0) || (Number.isFinite(fontSize) && fontSize <= 0) ||
+        color === 'transparent' || /rgba\([^)]*,0(?:\.0+)?\)$/u.test(color) ||
+        textFill === 'transparent' || /rgba\([^)]*,0(?:\.0+)?\)$/u.test(textFill)) return true;
+
+    const clip = String(computed && computed.clip || '').trim().toLowerCase();
+    const clipPath = String(computed && (computed.clipPath || computed.webkitClipPath) || '').trim().toLowerCase();
+    const filter = String(computed && computed.filter || '').trim().toLowerCase();
+    const transform = String(computed && computed.transform || '').trim().toLowerCase();
+    const position = String(computed && computed.position || '').trim().toLowerCase();
+    const floatValue = String(computed && (computed.cssFloat || computed.float) || '').trim().toLowerCase();
+    if ((clip && clip !== 'auto') || (clipPath && clipPath !== 'none') ||
+        (filter && filter !== 'none') || (transform && transform !== 'none') ||
+        /^(?:absolute|fixed)$/u.test(position) || (floatValue && floatValue !== 'none')) return true;
+
+    const textTransform = String(computed && computed.textTransform || '').toLowerCase();
+    const textSecurity = String(computed && (computed.webkitTextSecurity || computed.getPropertyValue &&
+      computed.getPropertyValue('-webkit-text-security')) || '').trim().toLowerCase();
+    const fontVariant = String(computed && computed.fontVariant || '').trim().toLowerCase();
+    const fontVariantCaps = String(computed && computed.fontVariantCaps || '').trim().toLowerCase();
+    if ((textTransform && textTransform !== 'none') || (textSecurity && textSecurity !== 'none') ||
+        (fontVariant && fontVariant !== 'normal' && fontVariant !== 'none') ||
+        (fontVariantCaps && fontVariantCaps !== 'normal')) return true;
+
+    if (/^(?:flex|inline-flex|grid|inline-grid|table|list-item)$/u.test(display)) return true;
+    if (display === 'block' && String(element.getAttribute('display') || '').toLowerCase() !== 'block') return true;
+    return false;
+  }
+
+  function nativeMathMLPresentationLayoutIsRisky(mathElement, viewInput, documentInput) {
+    if (!mathElement || mathElement.nodeType !== 1 ||
+        mathElement.namespaceURI !== MATHML_NAMESPACE) return true;
+    const documentObject = documentInput || mathElement.ownerDocument;
+    const view = viewInput || (documentObject && documentObject.defaultView);
+    if (!documentObject || !view || typeof view.getComputedStyle !== 'function') return true;
+    const stack = [mathElement];
+    let visited = 0;
+    while (stack.length) {
+      const element = stack.pop();
+      if (!element || element.nodeType !== 1 || element.namespaceURI !== MATHML_NAMESPACE) return true;
+      visited += 1;
+      if (visited > MAX_MATHML_NODES) return true;
+      const name = (element.localName || '').toLowerCase();
+      // These nodes have no rendered contribution and every math serializer
+      // already drops their text. TeX annotations in <semantics> must not make
+      // otherwise visible native MathML fail the layout audit.
+      if (['annotation', 'annotation-xml', 'mphantom', 'none', 'mspace'].includes(name)) continue;
+      if (replaceableMathMLRootLayoutIsRisky(element, view, documentObject)) return true;
+      const children = name === 'semantics'
+        ? [presentationMathNode(element)].filter(Boolean)
+        : elementChildren(element);
+      for (let index = children.length - 1; index >= 0; index -= 1) stack.push(children[index]);
+    }
+    return false;
+  }
+
+  function ordinaryComputedLayoutRisk(range, documentObject, replaceableMathRoots) {
     const view = documentObject && documentObject.defaultView;
     if (!range || !view || typeof view.getComputedStyle !== 'function') return true;
     const root = range.commonAncestorContainer && range.commonAncestorContainer.nodeType === 1
@@ -6827,14 +8871,31 @@
       if (!element || element.nodeType !== 1 || !rangeIntersects(range, element)) continue;
       inspected += 1;
       if (inspected > MAX_RICH_SELECTION_NODES) return true;
+      const replaceableMathRoot = Boolean(replaceableMathRoots && replaceableMathRoots.has(element));
+      // These exact roots have already passed sanitized MathML/source-visible
+      // agreement and are replaced before ordinary prose serialization.
+      // MathJax legitimately clips each font glyph and absolutely positions
+      // its speech layer; those renderer internals do not describe the prose
+      // layout and must not make an otherwise safe mixed selection fail. The
+      // root itself is still inspected below so a hidden, clipped, transformed,
+      // or absolutely positioned fake renderer can never gain this exemption.
       const tag = (element.localName || '').toLowerCase();
       // Semantic MathML is replaced from a separately sanitized clone before
       // ordinary prose is serialized. Its renderer-internal layout is not a
       // prose signal, and some DOM engines cannot compute MathML CSS at all.
-      if (element.namespaceURI === MATHML_NAMESPACE) continue;
-      if (ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag) || isVisuallyHiddenElement(element)) continue;
+      if (element.namespaceURI === MATHML_NAMESPACE) {
+        if (replaceableMathRoot &&
+            nativeMathMLPresentationLayoutIsRisky(element, view, documentObject)) return true;
+        continue;
+      }
+      if (ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag)) continue;
+      if (isVisuallyHiddenElement(element)) {
+        if (replaceableMathRoot) return true;
+        continue;
+      }
       try {
         const computed = view.getComputedStyle(element);
+        if (computedStyleHasUnsafeVisibleLayout(computed, false)) return true;
         const visibility = String(computed && computed.visibility || '').toLowerCase();
         const display = String(computed && computed.display || '').toLowerCase();
         const contentVisibility = String(computed && computed.contentVisibility || '').toLowerCase();
@@ -6906,6 +8967,7 @@
         // leave the operation native instead of guessing from source markup.
         return true;
       }
+      if (replaceableMathRoot) continue;
       for (let child = element.lastElementChild; child; child = child.previousElementSibling) {
         stack.push(child);
       }
@@ -6913,13 +8975,13 @@
     return false;
   }
 
-  function cloneOrdinaryRangeWithContext(range, documentObject) {
+  function cloneOrdinaryRangeWithContext(range, documentObject, replaceableMathRoots) {
     if (!rangeDOMWithinBudget(
       range,
       MAX_RICH_SELECTION_NODES,
       MAX_RICH_SELECTION_DEPTH,
       MAX_ORDINARY_SELECTION_MARKUP_LENGTH
-    ) || ordinaryComputedLayoutRisk(range, documentObject)) return null;
+    ) || ordinaryComputedLayoutRisk(range, documentObject, replaceableMathRoots)) return null;
     let contents;
     try {
       contents = range.cloneContents();
@@ -8329,8 +10391,12 @@
     const native = semanticVisibleAnchorSignature(nativeText);
     if (semantic.overBudget || native.overBudget) return false;
     if (semantic.identifiers !== native.identifiers) return false;
+    if (semantic.orderedIdentifiers !== native.orderedIdentifiers) return false;
+    if (semantic.accents !== native.accents || semantic.orderedAccents !== native.orderedAccents) return false;
     if (!semantic.uncertainOperators && !native.uncertainOperators &&
         semantic.operators !== native.operators) return false;
+    if (!semantic.uncertainOperators && !native.uncertainOperators &&
+        semantic.orderedOperators !== native.orderedOperators) return false;
     if (semantic.identifiers || native.identifiers || semantic.operators || native.operators) return true;
     return clipboardPlainAgreementKey(semanticText) === clipboardPlainAgreementKey(nativeText);
   }
@@ -8359,6 +10425,21 @@
     }
   }
 
+  function siteSemanticRichWrites(state, includeDefaultHTML) {
+    const html = state && state.semanticPayload && state.semanticPayload.html;
+    if (!html) return [];
+    const richTypes = new Map(state.nativeRichValues || []);
+    if (includeDefaultHTML && !richTypes.has('text/html')) {
+      richTypes.set('text/html', { type: 'text/html' });
+    }
+    return Array.from(richTypes.values(), (native) => ({
+      type: native.type,
+      text: native.type.toLowerCase() === 'html format'
+        ? clipboardHTMLFormat(html)
+        : html
+    }));
+  }
+
   function applySitePayloadDirect(clipboardData, state) {
     if (!clipboardData || !state || !state.originalSetData || !sitePayloadAgreesWithPlain(state)) return false;
     try {
@@ -8366,6 +10447,14 @@
       for (const type of plainTypes) {
         state.originalSetData.call(clipboardData, type, state.semanticPayload.text);
         markSiteInjectedPlain(state, type);
+      }
+      // Add text/html only when it can be removed during rollback. Existing
+      // rich flavors are always safe to replace because their native values
+      // were captured before the semantic rewrite.
+      const richWrites = siteSemanticRichWrites(state, Boolean(state.originalClearData));
+      for (const write of richWrites) {
+        state.originalSetData.call(clipboardData, write.type, write.text);
+        markSiteInjectedRich(state, write.type);
       }
       return true;
     } catch (_error) {
@@ -8560,6 +10649,9 @@
       state.repairedRendererPlain = '';
       state.nativePlainSeen = false;
     }
+    for (const type of types.filter(siteRichHTMLType)) {
+      recordSiteNativeRich(state, type, clipboardGet(event.clipboardData, type));
+    }
     state.semanticCandidates.clear();
     recomputeSiteSemanticPayload(state);
     for (const type of types) {
@@ -8607,12 +10699,38 @@
       }
       return;
     }
+    const normalizedNativeTypes = new Set(types.map((type) => String(type || '').toLowerCase()));
+    const canClear = typeof event.clipboardData.clearData === 'function';
+    // Write rich formats first and plain text last. A rejection restores every
+    // previously accepted flavor before the event is allowed to continue.
+    const writes = siteSemanticRichWrites(state, canClear);
+    writes.push({ type: plainType, text: state.semanticPayload.text });
+    const nativeValues = new Map();
+    const writtenTypes = [];
     try {
-      event.clipboardData.setData(plainType, state.semanticPayload.text);
+      for (const write of writes) {
+        nativeValues.set(write.type, {
+          existed: normalizedNativeTypes.has(write.type.toLowerCase()),
+          value: clipboardGet(event.clipboardData, write.type)
+        });
+        event.clipboardData.setData(write.type, write.text);
+        writtenTypes.push(write.type);
+      }
       state.rewritten = true;
       event.preventDefault();
     } catch (_error) {
-      // Preserve the site's native clipboard when a browser rejects rewriting.
+      for (let index = writtenTypes.length - 1; index >= 0; index -= 1) {
+        const type = writtenTypes[index];
+        const native = nativeValues.get(type);
+        try {
+          if (native && native.existed) event.clipboardData.setData(type, native.value);
+          else if (canClear) event.clipboardData.clearData(type);
+        } catch (_restoreError) {
+          // Best effort only; the event remains uncancelled so the browser and
+          // site retain control when this non-wrappable fallback is hostile.
+        }
+      }
+      state.rewritten = false;
     }
   }
 
@@ -8718,20 +10836,48 @@
           if (response.action === 'write' && typeof response.text === 'string') {
             const requestedType = response.type || 'text/plain';
             const requestedKey = normalizedType(requestedType);
+            const writes = [];
             if (injectedValues.get(requestedKey) !== response.text) {
-              reflectApply(nativeSet, data, [requestedType, response.text]);
-              injectedValues.set(requestedKey, response.text);
-              if (requestedKey !== 'text/plain') {
-                reflectApply(nativeSet, data, ['text/plain', response.text]);
-                injectedValues.set('text/plain', response.text);
-              }
+              writes.push({ type: requestedType, key: requestedKey, text: response.text });
+            }
+            if (requestedKey !== 'text/plain' && injectedValues.get('text/plain') !== response.text) {
+              writes.push({ type: 'text/plain', key: 'text/plain', text: response.text });
             }
             for (const item of Array.isArray(response.richWrites) ? response.richWrites.slice(0, 2) : []) {
               if (!item || typeof item.type !== 'string' || typeof item.text !== 'string') continue;
               const itemKey = normalizedType(item.type);
               if (injectedValues.get(itemKey) === item.text) continue;
-              reflectApply(nativeSet, data, [item.type, item.text]);
-              injectedValues.set(itemKey, item.text);
+              writes.push({ type: item.type, key: itemKey, text: item.text });
+            }
+            // Every accepted flavor is one transaction. If a browser rejects
+            // a later rich write, restore the site's native values (or remove
+            // newly introduced flavors) before leaving the event uncancelled.
+            if (!nativeClear && writes.some((write) => !nativeValues.has(write.key))) {
+              throw new TypeError('Cannot roll back relayed clipboard write');
+            }
+            const applied = [];
+            try {
+              for (const write of writes) {
+                reflectApply(nativeSet, data, [write.type, write.text]);
+                applied.push(write);
+                injectedValues.set(write.key, write.text);
+              }
+            } catch (writeError) {
+              const restored = new Set();
+              for (let index = applied.length - 1; index >= 0; index -= 1) {
+                const write = applied[index];
+                if (restored.has(write.key)) continue;
+                restored.add(write.key);
+                const native = nativeValues.get(write.key);
+                try {
+                  if (native) reflectApply(nativeSet, data, [native.type, native.value]);
+                  else if (nativeClear) reflectApply(nativeClear, data, [write.type]);
+                } catch (_restoreError) {
+                  // Best effort; never cancel an event after a failed rewrite.
+                }
+                injectedValues.delete(write.key);
+              }
+              throw writeError;
             }
           } else if (response.action === 'restore') {
             for (const item of Array.isArray(response.writes) ? response.writes.slice(0, 4) : []) {
@@ -8944,10 +11090,13 @@
       for (const type of new Set([state.plainType || 'text/plain', 'text/plain'])) {
         markSiteInjectedPlain(state, type);
       }
+      const richWrites = siteSemanticRichWrites(state, true);
+      for (const write of richWrites) markSiteInjectedRich(state, write.type);
       return {
         action: 'write',
         type: state.plainType || 'text/plain',
         text: state.semanticPayload.text,
+        richWrites,
         prevent: Boolean(finalize)
       };
     }

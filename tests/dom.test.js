@@ -57,6 +57,65 @@ function rendererWithSeparateAccessibilityTree(markup, visualText) {
   ].join('');
 }
 
+function macmillanMathJaxChtmlFixture(vectorSource = String.raw`\vec{J}=J\hat{z} `) {
+  // Reduced from the live Macmillan/MathJax v3 CHTML tree. In CHTML, accents
+  // occur before their bases in DOM order, and MathJax exposes the original
+  // TeX through the MathItem associated with each mjx-container.
+  const instance = dom([
+    '<style>',
+    'mjx-c { clip-path: polygon(0 0, 100% 0, 100% 100%, 0 100%); }',
+    'mjx-speech { position: absolute; }',
+    '</style>',
+    '<span data-test-id="equation-prefix"><span id="target">',
+    'An infinitely long, straight, cylindrical wire of radius ',
+    '<mjx-container id="radius" class="MathJax" jax="CHTML" has-speech="true">',
+    '<mjx-math data-latex="R" aria-hidden="true">',
+    '<mjx-mi data-latex="R"><mjx-c>𝑅</mjx-c></mjx-mi>',
+    '</mjx-math><mjx-speech aria-label="R, math" role="img"></mjx-speech>',
+    '</mjx-container>',
+    ' has a uniform current density ',
+    '<mjx-container id="vector" class="MathJax" jax="CHTML" has-speech="true">',
+    '<mjx-math data-latex="', vectorSource, '" aria-hidden="true">',
+    '<mjx-texatom data-latex="\\vec{J}"><mjx-mover>',
+    '<mjx-over><mjx-mo data-semantic-role="overaccent" data-semantic-id="1"><mjx-c>⃗</mjx-c></mjx-mo></mjx-over>',
+    '<mjx-base><mjx-mi data-latex="J" data-semantic-id="0"><mjx-c id="partial-base">𝐽</mjx-c></mjx-mi></mjx-base>',
+    '</mjx-mover></mjx-texatom>',
+    '<mjx-mo data-latex="=" data-semantic-id="3"><mjx-c>=</mjx-c></mjx-mo>',
+    '<mjx-mrow><mjx-mi data-latex="J" data-semantic-id="4"><mjx-c>𝐽</mjx-c></mjx-mi>',
+    '<mjx-mo data-semantic-added="true" data-semantic-id="8"><mjx-c>⁢</mjx-c></mjx-mo>',
+    '<mjx-texatom data-latex="\\hat{z}"><mjx-mover>',
+    '<mjx-over><mjx-mo data-semantic-role="overaccent" data-semantic-id="6"><mjx-c>ˆ</mjx-c></mjx-mo></mjx-over>',
+    '<mjx-base><mjx-mi data-latex="z" data-semantic-id="5"><mjx-c>𝑧</mjx-c></mjx-mi></mjx-base>',
+    '</mjx-mover></mjx-texatom></mjx-mrow>',
+    '</mjx-math><mjx-speech aria-label="J right arrow equals J z hat, math" role="img"></mjx-speech>',
+    '</mjx-container>',
+    ' in cylindrical coordinates.',
+    '</span></span>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const radiusRoot = instance.window.document.querySelector('#radius');
+  const vectorRoot = instance.window.document.querySelector('#vector');
+  const mathItems = [
+    { math: 'R', typesetRoot: radiusRoot },
+    { math: vectorSource, typesetRoot: vectorRoot }
+  ];
+  const pageWindow = {
+    MathJax: {
+      startup: {
+        document: {
+          getMathItemsWithin(candidate) {
+            return mathItems.filter((item) =>
+              candidate === item.typesetRoot || (candidate.contains && candidate.contains(item.typesetRoot))
+            );
+          },
+          math: mathItems
+        }
+      }
+    }
+  };
+  return { instance, target, radiusRoot, vectorRoot, pageWindow };
+}
+
 function positionedWordToken(left, top, size, text) {
   return [
     '<span role="presentation" dir="ltr" style="left:calc(var(--scale-factor)*', left,
@@ -108,26 +167,15 @@ function googleDocsSlice(parts, textStyles = []) {
 }
 
 function reportedGoogleDocsEquationSlice() {
-  const power = (value) => ({
-    command: '\\superscript',
-    args: [[
-      '(', value,
-      // The current Google Docs clipboard slice includes this zero-content
-      // fence as a layout placeholder immediately before the literal `)`.
-      { command: '\\rbracelr', args: [''] },
-      ')'
-    ], '2']
-  });
+  // Exact reduced form decoded from the reported live Google Docs private
+  // clipboard slice. Docs leaves each opening parenthesis and number in the
+  // surrounding row, then puts only the closing `)` in the superscript base.
+  const power = () => ({ command: '\\superscript', args: [')', '2'] });
   return googleDocsSlice([{
     equation: [
-      { command: '\\abs', args: ['B'] },
-      '=',
-      { command: '\\sqrt', args: [[
-        power('27.187'), '+', power('17.479'), '+', power('-28.112')
-      ]] },
-      '=42.84 ', { command: '\\mu' }, 'T'
+      '|B|=√((27.187', power(), '+(17.479', power(), '+(-28.112', power(), ')'
     ]
-  }]);
+  }, ' = 42.84 μT']);
 }
 
 test('copies KaTeX exactly once and uses its MathML structure', () => {
@@ -446,6 +494,70 @@ test('serializes native MathML fractions, roots, scripts, and tables', () => {
   assert.equal(cleanCopy.mathMLToUnicode(instance.window.document.querySelector('#matrix')), '[a, b; c, d]');
 });
 
+test('mixed native MathML replaces only a visibly and normally laid-out root', () => {
+  const copy = (style) => {
+    const instance = dom(
+      '<p id="target">before <math' + (style ? ' style="' + style + '"' : '') +
+        '><msup><mi>x</mi><mn>2</mn></msup></math> after</p>'
+    );
+    const target = instance.window.document.querySelector('#target');
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    );
+  };
+
+  assert.equal(copy('').text, 'before x² after');
+  for (const style of [
+    'display:none',
+    'visibility:hidden',
+    'opacity:0',
+    'color:transparent',
+    'position:absolute',
+    'transform:scale(0)',
+    'filter:opacity(0)',
+    'clip-path:inset(100%)'
+  ]) {
+    assert.equal(copy(style), null, 'native MathML root layout must remain visible: ' + style);
+  }
+});
+
+test('native MathML never promotes a computed-hidden presentation descendant', () => {
+  const copy = (style, mixed) => {
+    const instance = dom(
+      (mixed ? '<p id="target">before ' : '<div id="target">') +
+      '<math><mrow><mi>x</mi><mi style="' + style + '">SECRET</mi></mrow></math>' +
+      (mixed ? ' after</p>' : '</div>')
+    );
+    const target = instance.window.document.querySelector('#target');
+    const selectionTarget = mixed ? target : target.querySelector('math');
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, selectionTarget),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      selectionTarget
+    );
+  };
+
+  for (const style of [
+    'display:none',
+    'visibility:hidden',
+    'opacity:0',
+    'color:transparent',
+    'position:absolute',
+    'transform:scale(0)',
+    'filter:opacity(0)',
+    'clip-path:inset(100%)'
+  ]) {
+    assert.equal(copy(style, true), null, 'mixed MathML descendant must remain visible: ' + style);
+    assert.equal(copy(style, false), null, 'whole MathML descendant must remain visible: ' + style);
+  }
+});
+
 test('faithful MathML preserves compound scope, text punctuation, accents, and parallel versus norm', () => {
   const render = (markup) => {
     const instance = dom('<math>' + markup + '</math>');
@@ -618,6 +730,73 @@ test('whole-math copy declines stale hidden semantics that disagree with the vis
   ), null);
 });
 
+test('installed listener never replaces visible linear order from stale hidden MathML', () => {
+  const instance = dom([
+    '<span class="katex"><span class="katex-mathml"><math><semantics>',
+    '<mrow><mi>x</mi><mo>−</mo><mi>y</mi></mrow>',
+    '<annotation encoding="application/x-tex">x-y</annotation>',
+    '</semantics></math></span><span id="visual" class="katex-html" aria-hidden="true">y−x</span></span>'
+  ].join(''));
+  const visual = instance.window.document.querySelector('#visual');
+  selectContents(instance.window, visual);
+  cleanCopy.install(instance.window.document, instance.window);
+  const clipboard = new Map();
+  visual.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text/plain', 'y−x');
+    event.preventDefault();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  visual.dispatchEvent(event);
+  assert.equal(clipboard.get('text/plain'), 'y−x');
+});
+
+test('hidden MathML agreement retains valid fraction, script, and accent layouts', () => {
+  const cases = [
+    ['<mfrac><mi>a</mi><mi>b</mi></mfrac>', 'ba', 'a/b'],
+    ['<msup><mi>x</mi><mn>2</mn></msup>', 'x2', 'x²'],
+    ['<mover accent="true"><mi>x</mi><mo>ˆ</mo></mover>', 'xˆ', 'x̂']
+  ];
+  for (const [presentation, visibleText, expected] of cases) {
+    const instance = dom([
+      '<span class="katex"><span class="katex-mathml"><math><semantics>', presentation,
+      '<annotation encoding="application/x-tex">x</annotation>',
+      '</semantics></math></span><span id="visual" class="katex-html" aria-hidden="true">',
+      visibleText, '</span></span>'
+    ].join(''));
+    const visual = instance.window.document.querySelector('#visual');
+    const payload = cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, visual),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      visual
+    );
+    assert.equal(payload && payload.text, expected, presentation);
+  }
+
+  const staleFraction = dom([
+    '<span class="katex"><span class="katex-mathml"><math><semantics>',
+    '<mfrac><mi>b</mi><mi>a</mi></mfrac>',
+    '</semantics></math></span><span id="visual" class="katex-html" aria-hidden="true">ba</span></span>'
+  ].join(''));
+  const staleVisual = staleFraction.window.document.querySelector('#visual');
+  assert.equal(cleanCopy.getCopyPayload(
+    staleFraction.window.document,
+    selectContents(staleFraction.window, staleVisual),
+    cleanCopy.DEFAULT_SETTINGS,
+    staleFraction.window,
+    staleVisual
+  ), null, 'visible denominator-first a/b must not agree with stale hidden b/a');
+});
+
 test('faithful whole-math copy preserves rendered grouping against contradictory annotations', () => {
   const copy = (presentation, annotation, visualText = 'abc') => {
     const instance = dom([
@@ -638,14 +817,16 @@ test('faithful whole-math copy preserves rendered grouping against contradictory
   assert.equal(
     copy(
       '<mrow><mrow><mfrac><mi>a</mi><mi>b</mi></mfrac></mrow><mi>c</mi></mrow>',
-      String.raw`\frac{a}{bc}`
+      String.raw`\frac{a}{bc}`,
+      'bac'
     ),
     '(a/b)c'
   );
   assert.equal(
     copy(
       '<mfrac><mi>a</mi><mrow><mi>b</mi><mi>c</mi></mrow></mfrac>',
-      String.raw`\frac ab c`
+      String.raw`\frac ab c`,
+      'bca'
     ),
     'a/(bc)'
   );
@@ -872,6 +1053,871 @@ test('source-only MathJax rewrites exact visual drags but never widens a partial
   partial.setStart(textNode, 0);
   partial.setEnd(textNode, 3);
   assert.equal(copyRange(partial), null);
+});
+
+test('source-only SVG math never replaces a different visible token order', () => {
+  const copy = (source, visible) => {
+    const instance = dom('<mjx-container id="math"><svg><text>' + visible + '</text></svg></mjx-container>');
+    const root = instance.window.document.querySelector('#math');
+    const pageWindow = {
+      MathJax: {
+        startup: {
+          document: {
+            getMathItemsWithin(candidate) {
+              return candidate === root ? [{ math: source }] : [];
+            }
+          }
+        }
+      }
+    };
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, root),
+      cleanCopy.DEFAULT_SETTINGS,
+      pageWindow,
+      root
+    );
+  };
+
+  assert.equal(copy('x-y', 'x−y').text, 'x − y');
+  assert.equal(copy('x+y', 'x+y').text, 'x + y');
+  assert.equal(copy('x-y', 'y−x'), null);
+  assert.equal(copy('x+y', 'y+x'), null);
+  assert.equal(copy('x/y', 'xy'), null, 'SVG metadata cannot inject a missing division slash');
+  assert.equal(copy('(x)', ')x('), null, 'SVG metadata cannot reorder visible fences');
+  assert.equal(copy('x/y,z', 'x,y/z'), null,
+    'SVG metadata cannot move authored separators between otherwise identical anchors');
+});
+
+test('copies the reported Macmillan inline-vector sentence from its live MathJax CHTML shape', () => {
+  const { instance, target, pageWindow } = macmillanMathJaxChtmlFixture();
+  assert.match(instance.window.getComputedStyle(target.querySelector('mjx-c')).clipPath, /^polygon\(/u);
+  assert.equal(instance.window.getComputedStyle(target.querySelector('mjx-speech')).position, 'absolute');
+  const selection = selectContents(instance.window, target);
+  assert.equal(
+    selection.toString(),
+    'An infinitely long, straight, cylindrical wire of radius 𝑅 has a uniform current density ' +
+      '⃗𝐽=𝐽⁢ˆ𝑧 in cylindrical coordinates.'
+  );
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    pageWindow,
+    target
+  );
+  assert.ok(payload, 'the exact live CHTML selection must produce a semantic clipboard payload');
+  assert.equal(
+    payload.text,
+    'An infinitely long, straight, cylindrical wire of radius R has a uniform current density ' +
+      'J⃗ = Jẑ in cylindrical coordinates.'
+  );
+  assert.doesNotMatch(payload.text, /[\n\r\u2061-\u2064\u{1d400}-\u{1d7ff}]/u);
+});
+
+test('the installed copy listener rewrites the reported Macmillan CHTML selection', () => {
+  const { instance, target, pageWindow } = macmillanMathJaxChtmlFixture();
+  instance.window.MathJax = pageWindow.MathJax;
+  // The live selection included a collapsible boundary space after the final
+  // sentence. Both clipboard representations must drop it.
+  target.appendChild(instance.window.document.createTextNode(' '));
+  selectContents(instance.window, target);
+  cleanCopy.install(instance.window.document, instance.window);
+  const clipboard = new Map();
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  target.dispatchEvent(event);
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(
+    clipboard.get('text/plain'),
+    'An infinitely long, straight, cylindrical wire of radius R has a uniform current density ' +
+      'J⃗ = Jẑ in cylindrical coordinates.'
+  );
+  const rich = new JSDOM(clipboard.get('text/html') || '').window.document.body.textContent;
+  assert.equal(rich.endsWith(' '), false);
+  assert.equal(rich.endsWith('\n'), false);
+  assert.match(rich, /in cylindrical coordinates\.$/u);
+});
+
+test('Macmillan CHTML uses direct mjx-math TeX when page-world MathJax is unavailable', () => {
+  const { instance, target } = macmillanMathJaxChtmlFixture();
+  assert.equal(instance.window.MathJax, undefined);
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.ok(payload, 'direct mjx-math data-latex must survive userscript page-world isolation');
+  assert.equal(
+    payload.text,
+    'An infinitely long, straight, cylindrical wire of radius R has a uniform current density ' +
+      'J⃗ = Jẑ in cylindrical coordinates.'
+  );
+});
+
+test('Macmillan source-only CHTML never widens a strict partial vector selection', () => {
+  const { instance, vectorRoot, pageWindow } = macmillanMathJaxChtmlFixture();
+  const textNode = instance.window.document.querySelector('#partial-base').firstChild;
+  const range = instance.window.document.createRange();
+  range.setStart(textNode, 0);
+  range.setEnd(textNode, textNode.nodeValue.length);
+  const selection = instance.window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  assert.equal(selection.toString(), '𝐽');
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      instance.window.document,
+      selection,
+      cleanCopy.DEFAULT_SETTINGS,
+      pageWindow,
+      vectorRoot
+    ),
+    null
+  );
+});
+
+test('Macmillan CHTML source mapping requires exact identifiers, operators, and accents', () => {
+  const copyVector = (source) => {
+    const { instance, vectorRoot, pageWindow } = macmillanMathJaxChtmlFixture(source);
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, vectorRoot),
+      cleanCopy.DEFAULT_SETTINGS,
+      pageWindow,
+      vectorRoot
+    );
+  };
+  assert.equal(copyVector(String.raw`\vec{J}=J\hat{z} `).text, 'J⃗ = Jẑ');
+
+  const staleSources = [
+    String.raw`J=Jz `,
+    String.raw`\vec{J}=Jz `,
+    String.raw`J=J\hat{z} `,
+    String.raw`\hat{J}=J\vec{z} `,
+    String.raw`\bar{J}=J\hat{z} `,
+    String.raw`\vec{J}=J\bar{z} `,
+    String.raw`\overleftarrow{J}=J\hat{z} `,
+    String.raw`\vec{K}=J\hat{z} `,
+    String.raw`\vec{J}\ne J\hat{z} `
+  ];
+  for (const source of staleSources) {
+    assert.equal(
+      copyVector(source),
+      null,
+      'stale source must not replace the visual selection: ' + source
+    );
+  }
+});
+
+test('direct MathJax CHTML source mapping preserves authored token order', () => {
+  const copy = (source, visible) => {
+    const instance = dom(
+      '<p id="target">before <mjx-container class="MathJax"><mjx-math data-latex="' +
+        source.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '">' + visible +
+      '</mjx-math></mjx-container> after</p>'
+    );
+    const target = instance.window.document.querySelector('#target');
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    );
+  };
+  assert.equal(copy('x-y', 'x−y').text, 'before x − y after');
+  assert.equal(copy('x-y', 'y−x'), null);
+  assert.equal(copy(String.raw`\frac{x}{y}`, 'yx'), null);
+  assert.equal(copy('x=2*y+1', 'y=2*x+1'), null);
+  assert.equal(copy(
+    String.raw`\acute{x}`,
+    '<mjx-mover data-latex="\\acute{x}"><mjx-base data-semantic-id="0">x</mjx-base>' +
+      '<mjx-over data-semantic-id="1">ˊ</mjx-over></mjx-mover>'
+  ).text, 'before x́ after');
+  assert.equal(copy(
+    String.raw`\acute{x}`,
+    '<mjx-mover data-latex="\\acute{x}"><mjx-over data-semantic-id="1">ˊ</mjx-over>' +
+      '<mjx-base data-semantic-id="0">x</mjx-base></mjx-mover>'
+  ).text, 'before x́ after');
+
+  const integral = dom([
+    '<mjx-container id="target"><mjx-math data-latex="\\int_0^1 x^2\\,dx">',
+    '<mjx-msubsup data-latex="\\int_0^1" data-semantic-role="integral">',
+    '<mjx-mo data-semantic-id="0">∫</mjx-mo><mjx-script>',
+    '<mjx-mn data-semantic-id="2">1</mjx-mn><mjx-mn data-semantic-id="1">0</mjx-mn>',
+    '</mjx-script></mjx-msubsup>',
+    '<mjx-msup data-latex="x^2"><mjx-mi data-semantic-id="4">x</mjx-mi>',
+    '<mjx-mn data-semantic-id="5">2</mjx-mn></mjx-msup>',
+    '<mjx-mi data-semantic-id="8">d</mjx-mi><mjx-mi data-semantic-id="9">x</mjx-mi>',
+    '</mjx-math></mjx-container>'
+  ].join(''));
+  const integralTarget = integral.window.document.querySelector('#target');
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      integral.window.document,
+      selectContents(integral.window, integralTarget),
+      cleanCopy.DEFAULT_SETTINGS,
+      integral.window,
+      integralTarget
+    ).text,
+    '∫₀¹ x² dx'
+  );
+
+  const sum = dom([
+    '<mjx-container id="target"><mjx-math data-latex="\\sum_{i=1}^{n}i^2">',
+    '<mjx-munderover data-latex="\\sum_{i=1}^{n}" data-semantic-role="sum">',
+    '<mjx-over><mjx-mi data-semantic-id="5">n</mjx-mi></mjx-over>',
+    '<mjx-box><mjx-mo data-semantic-id="0">∑</mjx-mo><mjx-under>',
+    '<mjx-mi data-semantic-id="1">i</mjx-mi><mjx-mo data-semantic-id="2">=</mjx-mo>',
+    '<mjx-mn data-semantic-id="3">1</mjx-mn></mjx-under></mjx-box></mjx-munderover>',
+    '<mjx-msup data-latex="i^2"><mjx-mi data-semantic-id="7">i</mjx-mi>',
+    '<mjx-mn data-semantic-id="8">2</mjx-mn></mjx-msup>',
+    '</mjx-math></mjx-container>'
+  ].join(''));
+  const sumTarget = sum.window.document.querySelector('#target');
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      sum.window.document,
+      selectContents(sum.window, sumTarget),
+      cleanCopy.DEFAULT_SETTINGS,
+      sum.window,
+      sumTarget
+    ).text,
+    '∑ᵢ₌₁ⁿ i²'
+  );
+
+  const overline = dom([
+    '<mjx-container id="target"><mjx-math data-latex="\\overline{a+b}">',
+    '<mjx-mover data-latex="\\overline{a+b}"><mjx-over><mjx-mo data-semantic-id="3">――――</mjx-mo></mjx-over>',
+    '<mjx-base><mjx-mi data-semantic-id="0">a</mjx-mi>',
+    '<mjx-mo data-semantic-id="1">+</mjx-mo><mjx-mi data-semantic-id="2">b</mjx-mi>',
+    '</mjx-base></mjx-mover></mjx-math></mjx-container>'
+  ].join(''));
+  const overlineTarget = overline.window.document.querySelector('#target');
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      overline.window.document,
+      selectContents(overline.window, overlineTarget),
+      cleanCopy.DEFAULT_SETTINGS,
+      overline.window,
+      overlineTarget
+    ).text,
+    'overline(a + b)'
+  );
+
+  const underline = dom([
+    '<mjx-container id="target"><mjx-math data-latex="\\underline{x}">',
+    '<mjx-munder data-latex="\\underline{x}"><mjx-base><mjx-mi data-semantic-id="0">x</mjx-mi></mjx-base>',
+    '<mjx-under><mjx-mo data-semantic-id="1">――</mjx-mo></mjx-under>',
+    '</mjx-munder></mjx-math></mjx-container>'
+  ].join(''));
+  const underlineTarget = underline.window.document.querySelector('#target');
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      underline.window.document,
+      selectContents(underline.window, underlineTarget),
+      cleanCopy.DEFAULT_SETTINGS,
+      underline.window,
+      underlineTarget
+    ).text,
+    'x̲'
+  );
+});
+
+test('direct MathJax CHTML source mapping requires matching authored structure', () => {
+  const copy = (source, visible) => {
+    const instance = dom(
+      '<mjx-container id="target" class="MathJax"><mjx-math data-latex="' +
+        source.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '">' + visible +
+      '</mjx-math></mjx-container>'
+    );
+    const target = instance.window.document.querySelector('#target');
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    );
+  };
+
+  const visibleSup = [
+    '<mjx-msup data-latex="x^2"><mjx-mi data-semantic-id="0">x</mjx-mi>',
+    '<mjx-script><mjx-mn data-semantic-id="1">2</mjx-mn></mjx-script></mjx-msup>'
+  ].join('');
+  const visibleSub = [
+    '<mjx-msub data-latex="x_2"><mjx-mi data-semantic-id="0">x</mjx-mi>',
+    '<mjx-script><mjx-mn data-semantic-id="1">2</mjx-mn></mjx-script></mjx-msub>'
+  ].join('');
+  const visibleRoot = [
+    '<mjx-msqrt data-latex="\\sqrt{x}"><mjx-sqrt><mjx-box>',
+    '<mjx-mi>x</mjx-mi></mjx-box></mjx-sqrt></mjx-msqrt>'
+  ].join('');
+  const visibleFraction = [
+    '<mjx-mfrac data-latex="\\frac{x}{y}"><mjx-frac>',
+    '<mjx-num><mjx-mi>x</mjx-mi></mjx-num>',
+    '<mjx-den><mjx-mi>y</mjx-mi></mjx-den>',
+    '</mjx-frac></mjx-mfrac>'
+  ].join('');
+
+  assert.equal(copy('x^2', visibleSup).text, 'x²');
+  assert.equal(copy('x_2', visibleSub).text, 'x₂');
+  assert.equal(copy(String.raw`\sqrt{x}`, visibleRoot).text, '√x');
+  assert.equal(copy(String.raw`\frac{x}{y}`, visibleFraction).text, 'x/y');
+
+  const outsideFraction = [
+    '<mjx-mi data-semantic-id="0">x</mjx-mi>',
+    '<mjx-mfrac data-latex="\\frac{y}{z}"><mjx-frac>',
+    '<mjx-num><mjx-mi data-semantic-id="1">y</mjx-mi></mjx-num>',
+    '<mjx-den><mjx-mi data-semantic-id="2">z</mjx-mi></mjx-den>',
+    '</mjx-frac></mjx-mfrac>'
+  ].join('');
+  assert.equal(copy(String.raw`\frac{xy}{z}`, outsideFraction), null,
+    'a fraction cannot absorb an adjacent visible factor');
+
+  const outsidePower = [
+    '<mjx-mi data-semantic-id="0">x</mjx-mi>',
+    '<mjx-msup data-latex="y^2"><mjx-mi data-semantic-id="1">y</mjx-mi>',
+    '<mjx-script><mjx-mn data-semantic-id="2">2</mjx-mn></mjx-script></mjx-msup>'
+  ].join('');
+  assert.equal(copy('(xy)^2', outsidePower), null,
+    'a superscript cannot absorb an adjacent visible factor into its base');
+
+  const outsideRoot = [
+    '<mjx-mi data-semantic-id="0">x</mjx-mi>',
+    '<mjx-msqrt data-latex="\\sqrt{y}"><mjx-sqrt><mjx-surd>√</mjx-surd>',
+    '<mjx-box><mjx-mi data-semantic-id="1">y</mjx-mi></mjx-box></mjx-sqrt></mjx-msqrt>'
+  ].join('');
+  assert.equal(copy(String.raw`\sqrt{xy}`, outsideRoot), null,
+    'a radical cannot absorb an adjacent visible factor into its radicand');
+
+  const outsideAccent = [
+    '<mjx-mi data-semantic-id="0">x</mjx-mi>',
+    '<mjx-texatom data-latex="\\hat{y}"><mjx-mover>',
+    '<mjx-over><mjx-mo data-semantic-id="2">ˆ</mjx-mo></mjx-over>',
+    '<mjx-base><mjx-mi data-semantic-id="1">y</mjx-mi></mjx-base>',
+    '</mjx-mover></mjx-texatom>'
+  ].join('');
+  assert.equal(copy(String.raw`\hat{xy}`, outsideAccent), null,
+    'an accent cannot absorb an adjacent visible factor into its base');
+
+  const outsideTable = [
+    '<mjx-mi data-semantic-id="0">x</mjx-mi>',
+    '<mjx-texatom data-latex="\\begin{matrix}y&amp;z\\end{matrix}">',
+    '<mjx-mtable><mjx-table><mjx-itable><mjx-mtr>',
+    '<mjx-mtd><mjx-mi data-semantic-id="1">y</mjx-mi></mjx-mtd>',
+    '<mjx-mtd><mjx-mi data-semantic-id="2">z</mjx-mi></mjx-mtd>',
+    '</mjx-mtr></mjx-itable></mjx-table></mjx-mtable></mjx-texatom>'
+  ].join('');
+  assert.equal(copy(String.raw`\begin{matrix}xy&z\end{matrix}`, outsideTable), null,
+    'a table cannot absorb an adjacent visible factor into its first cell');
+
+  assert.equal(copy('x_2', visibleSup), null, 'an msup surface cannot be rewritten as a subscript');
+  assert.equal(copy('x^2', visibleSub), null, 'an msub surface cannot be rewritten as a superscript');
+  assert.equal(copy(String.raw`\sqrt{x}`, '<mjx-mi>x</mjx-mi>'), null,
+    'a radical source requires a visible radical layout tag');
+  assert.equal(copy(String.raw`\frac{x}{y}`, '<mjx-mi>x</mjx-mi><mjx-mi>y</mjx-mi>'), null,
+    'a fraction source requires a visible fraction layout tag');
+  assert.equal(copy('x', visibleRoot), null, 'visible radical layout cannot be flattened by stale plain metadata');
+  assert.equal(copy('xy', visibleFraction), null, 'visible fraction layout cannot be flattened by stale plain metadata');
+
+  const punctuationControls = [
+    ['x/y', 'x/y', 'x/y'],
+    ['|x|', '|x|', '|x|'],
+    ['(x)', '(x)', '(x)'],
+    ['[x]', '[x]', '[x]'],
+    ['x,y', 'x,y', 'x, y'],
+    ['x:y;z', 'x:y;z', 'x:y; z'],
+    ['12.3', '12.3', '12.3']
+  ];
+  for (const [source, visible, expected] of punctuationControls) {
+    assert.equal(copy(source, visible).text, expected, 'visible authored punctuation: ' + source);
+  }
+  for (const [source, visible] of [
+    ['x/y', 'xy'],
+    ['|x|', 'x'],
+    ['(x)', 'x'],
+    ['[x]', 'x'],
+    ['x,y', 'xy'],
+    ['x:y;z', 'xyz'],
+    ['12.3', '123']
+  ]) {
+    assert.equal(copy(source, visible), null, 'source cannot inject missing punctuation: ' + source);
+  }
+  assert.equal(copy('(x)', '<mjx-mo>)</mjx-mo><mjx-mi>x</mjx-mi><mjx-mo>(</mjx-mo>'), null,
+    'source cannot reorder visible fences');
+  assert.equal(copy('x/y,z', [
+    '<mjx-mi>x</mjx-mi><mjx-mo>,</mjx-mo><mjx-mi>y</mjx-mi>',
+    '<mjx-mo>/</mjx-mo><mjx-mi>z</mjx-mi>'
+  ].join('')), null, 'source cannot move punctuation between matching visible anchors');
+
+  const matrix = [
+    '<mjx-texatom data-latex="\\begin{pmatrix}a&amp;b\\\\c&amp;d\\end{pmatrix}">',
+    '<mjx-mo>(</mjx-mo><mjx-mtable><mjx-table>',
+    '<mjx-itable><mjx-mtr><mjx-mtd><mjx-mi>a</mjx-mi></mjx-mtd>',
+    '<mjx-mtd><mjx-mi>b</mjx-mi></mjx-mtd></mjx-mtr>',
+    '<mjx-mtr><mjx-mtd><mjx-mi>c</mjx-mi></mjx-mtd>',
+    '<mjx-mtd><mjx-mi>d</mjx-mi></mjx-mtd></mjx-mtr></mjx-itable>',
+    '</mjx-table></mjx-mtable><mjx-mo>)</mjx-mo></mjx-texatom>'
+  ].join('');
+  assert.equal(
+    copy(String.raw`\begin{pmatrix}a&b\\c&d\end{pmatrix}`, matrix).text,
+    '[a, b; c, d]'
+  );
+  assert.equal(copy('abcd', matrix), null, 'visible table layout requires matching table metadata');
+
+  const citedPrimeFormula = [
+    '<mjx-mo data-semantic-id="0">(</mjx-mo>',
+    '<mjx-msup data-latex="y\'">',
+    '<mjx-mi data-semantic-id="1">y</mjx-mi>',
+    '<mjx-script><mjx-mo data-semantic-id="2">′</mjx-mo></mjx-script></mjx-msup>',
+    '<mjx-msup data-latex=")^2"><mjx-mo data-semantic-id="3">)</mjx-mo>',
+    '<mjx-script><mjx-mn data-semantic-id="4">2</mjx-mn></mjx-script></mjx-msup>',
+    '<mjx-mo data-semantic-id="5">=</mjx-mo>',
+    '<mjx-mn data-semantic-id="6">20</mjx-mn>',
+    '<mjx-msup><mjx-mi data-semantic-id="7">x</mjx-mi>',
+    '<mjx-script><mjx-mo data-semantic-id="8">′</mjx-mo></mjx-script></mjx-msup>'
+  ].join('');
+  assert.equal(copy("(y')^2=20x'", citedPrimeFormula).text, '(y′)² = 20x′');
+  assert.equal(copy("(y')_2=20x'", citedPrimeFormula), null,
+    'prime superscripts cannot conceal a stale ordinary subscript');
+
+  assert.equal(copy('[x^2', '[<mjx-msup data-latex="x^2"><mjx-mi data-semantic-id="0">x</mjx-mi>' +
+    '<mjx-script><mjx-mn data-semantic-id="1">2</mjx-mn></mjx-script></mjx-msup>').text, '[x²');
+  assert.equal(copy('[0,1)', '[0,1)').text, '[0, 1)');
+  assert.equal(copy('x]^2', 'x<mjx-msup data-latex="]^2"><mjx-mo data-semantic-id="0">]</mjx-mo>' +
+    '<mjx-script><mjx-mn data-semantic-id="1">2</mjx-mn></mjx-script></mjx-msup>').text, 'x]²');
+  assert.equal(copy('x}^2', visibleSup), null, 'unmatched TeX braces fail closed');
+
+  assert.equal(copy(String.raw`x\sp 2`, visibleSup).text, 'x²');
+  assert.equal(copy(String.raw`x\sb 2`, visibleSub).text, 'x₂');
+  assert.equal(copy("f''", '<mjx-msup data-latex="f\'\'"><mjx-mi data-semantic-id="0">f</mjx-mi>' +
+    '<mjx-script><mjx-mo data-semantic-id="1">″</mjx-mo></mjx-script></mjx-msup>').text, 'f′′');
+
+  const prescript = [
+    '<mjx-mmultiscripts data-latex="\\prescript{14}{6}{C}">',
+    '<mjx-script><mjx-mn data-semantic-id="0">14</mjx-mn>',
+    '<mjx-mn data-semantic-id="1">6</mjx-mn></mjx-script>',
+    '<mjx-mi data-semantic-id="2">C</mjx-mi></mjx-mmultiscripts>'
+  ].join('');
+  assert.equal(copy(String.raw`\prescript{14}{6}{C}`, prescript).text, '¹⁴₆C');
+
+  const nestedAccent = [
+    '<mjx-msub data-latex="x_{\\hat y}"><mjx-mi data-semantic-id="0">x</mjx-mi>',
+    '<mjx-script><mjx-texatom data-latex="{\\hat y}"><mjx-texatom data-latex="\\hat y">',
+    '<mjx-mover><mjx-over><mjx-mo data-semantic-id="2">ˆ</mjx-mo></mjx-over>',
+    '<mjx-base><mjx-mi data-semantic-id="1">y</mjx-mi></mjx-base></mjx-mover>',
+    '</mjx-texatom></mjx-texatom></mjx-script></mjx-msub>'
+  ].join('');
+  assert.equal(copy(String.raw`x_{\hat y}`, nestedAccent).text, 'x_(ŷ)');
+  assert.equal(copy(String.raw`x_{\hat y}`,
+    '<mjx-msub data-latex="x_{y}"><mjx-mi data-semantic-id="0">x</mjx-mi>' +
+    '<mjx-script><mjx-mi data-semantic-id="1">y</mjx-mi></mjx-script></mjx-msub>'), null,
+  'a nested accent command requires its own visible accent structure');
+
+  const nestedMovers = [
+    '<mjx-texatom data-latex="\\hat{\\vec{x}}"><mjx-mover>',
+    '<mjx-over><mjx-mo data-semantic-id="3">ˆ</mjx-mo></mjx-over>',
+    '<mjx-base><mjx-texatom data-latex="\\vec{x}"><mjx-mover>',
+    '<mjx-over><mjx-mo data-semantic-id="1">⃗</mjx-mo></mjx-over>',
+    '<mjx-base><mjx-mi data-semantic-id="0">x</mjx-mi></mjx-base>',
+    '</mjx-mover></mjx-texatom></mjx-base></mjx-mover></mjx-texatom>'
+  ].join('');
+  assert.equal(copy(String.raw`\hat{\vec{x}}`, nestedMovers).text, 'hat(x⃗)');
+  assert.equal(copy(String.raw`\hat{x}`, nestedMovers), null,
+    'two nested visible accents cannot agree with a one-accent source');
+
+  const substack = [
+    '<mjx-texatom data-latex="\\begin{subarray}{c}a\\\\b\\end{subarray}">',
+    '<mjx-mtable><mjx-table><mjx-itable>',
+    '<mjx-mtr><mjx-mtd><mjx-mi>a</mjx-mi></mjx-mtd></mjx-mtr>',
+    '<mjx-mtr><mjx-mtd><mjx-mi>b</mjx-mi></mjx-mtd></mjx-mtr>',
+    '</mjx-itable></mjx-table></mjx-mtable></mjx-texatom>'
+  ].join('');
+  assert.equal(copy(String.raw`\substack{a\\b}`, substack).text, 'a, b');
+
+  const longArrow = [
+    '<mjx-mover data-latex="\\overrightarrow{AB}">',
+    '<mjx-over><mjx-mo data-semantic-id="2">−−−→</mjx-mo></mjx-over>',
+    '<mjx-base><mjx-mi data-semantic-id="0">A</mjx-mi>',
+    '<mjx-mi data-semantic-id="1">B</mjx-mi></mjx-base></mjx-mover>'
+  ].join('');
+  assert.equal(copy(String.raw`\overrightarrow{AB}`, longArrow).text, 'vec(AB)');
+
+  const underbrace = [
+    '<mjx-munder data-latex="\\underbrace{x+y}_{n\\text{ terms}}">',
+    '<mjx-row><mjx-base><mjx-texatom data-latex="\\underbrace{x+y}"><mjx-munder>',
+    '<mjx-row><mjx-base><mjx-mi data-semantic-id="0">x</mjx-mi>',
+    '<mjx-mo data-semantic-id="1">+</mjx-mo><mjx-mi data-semantic-id="2">y</mjx-mi>',
+    '</mjx-base></mjx-row><mjx-row><mjx-under>',
+    '<mjx-mo data-semantic-id="4">⏟</mjx-mo></mjx-under></mjx-row>',
+    '</mjx-munder></mjx-texatom></mjx-base></mjx-row>',
+    '<mjx-row><mjx-under><mjx-mi data-semantic-id="6">n</mjx-mi>',
+    '<mjx-mtext data-semantic-id="7"> terms</mjx-mtext></mjx-under></mjx-row>',
+    '</mjx-munder>'
+  ].join('');
+  assert.equal(
+    copy(String.raw`\underbrace{x+y}_{n\text{ terms}}`, underbrace).text,
+    '(underbrace(x + y))_(n terms)'
+  );
+
+  const overbrace = [
+    '<mjx-mover data-latex="\\overbrace{x+y}^{n}">',
+    '<mjx-over><mjx-mi data-semantic-id="6">n</mjx-mi></mjx-over>',
+    '<mjx-base><mjx-texatom data-latex="\\overbrace{x+y}"><mjx-mover>',
+    '<mjx-over><mjx-mo data-semantic-id="4">⏞</mjx-mo></mjx-over>',
+    '<mjx-base><mjx-mi data-semantic-id="0">x</mjx-mi>',
+    '<mjx-mo data-semantic-id="1">+</mjx-mo><mjx-mi data-semantic-id="2">y</mjx-mi>',
+    '</mjx-base></mjx-mover></mjx-texatom></mjx-base></mjx-mover>'
+  ].join('');
+  assert.equal(copy(String.raw`\overbrace{x+y}^{n}`, overbrace).text, '(overbrace(x + y))ⁿ');
+
+  const overbraceWithSubscript = [
+    '<mjx-munder data-latex="\\overbrace{x}_n"><mjx-row><mjx-base>',
+    '<mjx-texatom data-latex="\\overbrace{x}"><mjx-mover>',
+    '<mjx-over><mjx-mo data-semantic-id="1">⏞</mjx-mo></mjx-over>',
+    '<mjx-base><mjx-mi data-semantic-id="0">x</mjx-mi></mjx-base>',
+    '</mjx-mover></mjx-texatom></mjx-base></mjx-row>',
+    '<mjx-row><mjx-under><mjx-mi data-semantic-id="3">n</mjx-mi>',
+    '</mjx-under></mjx-row></mjx-munder>'
+  ].join('');
+  assert.equal(copy(String.raw`\overbrace{x}_n`, overbraceWithSubscript).text, 'x̅ₙ');
+
+  const underbraceWithSuperscript = [
+    '<mjx-mover data-latex="\\underbrace{x}^n"><mjx-over>',
+    '<mjx-mi data-semantic-id="3">n</mjx-mi></mjx-over><mjx-base>',
+    '<mjx-texatom data-latex="\\underbrace{x}"><mjx-munder>',
+    '<mjx-row><mjx-base><mjx-mi data-semantic-id="0">x</mjx-mi>',
+    '</mjx-base></mjx-row><mjx-row><mjx-under>',
+    '<mjx-mo data-semantic-id="1">⏟</mjx-mo></mjx-under></mjx-row>',
+    '</mjx-munder></mjx-texatom></mjx-base></mjx-mover>'
+  ].join('');
+  assert.equal(copy(String.raw`\underbrace{x}^n`, underbraceWithSuperscript).text, 'x̲ⁿ');
+});
+
+test('direct MathJax CHTML authenticates live limit, cases, and binomial renderer shapes', () => {
+  const copy = (source, visible) => {
+    const instance = dom(
+      '<mjx-container id="target" class="MathJax"><mjx-math data-latex="' +
+        source.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '">' + visible +
+      '</mjx-math></mjx-container>'
+    );
+    const target = instance.window.document.querySelector('#target');
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    );
+  };
+
+  const limit = [
+    '<mjx-munder data-latex="\\lim_{x\\to0}" data-semantic-type="limlower">',
+    '<mjx-row><mjx-base><mjx-mo data-semantic-id="0">lim</mjx-mo></mjx-base></mjx-row>',
+    '<mjx-row><mjx-under><mjx-texatom data-latex="{x\\to0}">',
+    '<mjx-mi data-semantic-id="1">x</mjx-mi><mjx-mo data-semantic-id="2">→</mjx-mo>',
+    '<mjx-mn data-semantic-id="3">0</mjx-mn></mjx-texatom></mjx-under></mjx-row>',
+    '</mjx-munder><mjx-mo data-semantic-id="4">⁡</mjx-mo>',
+    '<mjx-mfrac data-latex="\\frac{\\sin x}{x}"><mjx-frac>',
+    '<mjx-num><mjx-mi data-semantic-id="5">sin</mjx-mi>',
+    '<mjx-mo data-semantic-id="6">⁡</mjx-mo><mjx-mi data-semantic-id="7">x</mjx-mi></mjx-num>',
+    '<mjx-den><mjx-mi data-semantic-id="8">x</mjx-mi></mjx-den>',
+    '</mjx-frac></mjx-mfrac>'
+  ].join('');
+  assert.equal(
+    copy(String.raw`\lim_{x\to0}\frac{\sin x}{x}`, limit).text,
+    'lim_(x → 0) (sin x)/x'
+  );
+
+  const cases = [
+    '<mjx-texatom data-latex="\\begin{cases}x^2 &amp;x&gt;0\\\\-x&amp;x\\le0\\end{cases}">',
+    '<mjx-mrow data-semantic-type="cases"><mjx-mo data-semantic-id="0">{</mjx-mo>',
+    '<mjx-mtable><mjx-table><mjx-itable><mjx-mtr>',
+    '<mjx-mtd><mjx-msup data-latex="x^2"><mjx-mi data-semantic-id="1">x</mjx-mi>',
+    '<mjx-script><mjx-mn data-semantic-id="2">2</mjx-mn></mjx-script></mjx-msup></mjx-mtd>',
+    '<mjx-mtd><mjx-mi data-semantic-id="3">x</mjx-mi><mjx-mo data-semantic-id="4">&gt;</mjx-mo>',
+    '<mjx-mn data-semantic-id="5">0</mjx-mn></mjx-mtd></mjx-mtr><mjx-mtr>',
+    '<mjx-mtd><mjx-mo data-semantic-id="6">−</mjx-mo><mjx-mi data-semantic-id="7">x</mjx-mi></mjx-mtd>',
+    '<mjx-mtd><mjx-mi data-semantic-id="8">x</mjx-mi><mjx-mo data-semantic-id="9">≤</mjx-mo>',
+    '<mjx-mn data-semantic-id="10">0</mjx-mn></mjx-mtd>',
+    '</mjx-mtr></mjx-itable></mjx-table></mjx-mtable></mjx-mrow></mjx-texatom>'
+  ].join('');
+  assert.equal(
+    copy(String.raw`\begin{cases}x^2&x>0\\-x&x\le0\end{cases}`, cases).text,
+    '{x² if x > 0; −x if x ≤ 0}'
+  );
+
+  const binomial = [
+    '<mjx-texatom data-latex="\\binom{n}{k}" data-semantic-role="binomial">',
+    '<mjx-mo data-semantic-id="0">(</mjx-mo><mjx-mfrac><mjx-frac atop="true">',
+    '<mjx-num><mjx-mi data-semantic-id="1">n</mjx-mi></mjx-num>',
+    '<mjx-den><mjx-mi data-semantic-id="2">k</mjx-mi></mjx-den>',
+    '</mjx-frac></mjx-mfrac><mjx-mo data-semantic-id="3">)</mjx-mo></mjx-texatom>'
+  ].join('');
+  assert.equal(copy(String.raw`\binom{n}{k}`, binomial).text, 'C(n, k)');
+  const nestedBinomial = [
+    '<mjx-texatom data-latex="\\binom{(n)}{k}" data-semantic-role="binomial">',
+    '<mjx-mo data-semantic-id="0">(</mjx-mo><mjx-mfrac><mjx-frac atop="true">',
+    '<mjx-num><mjx-mo>(</mjx-mo><mjx-mi data-semantic-id="1">n</mjx-mi><mjx-mo>)</mjx-mo></mjx-num>',
+    '<mjx-den><mjx-mi data-semantic-id="2">k</mjx-mi></mjx-den>',
+    '</mjx-frac></mjx-mfrac><mjx-mo data-semantic-id="3">)</mjx-mo></mjx-texatom>'
+  ].join('');
+  assert.equal(copy(String.raw`\binom{(n)}{k}`, nestedBinomial).text, 'C((n), k)');
+  assert.equal(copy(String.raw`\binom{n}{k}`, binomial
+    .replace('data-semantic-id="0">(</', 'data-semantic-id="0">)</')
+    .replace('data-semantic-id="3">)</', 'data-semantic-id="3">(</')), null,
+  'generated binomial fences must remain balanced and oriented');
+
+  const unsupportedPrescript = [
+    '<mjx-mtext data-latex="\\prescript" data-semantic-id="0">\\prescript</mjx-mtext>',
+    '<mjx-mn data-semantic-id="1">14</mjx-mn><mjx-mn data-semantic-id="2">6</mjx-mn>',
+    '<mjx-mi data-semantic-id="3">C</mjx-mi>'
+  ].join('');
+  assert.equal(copy(String.raw`\prescript{14}{6}{C}`, unsupportedPrescript), null);
+  assert.equal(
+    copy(String.raw`x\sp2+y\sb1`,
+      '<mjx-mi data-semantic-id="0">x</mjx-mi><mjx-mtext data-semantic-id="1">\\sp</mjx-mtext>' +
+      '<mjx-mn data-semantic-id="2">2</mjx-mn><mjx-mo data-semantic-id="3">+</mjx-mo>' +
+      '<mjx-mi data-semantic-id="4">y</mjx-mi><mjx-mtext data-semantic-id="5">\\sb</mjx-mtext>' +
+      '<mjx-mn data-semantic-id="6">1</mjx-mn>'),
+    null
+  );
+});
+
+test('direct MathJax structural agreement bounds aggregate renderer metadata work', () => {
+  const instance = dom(
+    '<mjx-container id="target"><mjx-math data-latex="\\hat{x}"></mjx-math></mjx-container>'
+  );
+  const target = instance.window.document.querySelector('#target');
+  const math = target.querySelector('mjx-math');
+  const moverCount = 96;
+  for (let index = 0; index < moverCount; index += 1) {
+    const mover = instance.window.document.createElement('mjx-mover');
+    mover.setAttribute('data-latex', String.raw`\hat{` + 'x'.repeat(3000) + index + '}');
+    mover.innerHTML = '<mjx-over>ˆ</mjx-over><mjx-base>x</mjx-base>';
+    math.appendChild(mover);
+  }
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    ),
+    null
+  );
+});
+
+test('source-backed renderer metadata needs a genuinely visible selected surface', () => {
+  const cases = [
+    '',
+    '<span style="display:none">x</span>',
+    '<span style="opacity:0">x</span>',
+    '<span style="clip-path:inset(50%)">x</span>',
+    '<span style="clip-path:inset(100%)">x</span>',
+    '<span style="clip-path:polygon(0 0,0 0,0 0)">x</span>',
+    '<span style="clip-path:polygon(0 0,1px 1px,2px 2px)">x</span>',
+    '<span style="position:absolute">x</span>',
+    '<span style="transform:scale(0)">x</span>',
+    '<span style="scale:0">x</span>',
+    '<span style="zoom:0">x</span>',
+    '<span style="filter:opacity(0)">x</span>',
+    '<span style="mask-image:linear-gradient(transparent,transparent)">x</span>',
+    '<span style="-webkit-mask-image:linear-gradient(transparent,transparent)">x</span>',
+    '<span style="text-indent:-9999px">x</span>',
+    '<span style="width:0;height:0;overflow:hidden">x</span>'
+  ];
+  for (const content of cases) {
+    const instance = dom(
+      '<p id="target">before <mjx-container class="MathJax">' +
+        '<mjx-math data-latex="x">' + content + '</mjx-math>' +
+      '</mjx-container> after</p>'
+    );
+    const target = instance.window.document.querySelector('#target');
+    assert.equal(
+      cleanCopy.getCopyPayload(
+        instance.window.document,
+        selectContents(instance.window, target),
+        cleanCopy.DEFAULT_SETTINGS,
+        instance.window,
+        target
+      ),
+      null
+    );
+  }
+  for (const style of [
+    'display:none',
+    'opacity:0',
+    'clip-path:inset(100%)',
+    'position:absolute'
+  ]) {
+    const instance = dom(
+      '<p id="target">before <mjx-container class="MathJax" style="' + style + '">' +
+        '<mjx-math data-latex="x">x</mjx-math>' +
+      '</mjx-container> after</p>'
+    );
+    const target = instance.window.document.querySelector('#target');
+    assert.equal(
+      cleanCopy.getCopyPayload(
+        instance.window.document,
+        selectContents(instance.window, target),
+        cleanCopy.DEFAULT_SETTINGS,
+        instance.window,
+        target
+      ),
+      null,
+      'renderer root layout must remain visible: ' + style
+    );
+  }
+
+  for (const style of [
+    'clip-path:polygon(0 0,100% 0,100% 100%,0 100%)',
+    'clip-path:polygon(-17.55px -2px,calc(100% + 17.55px) -2px,calc(100% + 17.55px) calc(100% + 2px),-17.55px calc(100% + 2px)) padding-box',
+    'width:10px;height:10px;overflow:hidden',
+    'scale:1;zoom:1'
+  ]) {
+    const instance = dom(
+      '<p id="target">before <mjx-container class="MathJax">' +
+        '<mjx-math data-latex="x"><span style="' + style + '">x</span></mjx-math>' +
+      '</mjx-container> after</p>'
+    );
+    const target = instance.window.document.querySelector('#target');
+    assert.equal(
+      cleanCopy.getCopyPayload(
+        instance.window.document,
+        selectContents(instance.window, target),
+        cleanCopy.DEFAULT_SETTINGS,
+        instance.window,
+        target
+      ).text,
+      'before x after',
+      'visible renderer control: ' + style
+    );
+  }
+});
+
+test('source-less accessible labels never replace different selected text', () => {
+  for (const markup of [
+    '<span id="target" role="math" aria-label="SECRET">x</span>',
+    '<span id="target" role="math"><img alt="SECRET"><span>x</span></span>'
+  ]) {
+    const instance = dom(markup);
+    const target = instance.window.document.querySelector('#target');
+    assert.equal(
+      cleanCopy.getCopyPayload(
+        instance.window.document,
+        selectContents(instance.window, target),
+        cleanCopy.DEFAULT_SETTINGS,
+        instance.window,
+        target
+      ),
+      null
+    );
+  }
+});
+
+test('source-less MathJax-like roots cannot leak hidden or duplicate content alone or in mixed prose', () => {
+  const cases = [
+    {
+      name: 'display-none',
+      markup: '<span id="risky" style="display:none">SECRET</span><mjx-c>x</mjx-c>',
+      raw: 'before SECRETx after',
+      computedProperty: 'display',
+      computedValue: 'none'
+    },
+    {
+      name: 'zero-opacity',
+      markup: '<span id="risky" style="opacity:0">SECRET</span><mjx-c>x</mjx-c>',
+      raw: 'before SECRETx after',
+      computedProperty: 'opacity',
+      computedValue: '0'
+    },
+    {
+      name: 'clipped',
+      markup: '<span id="risky" style="clip-path:inset(100%)">SECRET</span><mjx-c>x</mjx-c>',
+      raw: 'before SECRETx after',
+      computedProperty: 'clipPath',
+      computedValue: 'inset(100%)'
+    },
+    {
+      name: 'absolute-duplicate',
+      markup: '<mjx-c id="risky" aria-hidden="true" style="position:absolute">x</mjx-c><mjx-c>x</mjx-c>',
+      raw: 'before xx after',
+      computedProperty: 'position',
+      computedValue: 'absolute'
+    }
+  ];
+
+  for (const testCase of cases) {
+    const instance = dom(
+      '<p id="target">before <mjx-container class="MathJax">' +
+        testCase.markup +
+      '</mjx-container> after</p>'
+    );
+    const target = instance.window.document.querySelector('#target');
+    const mathRoot = instance.window.document.querySelector('mjx-container');
+    const risky = instance.window.document.querySelector('#risky');
+    assert.equal(
+      instance.window.getComputedStyle(risky)[testCase.computedProperty],
+      testCase.computedValue,
+      testCase.name + ' fixture must exercise its intended layout risk'
+    );
+    const selection = selectContents(instance.window, target);
+    assert.equal(selection.toString(), testCase.raw);
+    assert.equal(
+      cleanCopy.getCopyPayload(
+        instance.window.document,
+        selection,
+        cleanCopy.DEFAULT_SETTINGS,
+        instance.window,
+        target
+      ),
+      null,
+      testCase.name + ' must stay on the browser native copy path'
+    );
+    assert.equal(
+      cleanCopy.getCopyPayload(
+        instance.window.document,
+        selectContents(instance.window, mathRoot),
+        cleanCopy.DEFAULT_SETTINGS,
+        instance.window,
+        mathRoot
+      ),
+      null,
+      testCase.name + ' must not leak through an exact whole-root selection either'
+    );
+  }
+});
+
+test('benign source-less MathJax-like roots also preserve native mixed-prose copying', () => {
+  const instance = dom(
+    '<p id="target">before <mjx-container class="MathJax"><mjx-c>x</mjx-c></mjx-container> after</p>'
+  );
+  const target = instance.window.document.querySelector('#target');
+  const selection = selectContents(instance.window, target);
+  assert.equal(selection.toString(), 'before x after');
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      instance.window.document,
+      selection,
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    ),
+    null
+  );
 });
 
 test('source-only math metadata must agree with visible anchors in surrounding prose', () => {
@@ -2051,9 +3097,40 @@ test('decodes the reported Google Docs equation from its structural clipboard sl
   assert.equal(faithful.mathRanges, 1);
   assert.equal(/[\s\u200b\u2060]$/.test(faithful.text), false);
   assert.equal(
-    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'calculator' }).text,
-    'abs(B)=sqrt((27.187)^(2)+(17.479)^(2)+(-28.112)^(2))=42.84*mu*T'
+    faithful.html,
+    '<!--StartFragment-->|B| = √((27.187)<sup>2</sup> + (17.479)<sup>2</sup> + ' +
+      '(−28.112)<sup>2</sup>) = 42.84 μT<!--EndFragment-->'
   );
+  const faithfulRich = dom(faithful.html).window.document.body;
+  assert.deepEqual(Array.from(faithfulRich.querySelectorAll('sup'), (node) => node.textContent), ['2', '2', '2']);
+  assert.equal(/^[\s\u200b\u2060]|[\s\u200b\u2060]$/u.test(faithfulRich.textContent), false);
+  assert.equal(/[\r\n]/u.test(faithfulRich.textContent), false);
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'calculator' }).text,
+    'abs(B)=sqrt((27.187)^(2)+(17.479)^(2)+(-28.112)^(2)) = 42.84 μT'
+  );
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'unicode' }).text,
+    '|B| = √((27.187)² + (17.479)² + (-28.112)²) = 42.84 μT'
+  );
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'ascii' }).text,
+    '|B| = sqrt((27.187)^2 + (17.479)^2 + (-28.112)^2) = 42.84 μT'
+  );
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'latex' }).text,
+    '$|B|=√((27.187)^{2}+(17.479)^{2}+(-28.112)^{2})$ = 42.84 μT'
+  );
+  for (const outputMode of ['calculator', 'ascii', 'latex']) {
+    const payload = cleanCopy.googleDocsSlicePayload(slice, { outputMode });
+    const rich = dom(payload.html).window.document.body;
+    assert.equal(rich.querySelector('sup, sub'), null, outputMode);
+    assert.equal(rich.textContent, payload.text, outputMode);
+    assert.equal(/^[\s\u200b\u2060]|[\s\u200b\u2060]$/u.test(rich.textContent), false, outputMode);
+  }
+  const unicodeRich = dom(cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'unicode' }).html)
+    .window.document.body;
+  assert.equal(unicodeRich.querySelectorAll('sup').length, 3);
 });
 
 test('Google Docs suppresses only contextual empty fence placeholders and keeps authored fences', () => {
@@ -2080,8 +3157,58 @@ test('Google Docs suppresses only contextual empty fence placeholders and keeps 
   );
   assert.equal(
     cleanCopy.googleDocsSlicePayload(reportedGoogleDocsEquationSlice(), { outputMode: 'latex' }).text,
-    '$\\left|B\\right|=\\sqrt{(27.187)^{2}+(17.479)^{2}+(-28.112)^{2}}=42.84~\\mu T$'
+    '$|B|=√((27.187)^{2}+(17.479)^{2}+(-28.112)^{2})$ = 42.84 μT'
   );
+});
+
+test('Google Docs scripts keep close-only and vertical fence bases atomic', () => {
+  const slice = googleDocsSlice([{ equation: [
+    '(x', { command: '\\superscript', args: [')', '2'] }, ' ',
+    '[x', { command: '\\superscript', args: [']', '2'] }, ' ',
+    '{x', { command: '\\superscript', args: ['}', '2'] }, ' ',
+    '(x', { command: '\\subscript', args: [')', 'n'] }, ' ',
+    '(x', { command: '\\subsuperscript', args: [')', 'n', '2'] }
+  ] }]);
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'faithful' }).text,
+    '(x)² [x]² {x}² (x)ₙ (x)ₙ²'
+  );
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'calculator' }).text,
+    '(x)^(2) [x]^(2) {x}^(2)*(x)_(n)*(x)_(n)^(2)'
+  );
+
+  const absolutePower = googleDocsSlice([{ equation: [
+    '|B', { command: '\\superscript', args: ['|', '2'] }
+  ] }]);
+  const expected = {
+    faithful: '|B|²',
+    calculator: 'abs(B)^(2)',
+    unicode: '|B|²',
+    ascii: '|B|^2',
+    latex: '$|B|^{2}$'
+  };
+  for (const [outputMode, text] of Object.entries(expected)) {
+    assert.equal(cleanCopy.googleDocsSlicePayload(absolutePower, { outputMode }).text, text);
+  }
+
+  const allUnicodeClosingPunctuation = [];
+  for (let point = 0; point <= 0x10ffff; point += 1) {
+    const character = String.fromCodePoint(point);
+    if (/^\p{Pe}$/u.test(character)) allUnicodeClosingPunctuation.push(character);
+  }
+  const unicodeFences = Array.from(new Set([
+    ...Array.from('|∣❘∥‖‗⌉⌋»'),
+    ...allUnicodeClosingPunctuation
+  ]));
+  for (const fence of unicodeFences) {
+    const fenceSlice = googleDocsSlice([{ equation: [
+      'x', { command: '\\superscript', args: [fence, '2'] }
+    ] }]);
+    const text = cleanCopy.googleDocsSlicePayload(fenceSlice, { outputMode: 'faithful' }).text;
+    assert.doesNotMatch(text, /\(/u, 'atomic closing fence must not acquire grouping: ' + fence);
+    assert.match(text, /²$/u);
+  }
 });
 
 test('uses Google Docs explicit rich HTML as a script fallback when its private slice is unavailable', () => {
@@ -2159,8 +3286,40 @@ test('uses explicit Google Docs text styles for scripts without guessing adjacen
     cleanCopy.googleDocsSlicePayload(styled, { outputMode: 'faithful' }).text,
     'x² + H₂O'
   );
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(styled, { outputMode: 'faithful' }).html,
+    '<!--StartFragment-->x<sup>2</sup> + H<sub>2</sub>O<!--EndFragment-->'
+  );
   assert.equal(cleanCopy.googleDocsSlicePayload(googleDocsSlice(['x2 + H2O']), { outputMode: 'faithful' }), null);
   assert.equal(cleanCopy.googleDocsSlicePayload('{not json', { outputMode: 'faithful' }), null);
+
+  const hostile = googleDocsSlice(['<script>&2'], [[0, 'nor'], [9, 'sup']]);
+  const hostilePayload = cleanCopy.googleDocsSlicePayload(hostile, { outputMode: 'faithful' });
+  assert.equal(hostilePayload.text, '<script>&²');
+  assert.equal(
+    hostilePayload.html,
+    '<!--StartFragment-->&lt;script&gt;&amp;<sup>2</sup><!--EndFragment-->'
+  );
+  assert.doesNotMatch(hostilePayload.html, /<script[\s>]/iu);
+
+  const schwa = googleDocsSlice([{ equation: ['xₔ'] }]);
+  assert.equal(
+    cleanCopy.googleDocsSlicePayload(schwa, { outputMode: 'faithful' }).html,
+    '<!--StartFragment-->x<sub>ə</sub><!--EndFragment-->'
+  );
+});
+
+test('Google Docs semantic rich copy stays scoped to a partial equation selection', () => {
+  const partial = googleDocsSlice([{ equation: [
+    '(27.187', { command: '\\superscript', args: [')', '2'] }
+  ] }]);
+  const payload = cleanCopy.googleDocsSlicePayload(partial, { outputMode: 'faithful' });
+  assert.equal(payload.text, '(27.187)²');
+  assert.equal(
+    payload.html,
+    '<!--StartFragment-->(27.187)<sup>2</sup><!--EndFragment-->'
+  );
+  assert.doesNotMatch(payload.text + payload.html, /\|B\||17\.479|28\.112|42\.84/u);
 });
 
 test('Google Docs equation text and operator names preserve authored spaces', () => {
@@ -2230,6 +3389,7 @@ test('repairs Google Docs equation clipboard text even when Docs stops propagati
   target.addEventListener('copy', (event) => {
     event.clipboardData.setData('text/plain', flat);
     event.clipboardData.setData('text/html', rich);
+    event.clipboardData.setData('HTML Format', rich);
     event.clipboardData.setData('application/x-vnd.google-docs-document-slice-clip+wrapped', slice);
     event.preventDefault();
     event.stopImmediatePropagation();
@@ -2248,9 +3408,100 @@ test('repairs Google Docs equation clipboard text even when Docs stops propagati
     clipboard.get('text/plain'),
     '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
   );
-  assert.equal(clipboard.get('text/html'), rich);
+  assert.equal(
+    clipboard.get('text/html'),
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'faithful' }).html
+  );
+  assert.notEqual(clipboard.get('text/html'), rich);
+  assert.match(clipboard.get('HTML Format'), /StartFragment:\d{10}/u);
+  assert.match(clipboard.get('HTML Format'), /\(27\.187\)<sup>2<\/sup>/u);
+  assert.doesNotMatch(clipboard.get('HTML Format'), /[\s\u200b\u2060]<\/body>/u);
   assert.equal(clipboard.get('application/x-vnd.google-docs-document-slice-clip+wrapped'), slice);
   assert.equal(event.defaultPrevented, true);
+});
+
+test('Google Docs semantic rich rejection atomically restores wrapped native clipboard flavors', () => {
+  const flat = '|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT';
+  const nativeHTML = '<span>|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT</span>';
+  const slice = reportedGoogleDocsEquationSlice();
+  const customType = 'application/x-vnd.google-docs-document-slice-clip+wrapped';
+  const instance = dom('<div id="target" contenteditable="true">' + flat + '</div>', 'https://docs.google.com/document/d/test/edit');
+  const target = instance.window.document.querySelector('#target');
+  selectContents(instance.window, target);
+  cleanCopy.install(instance.window.document, instance.window);
+  const clipboard = new Map();
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text/plain', flat);
+    event.clipboardData.setData('text/html', nativeHTML);
+    event.clipboardData.setData(customType, slice);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) {
+        if (type.toLowerCase() === 'text/html' && /<sup>2<\/sup>/u.test(value)) {
+          throw new Error('browser rejected semantic HTML');
+        }
+        clipboard.set(type, value);
+      },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  target.dispatchEvent(event);
+  assert.equal(clipboard.get('text/plain'), flat);
+  assert.equal(clipboard.get('text/html'), nativeHTML);
+  assert.equal(clipboard.get(customType), slice);
+});
+
+test('Google Docs non-wrappable semantic writes roll back every accepted rich and plain flavor', () => {
+  const flat = '|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT';
+  const nativeHTML = '<span>|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT</span>';
+  const nativeHTMLFormat = 'Version:1.0\r\nStartHTML:0000000000\r\nNATIVE';
+  const customType = 'application/x-vnd.google-docs-document-slice-clip+wrapped';
+  const slice = reportedGoogleDocsEquationSlice();
+  for (const rejectAt of [1, 2, 3]) {
+    const instance = dom('<div id="target" contenteditable="true">' + flat + '</div>', 'https://docs.google.com/document/d/test/edit');
+    const target = instance.window.document.querySelector('#target');
+    selectContents(instance.window, target);
+    cleanCopy.install(instance.window.document, instance.window);
+    const initial = new Map([
+      ['text/plain', flat],
+      ['text/html', nativeHTML],
+      ['HTML Format', nativeHTMLFormat],
+      [customType, slice]
+    ]);
+    const values = new Map(initial);
+    let semanticWrites = 0;
+    let rejected = false;
+    const clipboardData = {
+      get types() { return Array.from(values.keys()); },
+      clearData(type) { if (arguments.length) values.delete(type); else values.clear(); },
+      getData(type) { return values.get(type) || ''; }
+    };
+    Object.defineProperty(clipboardData, 'setData', {
+      value(type, value) {
+        if (!rejected && value !== initial.get(type)) {
+          semanticWrites += 1;
+          if (semanticWrites === rejectAt) {
+            rejected = true;
+            throw new Error('browser rejected semantic flavor');
+          }
+        }
+        values.set(type, value);
+      },
+      configurable: false,
+      writable: false
+    });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', { value: clipboardData });
+    target.dispatchEvent(event);
+    assert.deepEqual(values, initial, 'rejected write ' + rejectAt);
+    assert.equal(event.defaultPrevented, false, 'rejected write ' + rejectAt);
+  }
 });
 
 test('repairs copy events inside Google Docs hidden text-event iframe', async () => {
@@ -2290,6 +3541,10 @@ test('repairs copy events inside Google Docs hidden text-event iframe', async ()
     clipboard.get('text/plain'),
     '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
   );
+  assert.equal(
+    clipboard.get('text/html'),
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'faithful' }).html
+  );
   assert.equal(clipboard.get('application/x-vnd.google-docs-document-slice-clip+wrapped'), slice);
   assert.equal(event.defaultPrevented, true);
 
@@ -2322,6 +3577,10 @@ test('repairs copy events inside Google Docs hidden text-event iframe', async ()
   assert.equal(
     replacementClipboard.get('text/plain'),
     '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
+  );
+  assert.equal(
+    replacementClipboard.get('text/html'),
+    cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'faithful' }).html
   );
 });
 
@@ -2440,7 +3699,7 @@ test('isolated relay harvests cached Google Docs writes from its about:blank cli
       ]);
       event.preventDefault();
       event.stopImmediatePropagation();
-    });
+    }, { once: true });
     const event = new childWindow.Event('copy', { bubbles: true, cancelable: true, composed: true });
     Object.defineProperty(event, 'clipboardData', { value: Object.create(clipboardPrototype) });
     target.dispatchEvent(event);
@@ -2448,8 +3707,43 @@ test('isolated relay harvests cached Google Docs writes from its about:blank cli
       clipboard.get('text/plain'),
       '|B| = √((27.187)² + (17.479)² + (−28.112)²) = 42.84 μT'
     );
+    assert.equal(
+      clipboard.get('text/html'),
+      cleanCopy.googleDocsSlicePayload(slice, { outputMode: 'faithful' }).html
+    );
     assert.equal(clipboard.get('application/x-vnd.google-docs-document-slice-clip+wrapped'), slice);
     assert.equal(event.defaultPrevented, true);
+
+    const rejectedClipboard = new Map();
+    const nativeHTML = '<span>|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT</span>';
+    const rejectingPrototype = {
+      get types() { return Array.from(rejectedClipboard.keys()); },
+      clearData(type) { if (arguments.length) rejectedClipboard.delete(type); else rejectedClipboard.clear(); },
+      setData(type, value) {
+        if (type.toLowerCase() === 'text/html' && /<sup>2<\/sup>/u.test(value)) {
+          throw new Error('browser rejected relayed semantic HTML');
+        }
+        rejectedClipboard.set(type, value);
+      },
+      getData(type) { return rejectedClipboard.get(type) || ''; }
+    };
+    const cachedRejectingSetData = rejectingPrototype.setData;
+    target.addEventListener('copy', (copyEvent) => {
+      Reflect.apply(cachedRejectingSetData, copyEvent.clipboardData, ['text/plain', flat]);
+      Reflect.apply(cachedRejectingSetData, copyEvent.clipboardData, ['text/html', nativeHTML]);
+      Reflect.apply(cachedRejectingSetData, copyEvent.clipboardData, [
+        'application/x-vnd.google-docs-document-slice-clip+wrapped',
+        slice
+      ]);
+      copyEvent.preventDefault();
+      copyEvent.stopImmediatePropagation();
+    }, { once: true });
+    const rejectedEvent = new childWindow.Event('copy', { bubbles: true, cancelable: true, composed: true });
+    Object.defineProperty(rejectedEvent, 'clipboardData', { value: Object.create(rejectingPrototype) });
+    target.dispatchEvent(rejectedEvent);
+    assert.equal(rejectedClipboard.get('text/plain'), flat);
+    assert.equal(rejectedClipboard.get('text/html'), nativeHTML);
+    assert.equal(rejectedClipboard.get('application/x-vnd.google-docs-document-slice-clip+wrapped'), slice);
   } finally {
     if (previousInfo) Object.defineProperty(globalThis, 'GM_info', previousInfo);
     else delete globalThis.GM_info;
@@ -2575,6 +3869,44 @@ test('generic semantic markup must agree with the site plain text before rewriti
   });
   target.dispatchEvent(event);
   assert.equal(clipboard.get('text/plain'), 'Room 101');
+});
+
+test('generic clipboard MathML requires visible token order and keeps valid structures', () => {
+  const run = (nativeText, mathML) => {
+    const instance = dom('<div id="target" contenteditable="true">' + nativeText + '</div>');
+    const target = instance.window.document.querySelector('#target');
+    selectContents(instance.window, target);
+    cleanCopy.install(instance.window.document, instance.window);
+    const clipboard = new Map();
+    target.addEventListener('copy', (event) => {
+      event.clipboardData.setData('text/plain', nativeText);
+      event.clipboardData.setData(
+        'application/mathml+xml',
+        '<math xmlns="http://www.w3.org/1998/Math/MathML">' + mathML + '</math>'
+      );
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', {
+      value: {
+        get types() { return Array.from(clipboard.keys()); },
+        clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+        setData(type, value) { clipboard.set(type, value); },
+        getData(type) { return clipboard.get(type) || ''; }
+      }
+    });
+    target.dispatchEvent(event);
+    return clipboard.get('text/plain');
+  };
+
+  assert.equal(
+    run('y − x', '<mrow><mi>x</mi><mo>−</mo><mi>y</mi></mrow>'),
+    'y − x'
+  );
+  assert.equal(run('ab', '<mfrac><mi>a</mi><mi>b</mi></mfrac>'), 'a/b');
+  assert.equal(run('x2', '<msup><mi>x</mi><mn>2</mn></msup>'), 'x²');
+  assert.equal(run('ˆx', '<mover accent="true"><mi>x</mi><mo>ˆ</mo></mover>'), 'x̂');
 });
 
 test('repairs a site-written flattened vector even when the site stops copy propagation', () => {

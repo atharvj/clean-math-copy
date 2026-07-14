@@ -28,6 +28,34 @@ function copyVisibleKaTeX(source, outputMode = 'calculator', renderOptions) {
   );
 }
 
+function copyWithSwappedKaTeXSemantics(hiddenSource, visibleSource, mixed = false) {
+  const options = { displayMode: true, output: 'htmlAndMathml', throwOnError: true };
+  const hiddenDocument = new JSDOM(katex.renderToString(hiddenSource, options)).window.document;
+  const visibleDocument = new JSDOM(katex.renderToString(visibleSource, options)).window.document;
+  const hiddenRoot = hiddenDocument.querySelector('.katex');
+  hiddenRoot.querySelector('.katex-html').replaceWith(
+    hiddenDocument.importNode(visibleDocument.querySelector('.katex-html'), true)
+  );
+  const markup = mixed
+    ? '<p id="fixture">before ' + hiddenRoot.outerHTML + ' after</p>'
+    : hiddenRoot.outerHTML;
+  const instance = new JSDOM('<!doctype html><html><body>' + markup + '</body></html>');
+  const target = mixed
+    ? instance.window.document.querySelector('#fixture')
+    : instance.window.document.querySelector('.katex-html');
+  const range = instance.window.document.createRange();
+  range.selectNodeContents(target);
+  const selection = instance.window.getSelection();
+  selection.addRange(range);
+  return cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+}
+
 test('real KaTeX DOM: faithful mode reproduces the two target visual formulas', () => {
   assert.equal(
     copyVisibleKaTeX(String.raw`(y')^2=20x'`, 'faithful').text,
@@ -146,6 +174,61 @@ test('real KaTeX DOM: faithful whole-copy follows rendered semantics over diverg
     copyVisibleKaTeX(String.raw`\htmlClass{foo}{x}`, 'faithful', { trust: true, strict: false }).text,
     'x'
   );
+});
+
+test('real KaTeX DOM: hidden MathML must match visible fraction, root, and script topology', () => {
+  const mismatches = [
+    [String.raw`\sqrt{x}`, 'x'],
+    [String.raw`\frac{x}{y}`, 'yx'],
+    ['x^y', 'xy'],
+    ['x^y', 'x_y'],
+    [String.raw`\frac{x}{\frac{y}{z}}`, String.raw`\frac{\frac{x}{y}}{z}`],
+    [String.raw`\frac{\frac{x}{y}}{z}`, String.raw`\frac{x}{\frac{y}{z}}`],
+    [String.raw`\sqrt{\frac{x}{y}}`, String.raw`\frac{\sqrt{x}}{y}`],
+    [String.raw`\sqrt{x^y}`, String.raw`\sqrt{x}^y`],
+    ['x^{y^z}', '{x^y}^z'],
+    ['(xy)^2', 'xy^2'],
+    ['xy^2', '(xy)^2'],
+    ['(x+y)^2', 'x+y^2'],
+    ['{xy}^2', 'xy^2'],
+    ['(xy)_2', 'xy_2'],
+    [String.raw`\sqrt{{}^x}`, String.raw`{}^{\sqrt{x}}`],
+    [String.raw`\vec{x}`, 'x'],
+    [String.raw`\hat{x}`, 'x'],
+    [String.raw`\overline{x}`, 'x'],
+    [String.raw`\underline{x}`, 'x'],
+    [String.raw`\hat{\vec{x}}`, String.raw`\vec{\hat{x}}`],
+    [String.raw`\widehat{x}`, String.raw`\widetilde{x}`],
+    ['|x|', 'x'],
+    ['(x)', 'x'],
+    ['x,y', 'xy'],
+    ['12.3', '123'],
+    [String.raw`\begin{matrix}a&b\\c&d\end{matrix}`, 'acbd'],
+    [String.raw`\begin{matrix}a&b\\c&d\end{matrix}`,
+      String.raw`\begin{matrix}a&c&b&d\end{matrix}`],
+    [String.raw`\begin{cases}x&y\\z&w\end{cases}`, 'xzyw'],
+    [String.raw`\boxed{x}`, 'x'],
+    [String.raw`\cancel{x}`, 'x']
+  ];
+  for (const [hidden, visible] of mismatches) {
+    assert.equal(copyWithSwappedKaTeXSemantics(hidden, visible), null, hidden + ' <- ' + visible);
+  }
+
+  assert.equal(
+    copyWithSwappedKaTeXSemantics('(xy)^2', 'xy^2', true),
+    null,
+    'mixed prose cannot bypass topology agreement'
+  );
+
+  for (const source of [
+    String.raw`\frac{x}{\frac{y}{z}}`, String.raw`\frac{\frac{x}{y}}{z}`,
+    String.raw`\sqrt{\frac{x}{y}}`, String.raw`\sqrt{x^y}`, 'x^{y^z}',
+    '{xy}^2', String.raw`10^{-25}`, '(27.187)^2', String.raw`F(x)\big\rvert_0^1`,
+    String.raw`\hat{\vec{x}}`, String.raw`\vec{\hat{x}}`,
+    String.raw`\begin{matrix}a&b\\c&d\end{matrix}`, String.raw`\boxed{x}`, String.raw`\cancel{x}`
+  ]) {
+    assert.ok(copyVisibleKaTeX(source, 'faithful'), 'matching genuine KaTeX: ' + source);
+  }
 });
 
 test('real KaTeX DOM: faithful mode preserves binomial stacks, accents, and isotope prescripts', () => {
