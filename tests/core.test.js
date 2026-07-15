@@ -455,9 +455,10 @@ test('standalone Unicode classification distinguishes formulas from comparative 
 
 test('cleans copy artifacts without breaking emoji joiners or intentional newlines', () => {
   const family = '👨‍👩‍👧‍👦';
-  assert.equal(cleanCopy.cleanClipboardText('A\u00a0B\u200bC\u00adD\u2060\r\n' + family), 'A BCD\n' + family);
+  assert.equal(cleanCopy.cleanClipboardText('A\u00a0B\u200bC\u00adD\u2060\u0000\r\n' + family), 'A BCD\n' + family);
   assert.equal(cleanCopy.hasCleanableArtifacts('plain text'), false);
   assert.equal(cleanCopy.hasCleanableArtifacts('zero\u200bwidth'), true);
+  assert.equal(cleanCopy.hasCleanableArtifacts('legacy\u0000glyph'), true);
 });
 
 test('normalizes invalid settings safely', () => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.4.1
+// @version      2.4.2
 // @description  Accurately copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
@@ -6615,7 +6615,7 @@
     const append = (text, preserveWhitespace) => {
       let value = String(text == null ? '' : text)
         .replace(/\r\n?/g, '\n')
-        .replace(/[\u00ad\u200b\u2060\ufeff]/g, '')
+        .replace(/[\u0000\u00ad\u200b\u2060\ufeff]/g, '')
         .replace(/\u00a0/g, ' ');
       if (!preserveWhitespace) value = value.replace(/[\t\n\f\r ]+/g, ' ');
       output += value;
@@ -7392,6 +7392,26 @@
       image.matches('.mwe-math-fallback-image-inline, .mwe-math-fallback-image-display'));
   }
 
+  function isAuthenticatedKatexWholeBoundary(root, container) {
+    if (!root || !container || container.nodeType !== 1 ||
+        !root.matches || !root.matches('.katex-display') ||
+        !container.matches || !container.matches('.katex') ||
+        container.parentElement !== root) return false;
+    const rootChildren = elementChildren(root);
+    if (rootChildren.length !== 1 || rootChildren[0] !== container || hasSignificantDirectText(root)) return false;
+    const branches = elementChildren(container);
+    if (branches.length !== 2) return false;
+    const semanticBranch = branches.find((branch) => branch.matches && branch.matches('.katex-mathml'));
+    const visualBranch = branches.find((branch) => branch.matches && branch.matches('.katex-html'));
+    if (!semanticBranch || !visualBranch || !isGenuineKatexVisualBranch(visualBranch)) return false;
+    const semanticChildren = elementChildren(semanticBranch);
+    const math = semanticChildren.length === 1 &&
+      (semanticChildren[0].localName || '').toLowerCase() === 'math'
+      ? semanticChildren[0]
+      : null;
+    return Boolean(math && getMathElement(root) === math);
+  }
+
   function semanticMathRootAgreesWithVisible(root, math) {
     if (!wikipediaMathAgreesWithFallback(root, math)) return false;
     if (!root || !math || !root.querySelector) return true;
@@ -7784,6 +7804,22 @@
       const normalized = range.cloneRange();
       let normalizedBoundary = false;
       try {
+        // A Chromium mouse drag that ends immediately after display KaTeX can
+        // report the endpoint on its direct inner `.katex` wrapper, after both
+        // the hidden MathML and visible HTML branches. Treat only that exact,
+        // authenticated whole-renderer boundary as being after the canonical
+        // `.katex-display` root. An offset between the two branches remains a
+        // strict partial selection and deliberately fails closed.
+        if (startRoot && isAuthenticatedKatexWholeBoundary(startRoot, range.startContainer) &&
+            range.startOffset === 0) {
+          normalized.setStartBefore(startRoot);
+          normalizedBoundary = true;
+        }
+        if (endRoot && isAuthenticatedKatexWholeBoundary(endRoot, range.endContainer) &&
+            range.endOffset === range.endContainer.childNodes.length) {
+          normalized.setEndAfter(endRoot);
+          normalizedBoundary = true;
+        }
         // Chromium terminates a mouse drag around Wikipedia's indivisible
         // fallback image on the outer wrapper at offset 0/childNodes.length.
         // Move only those exact Wikipedia endpoints outside the renderer; the
@@ -7898,7 +7934,7 @@
   function cleanClipboardText(input) {
     const value = String(input == null ? '' : input)
       .replace(/\r\n?/g, '\n')
-      .replace(/[\u00ad\u200b\u2060\ufeff]/g, '')
+      .replace(/[\u0000\u00ad\u200b\u2060\ufeff]/g, '')
       .replace(/\u00a0/g, ' ');
     return value.normalize ? value.normalize('NFC') : value;
   }
@@ -8721,7 +8757,7 @@
   }
 
   function hasCleanableArtifacts(text) {
-    return /[\u00ad\u200b\u2060\ufeff\u00a0\r]/.test(text);
+    return /[\u0000\u00ad\u200b\u2060\ufeff\u00a0\r]/.test(text);
   }
 
   function looksLikeStandaloneUnicodeMath(input) {
@@ -8924,7 +8960,7 @@
       .replace(/\r\n?/g, '\n')
       // U+200D is intentionally absent: it joins emoji and several writing
       // systems. Bidi controls and combining marks are also meaningful text.
-      .replace(/[\u00ad\u200b\u2060\ufeff]/g, '')
+      .replace(/[\u0000\u00ad\u200b\u2060\ufeff]/g, '')
       .replace(/\u00a0/g, ' ');
   }
 
@@ -9969,11 +10005,19 @@
       const style = styles[fontName] || {};
       const size = Math.max(0.01, Math.hypot(number(transform[0], 0), number(transform[1], 0)) ||
         number(source && source.height, 0) || 1);
-      const text = String(source && source.str || '');
+      const rawText = String(source && source.str || '');
       const x = number(transform[4], 0);
       const y = number(transform[5], 0);
       const width = Math.max(0, Math.abs(number(source && source.width, 0)));
       const originalFont = cleanFontName(font.name || font.loadedName || style.fontFamily || fontName);
+      // Older PDFs without a usable ToUnicode map can expose raw TeX OMS
+      // slots. In CMSY fonts slot 0 is the minus sign; leaving it as U+0000
+      // produces an invisible/NUL character on the clipboard. The radical's
+      // legacy `p` slot is normalized later only when its drawn overbar
+      // authenticates the glyph geometrically.
+      const text = /^CMSY\d+$/i.test(originalFont)
+        ? rawText.replace(/\u0000/gu, '−')
+        : rawText;
       let semantic = '';
       // In TeX's CMEX encoding, character 0x5a is the display integral. PDF
       // text extraction commonly maps that byte to the literal letter Z.
@@ -10067,7 +10111,9 @@
 
     const usedRules = new Set();
     for (const root of visible) {
-      if (root.text !== '√') continue;
+      const unicodeRoot = root.text === '√';
+      const legacyTexRoot = root.text === 'p' && /^CMSY\d+$/i.test(root.originalFont);
+      if (!unicodeRoot && !legacyTexRoot) continue;
       let best = null;
       let bestScore = Infinity;
       for (const rule of horizontalRules) {
@@ -10078,6 +10124,7 @@
         if (score < bestScore) { best = rule; bestScore = score; }
       }
       if (!best) continue;
+      if (legacyTexRoot) root.text = '√';
       usedRules.add(best);
       root.semantic = 'root';
       root.radical = 'root-' + root.index;
@@ -11463,6 +11510,13 @@
               const item = analysis.items[index];
               const span = textLayer.textDivs[index];
               if (!span || !span.isConnected || !item.text || /^\s+$/u.test(item.text)) continue;
+              // Keep the selectable layer aligned with authenticated legacy
+              // font normalization. The canvas remains the visual source of
+              // truth; these replacements are one glyph for one glyph, so
+              // TextLayer geometry and partial-selection offsets stay exact.
+              if (span.textContent !== item.text && span.textContent.length === item.text.length) {
+                span.textContent = item.text;
+              }
               const line = linesById.get(item.line);
               span.setAttribute('data-cmc-pdf-item', String(item.index));
               span.setAttribute('data-cmc-pdf-line', String(item.line));
@@ -13714,6 +13768,31 @@
       }
     };
 
+    const replayDirectPdfClipboardAfterDispatch = (payload, copyGeneration, copyModeGeneration) => {
+      if (!payload || payload.reason !== 'trusted-pdf-text-layer' ||
+          !isDirectPdfDocument(documentObject, pageWindow)) return;
+      const isCurrent = () => clipboardIntentGeneration === copyGeneration &&
+        modeGeneration === copyModeGeneration && currentSettings().outputMode !== 'native';
+      const replay = () => {
+        // Chromium's privileged application/pdf copy path commits after the
+        // DOM ClipboardEvent. In embedded TeX fonts that late native commit can
+        // replace an already-correct radical with source glyph bytes such as
+        // `p` and NUL. Replay only our authenticated viewer payload in the next
+        // task so it wins that browser-level race; generation checks prevent
+        // an older PDF copy from overwriting any newer user copy or mode.
+        if (!isCurrent()) return;
+        writeClipboardPayload(payload, pageWindow, isCurrent).catch(() => {});
+      };
+      try {
+        const schedule = pageWindow && typeof pageWindow.setTimeout === 'function'
+          ? pageWindow.setTimeout.bind(pageWindow)
+          : setTimeout;
+        schedule(replay, 0);
+      } catch (_error) {
+        // The synchronous DataTransfer payload remains the safe fallback.
+      }
+    };
+
     let listenerReady = null;
     if (!inheritedSettingsProvider) {
       const onSettingsChange = (_name, _oldValue, newValue) => {
@@ -14110,6 +14189,7 @@
         if (officeState.recovery) officeState.recovery.stop();
       }
       event.preventDefault();
+      replayDirectPdfClipboardAfterDispatch(payload, eventGeneration, eventModeGeneration);
       event.stopImmediatePropagation();
     };
 

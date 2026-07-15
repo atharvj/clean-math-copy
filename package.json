@@ -1,6 +1,6 @@
 {
   "name": "clean-math-copy-userscript",
-  "version": "2.4.1",
+  "version": "2.4.2",
   "private": true,
   "description": "Accurately transcribe web math and clean messy copied text for readable plain-text paste.",
   "repository": {

@@ -45,6 +45,23 @@ function analyzeTongEquation() {
   );
 }
 
+function analyzeLegacyEncodedTongEquation() {
+  const items = TONG_EQUATION_ITEMS.map((item) => {
+    if (item.str === '√') return { ...item, str: 'p' };
+    if (item.str === '−') return { ...item, str: '\u0000', fontName: 'rootFont' };
+    return { ...item };
+  });
+  return cleanCopy.analyzePdfPageText(
+    items,
+    {},
+    {
+      integralFont: { name: 'ABCDEF+CMEX10' },
+      rootFont: { name: 'ABCDEF+CMSY10' }
+    },
+    TONG_RADICAL_RULES
+  );
+}
+
 function radicalCharacterCount(item) {
   if (!item.radical || item.semantic === 'root') return 0;
   if (item.x + item.width <= item.radicalEndX + item.size * 0.06) return item.text.length;
@@ -218,6 +235,38 @@ test('Tong PDF geometry recovers its integral, superscript, and exact radical sc
     [s, equals, integral, differential, dimension, coordinate, root, minus, radicandAndFactor].map((item) => item.line),
     Array(9).fill(0)
   );
+});
+
+test('Tong PDF geometry decodes legacy CMSY radical and minus font slots', () => {
+  const analysis = analyzeLegacyEncodedTongEquation();
+  const root = analysis.items[6];
+  const minus = analysis.items[7];
+
+  assert.equal(root.text, '√');
+  assert.equal(root.semantic, 'root');
+  assert.equal(root.originalFont, 'CMSY10');
+  assert.equal(minus.text, '−');
+  assert.equal(minus.radical, root.radical);
+
+  const instance = new JSDOM(
+    '<!doctype html><html><body><div id="viewer"><section id="page" data-cmc-pdf-page="148"></section></div></body></html>',
+    { url: 'https://example.test/general-relativity.pdf' }
+  );
+  const { document } = instance.window;
+  const viewer = document.querySelector('#viewer');
+  const page = document.querySelector('#page');
+  annotateAnalyzedPdfPage(document, page, analysis);
+  cleanCopy.registerTrustedPdfViewerRoot(viewer);
+  const payload = cleanCopy.getCopyPayload(
+    document,
+    selectNodeContents(instance, page),
+    { outputMode: 'faithful' },
+    instance.window,
+    page
+  );
+  assert.ok(payload);
+  assert.equal(payload.text, 'S = ∫ d⁴x √(−g) R');
+  assert.doesNotMatch(payload.text, /[p\u0000]/u);
 });
 
 test('Tong PDF geometry recognizes its shallow Greek metric subscript', () => {

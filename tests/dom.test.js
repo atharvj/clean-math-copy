@@ -931,7 +931,7 @@ test('old KaTeX split numeric powers do not force mixed prose and display math t
     inline,
     '. The numerical factor relating energy and curvature is</p>',
     display,
-    '</section>'
+    '</section><p id="after">Following text.</p>'
   ].join(''));
   splitOldKatexNumericPower(instance.window.document.querySelector('.katex-display'));
   const target = instance.window.document.querySelector('#target');
@@ -951,6 +951,95 @@ test('old KaTeX split numeric powers do not force mixed prose and display math t
   assert.equal(payload.text, expected);
   assert.equal((payload.text.match(/\n/gu) || []).length, 2);
   assert.doesNotMatch(payload.text + payload.html, /\\(?:text|frac|times)|DUPLICATE/u);
+
+  // Chromium can terminate a real mouse drag on the direct inner `.katex`
+  // wrapper at offset 2 (after its hidden semantic and visible branches),
+  // instead of after the canonical `.katex-display` root.
+  const firstParagraph = target.querySelector('p');
+  const displayRoot = target.querySelector('.katex-display');
+  const rendererWrapper = displayRoot.querySelector('.katex');
+  assert.equal(rendererWrapper.parentElement, displayRoot);
+  assert.equal(rendererWrapper.childNodes.length, 2);
+  const mouseRange = instance.window.document.createRange();
+  mouseRange.setStart(firstParagraph.firstChild, 0);
+  mouseRange.setEnd(rendererWrapper, rendererWrapper.childNodes.length);
+  const selection = instance.window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(mouseRange);
+
+  const mouseExpected = {
+    faithful: expected,
+    calculator: 'In Cartesian coordinates, the curvature tensor has units of (length)^(-2). ' +
+      'The numerical factor relating energy and curvature is\n\n' +
+      '((8*pi*G)/(c^(4)))=2.08*10^(-43)*((meter^(-2))/(J/meter^(3))).',
+    latex: 'In Cartesian coordinates, the curvature tensor has units of $\\text{length}^{-2}$. ' +
+      'The numerical factor relating energy and curvature is\n\n' +
+      '$$\\frac{8\\pi G}{c^4} = 2.08 \\times 10^{-43} ' +
+      '\\frac{\\text{meter}^{-2}}{\\text J / \\text{meter}^3}.$$'
+  };
+  for (const outputMode of ['faithful', 'calculator', 'latex']) {
+    const mousePayload = cleanCopy.getCopyPayload(
+      instance.window.document,
+      selection,
+      { outputMode },
+      instance.window,
+      rendererWrapper
+    );
+    assert.ok(mousePayload, outputMode);
+    assert.equal(mousePayload.reason, 'rendered-math', outputMode);
+    assert.equal(mousePayload.text, mouseExpected[outputMode], outputMode);
+    assert.doesNotMatch(mousePayload.text + mousePayload.html, /DUPLICATE|\\displaystyle/u, outputMode);
+    if (outputMode !== 'latex') {
+      assert.doesNotMatch(mousePayload.text, /\\(?:text|frac|times)/u, outputMode);
+    }
+    assert.equal((mousePayload.text.match(/\n/gu) || []).length, 2, outputMode);
+  }
+
+  const afterText = instance.window.document.querySelector('#after').firstChild;
+  const reverseRange = instance.window.document.createRange();
+  reverseRange.setStart(rendererWrapper, 0);
+  reverseRange.setEnd(afterText, afterText.data.length);
+  selection.removeAllRanges();
+  selection.addRange(reverseRange);
+  const reversePayload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    { outputMode: 'faithful' },
+    instance.window,
+    rendererWrapper
+  );
+  assert.ok(reversePayload);
+  assert.equal(reversePayload.text,
+    '8πG/c⁴ = 2.08 × 10⁻⁴³ (meter⁻²/(J/meter³)).\nFollowing text.');
+  assert.doesNotMatch(reversePayload.text + reversePayload.html, /DUPLICATE|\\displaystyle/u);
+
+  selection.removeAllRanges();
+  selection.addRange(mouseRange);
+  const equationLabel = instance.window.document.createElement('span');
+  equationLabel.textContent = '(1)';
+  displayRoot.appendChild(equationLabel);
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    { outputMode: 'faithful' },
+    instance.window,
+    rendererWrapper
+  ), null, 'a sibling equation label makes the outer boundary non-atomic');
+  equationLabel.remove();
+
+  // Offset 1 sits between the hidden MathML and visible HTML branches. It is
+  // not a whole-renderer boundary and must never be widened to the equation.
+  const partialRange = mouseRange.cloneRange();
+  partialRange.setEnd(rendererWrapper, 1);
+  selection.removeAllRanges();
+  selection.addRange(partialRange);
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    { outputMode: 'faithful' },
+    instance.window,
+    rendererWrapper
+  ), null);
 });
 
 test('KaTeX numeric script bases stay inside their fraction branch', () => {
