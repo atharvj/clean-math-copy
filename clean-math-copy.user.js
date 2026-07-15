@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.3.0
+// @version      2.3.1
 // @description  Faithfully copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
@@ -7219,6 +7219,13 @@
       faithfulAgreementKey(unicodeToCalculator(semantic));
   }
 
+  function isWikipediaAtomicFallbackRoot(root) {
+    if (!root || !root.matches || !root.matches('.mwe-math-element') || !root.querySelector) return false;
+    const image = root.querySelector('img[alt]');
+    return Boolean(image && image.parentElement === root && image.matches &&
+      image.matches('.mwe-math-fallback-image-inline, .mwe-math-fallback-image-display'));
+  }
+
   function semanticMathRootAgreesWithVisible(root, math) {
     if (!wikipediaMathAgreesWithFallback(root, math)) return false;
     if (!root || !math || !root.querySelector) return true;
@@ -7599,6 +7606,33 @@
     if (!originalRoots.length) return null;
     const startRoot = outermostMathAncestor(range.startContainer);
     const endRoot = outermostMathAncestor(range.endContainer);
+    if (startRoot !== endRoot) {
+      const normalized = range.cloneRange();
+      let normalizedBoundary = false;
+      try {
+        // Chromium terminates a mouse drag around Wikipedia's indivisible
+        // fallback image on the outer wrapper at offset 0/childNodes.length.
+        // Move only those exact Wikipedia endpoints outside the renderer; the
+        // normal serializer then preserves paragraph context and still checks
+        // fallback-image alt text against sanitized MathML.
+        if (startRoot && isWikipediaAtomicFallbackRoot(startRoot) &&
+            range.startContainer === startRoot && range.startOffset === 0) {
+          normalized.setStartBefore(startRoot);
+          normalizedBoundary = true;
+        }
+        if (endRoot && isWikipediaAtomicFallbackRoot(endRoot) &&
+            range.endContainer === endRoot &&
+            range.endOffset === endRoot.childNodes.length) {
+          normalized.setEndAfter(endRoot);
+          normalizedBoundary = true;
+        }
+      } catch (_error) {
+        return null;
+      }
+      if (normalizedBoundary) {
+        return serializeRangePayloadWithMath(normalized, settings, pageWindow);
+      }
+    }
     if (originalRoots.length === 1 && startRoot && startRoot === endRoot &&
         nodeInside(startRoot, range.startContainer) && nodeInside(startRoot, range.endContainer)) {
       const semanticSelection = semanticMathSelectionPayload(startRoot, range, settings, pageWindow);
@@ -8937,7 +8971,15 @@
           const modeledBlock = BLOCK_TAGS.has(tag) || /display\s*:\s*(?:block|flex|grid|list-item|table)/i.test(
             String(element.getAttribute && element.getAttribute('style') || '')
           );
-          if (computedBlock !== modeledBlock && display !== 'contents') return true;
+          // Wikipedia declares its authenticated display-math wrapper as a
+          // <span> and gives it display:block from an external stylesheet.
+          // The semantic MathML display flag already proves that block layout
+          // is intentional. Keep rejecting every other class-driven block,
+          // including CSS that tries to promote inline math or ordinary spans.
+          const authenticatedDisplayMathBlock = replaceableMathRoot &&
+            display === 'block' && isDisplayMath(element);
+          if (computedBlock !== modeledBlock && display !== 'contents' &&
+              !authenticatedDisplayMathBlock) return true;
           if (display === 'contents' && modeledBlock) return true;
         }
       } catch (_error) {

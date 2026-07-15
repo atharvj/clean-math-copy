@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <title>Clean Math Copy browser smoke</title>
+  <style>.mwe-math-element-block { display: block; overflow: auto hidden; }</style>
 </head>
 <body>
   <span id="unicode-partial">0.666 × 10⁻²⁵</span>
@@ -49,6 +50,11 @@
     </span>
     <span class="visual-layout">a∣b</span>
   </span>
+
+  <main id="wikipedia-quadratic">
+    <p>Given a general quadratic equation of the form <span class="nowrap">⁠<span class="mwe-math-element mwe-math-element-inline"><span class="mwe-math-mathml-inline mwe-math-mathml-a11y" style="display:none"><math alttext="{\displaystyle \textstyle ax^{2}+bx+c=0}"><semantics><mrow><mi>a</mi><msup><mi>x</mi><mn>2</mn></msup><mo>+</mo><mi>b</mi><mi>x</mi><mo>+</mo><mi>c</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">{\displaystyle \textstyle ax^{2}+bx+c=0}</annotation></semantics></math></span><img class="mwe-math-fallback-image-inline" aria-hidden="true" alt="{\displaystyle \textstyle ax^{2}+bx+c=0}"></span>⁠</span>, the values can be found using the quadratic formula,</p>
+    <p><span class="mwe-math-element mwe-math-element-block"><span class="mwe-math-mathml-display mwe-math-mathml-a11y" style="display:none"><math display="block" alttext="{\displaystyle x={\frac {-b\pm {\sqrt {b^{2}-4ac}}}{2a}},}"><semantics><mrow><mi>x</mi><mo>=</mo><mfrac><mrow><mo>−</mo><mi>b</mi><mo>±</mo><msqrt><msup><mi>b</mi><mn>2</mn></msup><mo>−</mo><mn>4</mn><mi>a</mi><mi>c</mi></msqrt></mrow><mrow><mn>2</mn><mi>a</mi></mrow></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">{\displaystyle x={\frac {-b\pm {\sqrt {b^{2}-4ac}}}{2a}},}</annotation></semantics></math></span><img class="mwe-math-fallback-image-display" aria-hidden="true" alt="{\displaystyle x={\frac {-b\pm {\sqrt {b^{2}-4ac}}}{2a}},}"></span></p>
+  </main>
 
   <span id="ordinary-symbol-prose">Symbols in prose: α vs β.</span>
   <span id="comparative-prose">Plan A ≠ Plan B</span>
@@ -296,6 +302,27 @@
 
       const renderedRelation = copyRange(document.querySelector('#relation-renderer .visual-layout'));
       assertEqual('relational bar stays relational', renderedRelation.plain, 'a ∣ b');
+
+      const wikipediaTarget = document.querySelector('#wikipedia-quadratic');
+      const wikipediaRange = document.createRange();
+      wikipediaRange.setStart(wikipediaTarget.querySelector('p').firstChild, 0);
+      const wikipediaDisplay = wikipediaTarget.querySelector('.mwe-math-element-block');
+      wikipediaRange.setEnd(wikipediaDisplay, wikipediaDisplay.childNodes.length);
+      const wikipediaSelection = getSelection();
+      wikipediaSelection.removeAllRanges();
+      wikipediaSelection.addRange(wikipediaRange);
+      const wikipedia = dispatchCopy(wikipediaTarget);
+      assertEqual('Wikipedia stylesheet display math is handled', wikipedia.prevented, true);
+      assertEqual(
+        'Wikipedia prose and display equation stay semantic',
+        wikipedia.plain,
+        'Given a general quadratic equation of the form ax² + bx + c = 0, the values can be found using the quadratic formula,\n\nx = (−b ± √(b² − 4ac))/(2a),'
+      );
+      assertEqual(
+        'Wikipedia hidden TeX never reaches rich copy',
+        /displaystyle|\\textstyle|\\frac|\u2060/u.test(wikipedia.plain + wikipedia.html),
+        false
+      );
 
       const ordinary = copyRange(document.querySelector('#ordinary-symbol-prose'));
       assertEqual('ordinary symbol prose stays native', ordinary.prevented, false);

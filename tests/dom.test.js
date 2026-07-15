@@ -2624,33 +2624,231 @@ test('Wikipedia formula page classes never swallow its real MathML renderers', (
 });
 
 test('Wikipedia prose plus display equation copies one clean readable selection', () => {
-  const inline = wikipediaMath([
+  const equation = wikipediaMath([
     '<mrow><mi>a</mi><msup><mi>x</mi><mn>2</mn></msup><mo>+</mo><mi>b</mi><mi>x</mi>',
     '<mo>+</mo><mi>c</mi><mo>=</mo><mn>0</mn></mrow>'
   ].join(''), '\\textstyle ax^{2}+bx+c=0');
+  const x = wikipediaMath('<mrow><mi>x</mi></mrow>', 'x');
+  const a = wikipediaMath('<mrow><mi>a</mi></mrow>', 'a');
+  const b = wikipediaMath('<mrow><mi>b</mi></mrow>', 'b');
+  const c = wikipediaMath('<mrow><mi>c</mi></mrow>', 'c');
+  const nonzero = wikipediaMath(
+    '<mrow><mi>a</mi><mo>≠</mo><mn>0</mn></mrow>',
+    'a \\neq 0'
+  );
   const display = wikipediaMath([
     '<mrow><mi>x</mi><mo>=</mo><mfrac><mrow><mo>−</mo><mi>b</mi><mo>±</mo><msqrt>',
     '<msup><mi>b</mi><mn>2</mn></msup><mo>−</mo><mn>4</mn><mi>a</mi><mi>c</mi>',
     '</msqrt></mrow><mrow><mn>2</mn><mi>a</mi></mrow></mfrac><mo>,</mo></mrow>'
   ].join(''), 'x={\\frac {-b\\pm {\\sqrt {b^{2}-4ac}}}{2a}},', true);
+  const nowrap = (math) => '<span class="nowrap">\u2060' + math + '\u2060</span>';
   const instance = dom([
+    '<style>.mwe-math-element-block{display:block;overflow:auto hidden}</style>',
     '<main id="target" class="page-Quadratic_formula rootpage-Quadratic_formula">',
-    '<p>Given a general quadratic equation of the form <span class="nowrap">\u2060', inline,
-    '\u2060</span>, the values can be found using the quadratic formula,</p><p>', display, '</p></main>'
+    '<p>Given a general quadratic equation of the form ', nowrap(equation),
+    ', with ', nowrap(x), ' representing an unknown, and <a>coefficients</a> ', nowrap(a),
+    ', ', nowrap(b), ', and ', nowrap(c), ' representing known <a>real</a> or <a>complex</a> ',
+    'numbers with ', nowrap(nonzero), ', the values of ', nowrap(x),
+    ' satisfying the equation, called the <a><i>roots</i></a> or <i>zeros</i>, can be found ',
+    'using the quadratic formula,</p><p>', display, '</p></main>'
   ].join(''), 'https://en.wikipedia.org/wiki/Quadratic_formula');
   const target = instance.window.document.querySelector('#target');
+  const firstParagraph = target.querySelector('p');
+  const displayRoot = target.querySelector('.mwe-math-element-block');
+  assert.equal(
+    instance.window.getComputedStyle(displayRoot).display,
+    'block',
+    'the regression must exercise Wikipedia\'s external display-math CSS'
+  );
+  assert.equal(displayRoot.childNodes.length, 2, 'the live root contains hidden MathML followed by its fallback image');
+  const range = instance.window.document.createRange();
+  range.setStart(firstParagraph.firstChild, 0);
+  // A real Chromium mouse drag ends on the wrapper after its fallback image,
+  // rather than after the surrounding paragraph.
+  range.setEnd(displayRoot, displayRoot.childNodes.length);
+  const selection = instance.window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
   const payload = cleanCopy.getCopyPayload(
     instance.window.document,
-    selectContents(instance.window, target),
+    selection,
     cleanCopy.DEFAULT_SETTINGS,
     instance.window,
     target
   );
   assert.equal(
     payload.text,
-    'Given a general quadratic equation of the form ax² + bx + c = 0, the values can be found using the quadratic formula,\n\nx = (−b ± √(b² − 4ac))/(2a),'
+    'Given a general quadratic equation of the form ax² + bx + c = 0, with x representing an unknown, ' +
+      'and coefficients a, b, and c representing known real or complex numbers with a ≠ 0, the values ' +
+      'of x satisfying the equation, called the roots or zeros, can be found using the quadratic formula,\n\n' +
+      'x = (−b ± √(b² − 4ac))/(2a),'
   );
   assert.doesNotMatch(payload.text + payload.html, /displaystyle|\\textstyle|\\frac|\u2060/u);
+
+  const hiddenOnlyRange = instance.window.document.createRange();
+  hiddenOnlyRange.setStart(firstParagraph.firstChild, 0);
+  hiddenOnlyRange.setEnd(displayRoot, 1);
+  selection.removeAllRanges();
+  selection.addRange(hiddenOnlyRange);
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      instance.window.document,
+      selection,
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    ),
+    null,
+    'selecting only the hidden semantic branch must never widen to the visible equation'
+  );
+  selection.removeAllRanges();
+  selection.addRange(range);
+
+  cleanCopy.install(instance.window.document, instance.window, { registerMenus: false });
+  const clipboard = new Map();
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  target.dispatchEvent(event);
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(clipboard.get('text/plain'), payload.text);
+  assert.doesNotMatch(clipboard.get('text/html'), /displaystyle|\\textstyle|\\frac|\u2060/u);
+});
+
+test('Wikipedia inline math cannot gain display layout trust from CSS alone', () => {
+  const inline = wikipediaMath(
+    '<mrow><mi>x</mi><mo>=</mo><mn>1</mn></mrow>',
+    'x=1'
+  );
+  const instance = dom([
+    '<style>.mwe-math-element-inline{display:block}</style>',
+    '<p id="target">Before ', inline, ' after.</p>'
+  ].join(''), 'https://en.wikipedia.org/wiki/Equation');
+  const target = instance.window.document.querySelector('#target');
+  assert.equal(instance.window.getComputedStyle(target.querySelector('.mwe-math-element-inline')).display, 'block');
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  ), null);
+});
+
+test('a contained renderer image cannot widen past an unselected trailing sibling', () => {
+  const instance = dom([
+    '<p id="target">Before <span id="math" role="math">',
+    '<span style="display:none"><math><mi>SECRET</mi></math></span>',
+    '<img aria-hidden="true" alt="harmless">',
+    '<span>VISIBLE-REST</span>',
+    '</span></p>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const math = instance.window.document.querySelector('#math');
+  const range = instance.window.document.createRange();
+  range.setStart(target.firstChild, 0);
+  range.setEnd(math, 2);
+  const selection = instance.window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  ), null);
+});
+
+test('a generic two-child renderer cannot impersonate Wikipedia boundary semantics', () => {
+  const instance = dom([
+    '<p id="target">Before <span id="math" role="math">',
+    '<span style="display:none"><math><mi>SECRET</mi></math></span>',
+    '<img aria-hidden="true" alt="harmless">',
+    '</span></p>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const math = instance.window.document.querySelector('#math');
+  const range = instance.window.document.createRange();
+  range.setStart(target.firstChild, 0);
+  range.setEnd(math, math.childNodes.length);
+  const selection = instance.window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selection,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  ), null);
+});
+
+test('a forged Wikipedia wrapper without its atomic fallback image cannot widen selection', () => {
+  const instance = dom([
+    '<p id="target">Before <span id="math" class="mwe-math-element">',
+    '<span style="display:none"><math><mi>SECRET</mi></math></span>',
+    '<span aria-hidden="true">harmless</span>',
+    '</span></p>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const math = instance.window.document.querySelector('#math');
+  const range = instance.window.document.createRange();
+  range.setStart(target.firstChild, 0);
+  range.setEnd(math, math.childNodes.length);
+  instance.window.getSelection().removeAllRanges();
+  instance.window.getSelection().addRange(range);
+
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    instance.window.getSelection(),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  ), null);
+});
+
+test('whole renderer boundary normalization preserves same-paragraph context', () => {
+  const display = wikipediaMath(
+    '<mrow><mi>x</mi><mo>=</mo><mn>1</mn></mrow>',
+    'x=1',
+    true
+  );
+  const instance = dom([
+    '<style>.mwe-math-element-block{display:block}</style>',
+    '<p id="target">Before ', display, ' after.</p>'
+  ].join(''), 'https://en.wikipedia.org/wiki/Equation');
+  const target = instance.window.document.querySelector('#target');
+  const root = target.querySelector('.mwe-math-element-block');
+  const selection = instance.window.getSelection();
+  const payloadFor = (range) => {
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selection,
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    );
+  };
+  const browserBoundary = instance.window.document.createRange();
+  browserBoundary.setStart(target.firstChild, 0);
+  browserBoundary.setEnd(root, root.childNodes.length);
+  const normalizedBoundary = instance.window.document.createRange();
+  normalizedBoundary.setStart(target.firstChild, 0);
+  normalizedBoundary.setEndAfter(root);
+  const expected = payloadFor(normalizedBoundary);
+  const actual = payloadFor(browserBoundary);
+  assert.equal(actual.text, 'Before\nx = 1');
+  assert.equal(actual.text, expected.text);
+  assert.equal(actual.html, expected.html);
 });
 
 test('Wikipedia hidden MathML must agree with its visible fallback in mixed prose', () => {
