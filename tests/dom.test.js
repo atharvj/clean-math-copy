@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const katexRenderer = require('katex');
 const { JSDOM } = require('jsdom');
 const cleanCopy = require('../clean-math-copy.user.js');
 
@@ -31,6 +32,35 @@ function katex(markup, source, display = false) {
     '</span>'
   ].join('');
   return display ? '<div class="katex-display">' + expression + '</div>' : expression;
+}
+
+function renderedKatex(source, display = false) {
+  return katexRenderer.renderToString(source, {
+    displayMode: display,
+    output: 'htmlAndMathml',
+    throwOnError: true
+  });
+}
+
+function splitOldKatexNumericPower(root, insertInvisibleTimes = false) {
+  const superscript = Array.from(root.querySelectorAll('.katex-mathml msup')).find((candidate) => {
+    const children = Array.from(candidate.children || []);
+    return children.length >= 2 && children[0].textContent === '10' &&
+      children[1].textContent.replace(/[\s\u2212-]/gu, '') === '43';
+  });
+  if (!superscript) throw new Error('Expected a KaTeX 10^{-43} MathML power');
+  const documentObject = superscript.ownerDocument;
+  const namespace = superscript.namespaceURI || 'http://www.w3.org/1998/Math/MathML';
+  const leadingDigit = documentObject.createElementNS(namespace, 'mn');
+  leadingDigit.textContent = '1';
+  superscript.firstElementChild.textContent = '0';
+  superscript.before(leadingDigit);
+  if (insertInvisibleTimes) {
+    const invisibleTimes = documentObject.createElementNS(namespace, 'mo');
+    invisibleTimes.textContent = '\u2062';
+    superscript.before(invisibleTimes);
+  }
+  return superscript;
 }
 
 function wikipediaMath(markup, source, display = false) {
@@ -560,6 +590,7 @@ test('faithful MathML preserves compound scope, text punctuation, accents, and p
     return cleanCopy.mathMLToFaithful(instance.window.document.querySelector('math'));
   };
   assert.equal(render('<mfrac><mn>1</mn><mrow><mn>2</mn><mi>a</mi><mi>b</mi></mrow></mfrac>'), '1/(2ab)');
+  assert.equal(render('<mrow><mn>2</mn><mfrac><mn>1</mn><mn>3</mn></mfrac></mrow>'), '2 (1/3)');
   assert.equal(render('<msup><mrow><mi>a</mi><mo>+</mo><mi>b</mi></mrow><mn>2</mn></msup>'), '(a + b)²');
   assert.equal(render('<msup><mrow><mi>a</mi><mi>b</mi></mrow><mn>2</mn></msup>'), '(ab)²');
   assert.equal(render('<msup><mfrac><mi>a</mi><mi>b</mi></mfrac><mn>2</mn></msup>'), '(a/b)²');
@@ -791,6 +822,171 @@ test('hidden MathML agreement retains valid fraction, script, and accent layouts
     staleFraction.window,
     staleVisual
   ), null, 'visible denominator-first a/b must not agree with stale hidden b/a');
+});
+
+test('old KaTeX split numeric powers retain the complete visual script base', () => {
+  const instance = dom(renderedKatex(String.raw`10^{-43}`, true));
+  splitOldKatexNumericPower(instance.window.document);
+  const visual = instance.window.document.querySelector('.katex-html');
+
+  const faithful = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, visual),
+    { outputMode: 'faithful' },
+    instance.window,
+    visual
+  );
+  assert.ok(faithful);
+  assert.equal(faithful.text, '10⁻⁴³');
+
+  const calculator = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, visual),
+    { outputMode: 'calculator' },
+    instance.window,
+    visual
+  );
+  assert.ok(calculator);
+  assert.equal(calculator.text, '10^(-43)');
+  assert.doesNotMatch(calculator.text, /1\s*\*\s*0/u);
+});
+
+test('partial old-KaTeX powers join every selected base digit without widening the selection', () => {
+  const instance = dom(renderedKatex(String.raw`2.08\times10^{-43}x`, true));
+  splitOldKatexNumericPower(instance.window.document);
+  const visual = instance.window.document.querySelector('.katex-html');
+  const walker = instance.window.document.createTreeWalker(visual, instance.window.NodeFilter.SHOW_TEXT);
+  const textNodes = [];
+  while (walker.nextNode()) {
+    if (walker.currentNode.data) textNodes.push(walker.currentNode);
+  }
+  const leading = textNodes.find((node) => node.data === '1');
+  const scriptedBase = textNodes.find((node) => node.data === '0');
+  const exponent = textNodes.find((node) => node.data === '43');
+  const coefficient = textNodes.find((node) => node.data === '2.08');
+  assert.ok(leading && scriptedBase && exponent && coefficient);
+
+  const copyRange = (start, end, outputMode) => {
+    const range = instance.window.document.createRange();
+    range.setStart(start, 0);
+    range.setEnd(end, end.data.length);
+    const selection = instance.window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selection,
+      { outputMode },
+      instance.window,
+      visual
+    );
+  };
+  const copyThroughExponent = (start, outputMode) => copyRange(start, exponent, outputMode);
+
+  const completeExpectations = {
+    faithful: '10⁻⁴³',
+    calculator: '10^(-43)',
+    latex: '${10}^{-43}$'
+  };
+  const strictExpectations = {
+    faithful: '0⁻⁴³',
+    calculator: '0^(-43)',
+    latex: '${0}^{-43}$'
+  };
+  for (const outputMode of ['faithful', 'calculator', 'latex']) {
+    const complete = copyThroughExponent(leading, outputMode);
+    assert.ok(complete, outputMode + ' complete');
+    assert.equal(complete.text, completeExpectations[outputMode], outputMode + ' complete');
+    const strict = copyThroughExponent(scriptedBase, outputMode);
+    assert.ok(strict, outputMode + ' strict');
+    assert.equal(strict.text, strictExpectations[outputMode], outputMode + ' strict');
+  }
+
+  for (const [outputMode, expected] of Object.entries({
+    faithful: '10', calculator: '10', latex: '$10$'
+  })) {
+    const baseOnly = copyRange(leading, scriptedBase, outputMode);
+    assert.ok(baseOnly, outputMode + ' base only');
+    assert.equal(baseOnly.text, expected, outputMode + ' base only');
+  }
+  for (const [outputMode, expected] of Object.entries({
+    faithful: '2.08 × 10⁻⁴³',
+    calculator: '2.08*10^(-43)',
+    latex: '$2.08\\times {10}^{-43}$'
+  })) {
+    const withCoefficient = copyThroughExponent(coefficient, outputMode);
+    assert.ok(withCoefficient, outputMode + ' with coefficient');
+    assert.equal(withCoefficient.text, expected, outputMode + ' with coefficient');
+  }
+});
+
+test('old KaTeX split numeric powers do not force mixed prose and display math to native duplicate copy', () => {
+  const inline = renderedKatex(String.raw`\text{length}^{-2}`);
+  const display = renderedKatex(
+    String.raw`\frac{8\pi G}{c^4} = 2.08 \times 10^{-43} \frac{\text{meter}^{-2}}{\text J / \text{meter}^3}.`,
+    true
+  );
+  const instance = dom([
+    '<section id="target"><p>In Cartesian coordinates, the curvature tensor has units of ',
+    inline,
+    '. The numerical factor relating energy and curvature is</p>',
+    display,
+    '</section>'
+  ].join(''));
+  splitOldKatexNumericPower(instance.window.document.querySelector('.katex-display'));
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    { outputMode: 'faithful' },
+    instance.window,
+    target
+  );
+
+  const expected = 'In Cartesian coordinates, the curvature tensor has units of length⁻². ' +
+    'The numerical factor relating energy and curvature is\n\n' +
+    '8πG/c⁴ = 2.08 × 10⁻⁴³ (meter⁻²/(J/meter³)).';
+  assert.ok(payload);
+  assert.equal(payload.reason, 'rendered-math');
+  assert.equal(payload.text, expected);
+  assert.equal((payload.text.match(/\n/gu) || []).length, 2);
+  assert.doesNotMatch(payload.text + payload.html, /\\(?:text|frac|times)|DUPLICATE/u);
+});
+
+test('KaTeX numeric script bases stay inside their fraction branch', () => {
+  const cases = new Map([
+    [String.raw`\frac{0^2}{5}`, '0²/5'],
+    [String.raw`\frac{10^{-43}}{5}`, '10⁻⁴³/5'],
+    [String.raw`\frac{5}{10^{-43}}`, '5/10⁻⁴³']
+  ]);
+  for (const [source, expected] of cases) {
+    const instance = dom(renderedKatex(source, true));
+    const visual = instance.window.document.querySelector('.katex-html');
+    const payload = cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, visual),
+      { outputMode: 'faithful' },
+      instance.window,
+      visual
+    );
+    assert.ok(payload, source);
+    assert.equal(payload.text, expected, source);
+  }
+});
+
+test('old KaTeX numeric recovery never crosses an explicit invisible multiplication', () => {
+  const instance = dom(renderedKatex(String.raw`10^{-43}`, true));
+  splitOldKatexNumericPower(instance.window.document, true);
+  const visual = instance.window.document.querySelector('.katex-html');
+  for (const outputMode of ['faithful', 'calculator']) {
+    assert.equal(cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, visual),
+      { outputMode },
+      instance.window,
+      visual
+    ), null, outputMode);
+  }
 });
 
 test('faithful whole-math copy preserves rendered grouping against contradictory annotations', () => {
@@ -5038,7 +5234,7 @@ test('paired modern menus mark only the active mode and reject a stale settings 
     };
     const installed = cleanCopy.install(instance.window.document, instance.window);
     assert.deepEqual(Array.from(commands.values(), (command) => command.caption), [
-      '✓ Faithful readable (recommended)',
+      '✓ Readable text (recommended)',
       'Calculator-safe',
       'Original LaTeX',
       'Original copy/paste'
@@ -5055,7 +5251,7 @@ test('paired modern menus mark only the active mode and reject a stale settings 
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(commands.size, 4);
     assert.deepEqual(Array.from(commands.values(), (command) => command.caption), [
-      'Faithful readable (recommended)',
+      'Readable text (recommended)',
       '✓ Calculator-safe',
       'Original LaTeX',
       'Original copy/paste'
@@ -5132,7 +5328,7 @@ test('rejected ID-less Promise menu registrations stay handled and never duplica
     assert.deepEqual(installed.settings, { outputMode: 'latex' });
     assert.equal(commands.size, 4);
     assert.deepEqual(Array.from(commands.values(), (command) => command.caption), [
-      'Faithful readable (recommended)',
+      'Readable text (recommended)',
       'Calculator-safe',
       '✓ Original LaTeX',
       'Original copy/paste'
@@ -5171,7 +5367,7 @@ test('ID-less legacy menu APIs receive four two-argument choices without duplica
     global.GM_setValue = () => undefined;
     const installed = cleanCopy.install(instance.window.document, instance.window);
     assert.deepEqual(commands.map((command) => command.caption), [
-      '✓ Faithful readable (recommended)',
+      '✓ Readable text (recommended)',
       'Calculator-safe',
       'Original LaTeX',
       'Original copy/paste'
@@ -5220,7 +5416,7 @@ test('menu registration falls back to the paired modern API when paired legacy r
     cleanCopy.install(instance.window.document, instance.window);
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(Array.from(commands.values(), (command) => command.caption), [
-      '✓ Faithful readable (recommended)',
+      '✓ Readable text (recommended)',
       'Calculator-safe',
       'Original LaTeX',
       'Original copy/paste'
@@ -5264,7 +5460,7 @@ test('mode changes synchronize to open frames while only the top page refreshes 
     const top = cleanCopy.install(instance.window.document, instance.window);
     assert.equal(commands.size, 4);
     assert.ok(Array.from(commands.values()).some((command) =>
-      command.caption === '✓ Faithful readable (recommended)'));
+      command.caption === '✓ Readable text (recommended)'));
     assert.equal(listeners.length, 2);
     for (const listener of listeners) {
       listener('cleanMathCopy.settings.v3', { outputMode: 'faithful' }, { outputMode: 'native' }, true);
@@ -6344,7 +6540,7 @@ test('deferred isolated relay cannot adopt a newer no-DataTransfer copy generati
     // must reject the controller generation instead of adopting it.
     const newerText = newerMode === 'faithful' ? 'faithful C' : 'native C';
     faithfulTarget.textContent = newerText;
-    if (newerMode === 'faithful') commands.get('✓ Faithful readable (recommended)')();
+    if (newerMode === 'faithful') commands.get('✓ Readable text (recommended)')();
     selectContents(instance.window, faithfulTarget);
     const newerEvent = new instance.window.Event('copy', {
       bubbles: true, cancelable: true, composed: true

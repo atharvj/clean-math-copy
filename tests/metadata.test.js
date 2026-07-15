@@ -10,12 +10,11 @@ const scriptPath = path.join(__dirname, '..', 'clean-math-copy.user.js');
 const source = fs.readFileSync(scriptPath, 'utf8');
 const packageJson = require('../package.json');
 const packageLock = require('../package-lock.json');
-const manifest = require('../manifest.json');
 
 test('ships a valid installable userscript metadata block', () => {
   assert.match(source, /^\/\/ ==UserScript==/);
   assert.match(source, /\/\/ @name\s+Clean Math Copy/);
-  assert.match(source, /\/\/ @version\s+2\.4\.0/);
+  assert.match(source, /\/\/ @version\s+2\.4\.1/);
   assert.match(source, /\/\/ @namespace\s+https:\/\/github\.com\/atharvj\/clean-math-copy/);
   assert.match(source, /\/\/ @homepageURL\s+https:\/\/github\.com\/atharvj\/clean-math-copy/);
   assert.match(source, /\/\/ @supportURL\s+https:\/\/github\.com\/atharvj\/clean-math-copy\/issues/);
@@ -40,13 +39,19 @@ test('ships a valid installable userscript metadata block', () => {
   assert.match(source, /outputMode: 'faithful'/);
 });
 
+test('ships as one userscript without a companion extension or privileged PDF fetch', () => {
+  assert.equal(fs.existsSync(path.join(__dirname, '..', 'manifest.json')), false);
+  assert.equal(fs.existsSync(path.join(__dirname, '..', 'extension')), false);
+  assert.doesNotMatch(source, /^\/\/ @connect\s+/m);
+  assert.doesNotMatch(source, /\bGM_xmlhttpRequest\b|\bGM\.xmlHttpRequest\b/);
+});
+
 test('release metadata and package manifests use one consistent version', () => {
   const versions = Array.from(source.matchAll(/^\/\/ @version\s+(\S+)$/gm), (match) => match[1]);
-  assert.deepEqual(versions, ['2.4.0']);
+  assert.deepEqual(versions, ['2.4.1']);
   assert.equal(packageJson.version, versions[0]);
   assert.equal(packageLock.version, versions[0]);
   assert.equal(packageLock.packages[''].version, versions[0]);
-  assert.equal(manifest.version, versions[0]);
   assert.equal(packageJson.devDependencies['pdfjs-dist'], '6.1.200');
   assert.equal(packageLock.packages['node_modules/pdfjs-dist'].version, '6.1.200');
   assert.equal((source.match(/^\/\/ @updateURL\s+/gm) || []).length, 1);
@@ -65,8 +70,8 @@ test('the installable userscript has no unpinned executable runtime dependency',
   ));
   assert.equal(resources.length, 2);
   const files = {
-    clean_math_copy_pdfjs: 'extension/vendor/pdf.min.mjs',
-    clean_math_copy_pdfjs_worker: 'extension/vendor/pdf.worker.min.mjs'
+    clean_math_copy_pdfjs: 'node_modules/pdfjs-dist/build/pdf.min.mjs',
+    clean_math_copy_pdfjs_worker: 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs'
   };
   for (const [, name, url, expectedHash] of resources) {
     assert.match(url, /^https:\/\/cdn\.jsdelivr\.net\/npm\/pdfjs-dist@6\.1\.200\/build\//);

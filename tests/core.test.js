@@ -276,6 +276,10 @@ test('produces calculator-safe syntax with explicit multiplication and scientifi
     'r=(1/0.452)*sqrt((2*(0.666*10^(-25))*(2464))/(1.602*10^(-19)))'
   );
   assert.equal(cleanCopy.latexToCalculator(String.raw`r\propto\sqrt{\frac{m}{\lvert q\rvert}}`), 'r ∝ sqrt(m/abs(q))');
+  assert.equal(
+    cleanCopy.latexToCalculator(String.raw`10^{-43}\frac{\text{meter}^{-2}}{\text J/\text{meter}^3}`),
+    '10^(-43)*((meter^(-2))/(J/meter^(3)))'
+  );
 });
 
 test('keeps raw LaTeX grouping, nesting, functions, and token boundaries executable', () => {

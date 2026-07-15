@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.4.0
-// @description  Faithfully copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
+// @version      2.4.1
+// @description  Accurately copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
 // @homepageURL  https://github.com/atharvj/clean-math-copy
@@ -56,6 +56,8 @@
   const STORAGE_KEY = 'cleanMathCopy.settings.v3';
   const PDFJS_RESOURCE = 'clean_math_copy_pdfjs';
   const PDFJS_WORKER_RESOURCE = 'clean_math_copy_pdfjs_worker';
+  const PDFJS_API_SOURCE_URL = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@6.1.200/build/pdf.min.mjs';
+  const PDFJS_WORKER_SOURCE_URL = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@6.1.200/build/pdf.worker.min.mjs';
   const PDF_VIEWER_BYPASS_KEY = 'cleanMathCopy.pdfViewerBypass.v1';
   const PDF_RENDER_SELECTION_EVENT = 'clean-math-copy-pdf-render-selection-v1';
   const PDF_SELECTION_READY_EVENT = 'clean-math-copy-pdf-selection-ready-v1';
@@ -94,6 +96,8 @@
   const MAX_PDF_PAGE_CHARACTERS = 2 * 1024 * 1024;
   const MAX_PDF_GEOMETRY_RULES = 10000;
   const MAX_PDF_GEOMETRY_WORK = 2000000;
+  const MAX_PDF_FILE_BYTES = 256 * 1024 * 1024;
+  const MAX_PDF_SIGNATURE_OFFSET = 1024;
   const MAX_SELECTION_RANGES = 64;
   const MAX_LATEX_PARSE_DEPTH = 128;
   const MAX_LATEX_PARSE_STEPS = 25000;
@@ -1470,7 +1474,10 @@
         const denominatorSource = this.faithfulMode ? this.peekArgumentSource() : '';
         const denominator = this.parseArgument();
         if (this.calculatorMode) {
-          return calculatorFraction(unicodeToCalculator(numerator), unicodeToCalculator(denominator));
+          return calculatorFraction(
+            unicodeToCalculator(numerator, { retainDeclaredIdentifiers: true }),
+            unicodeToCalculator(denominator, { retainDeclaredIdentifiers: true })
+          );
         }
         if (this.faithfulMode) return faithfulFraction(
           numerator,
@@ -1500,6 +1507,9 @@
       }
       if (['text', 'textrm', 'textnormal', 'mbox', 'hbox'].includes(name)) {
         const value = this.readRawGroup().replace(/~/g, ' ').replace(/\\([%_$#&{}])/g, '$1');
+        if (this.calculatorMode && /^[A-Za-z][A-Za-z0-9_]*$/.test(value)) {
+          return DECLARED_IDENTIFIER_START + value + DECLARED_IDENTIFIER_END;
+        }
         return this.faithfulMode ? protectFaithfulText(value) : value;
       }
       if (['mathrm', 'mathbf', 'mathit', 'mathsf', 'mathtt', 'boldsymbol', 'bm', 'operatorname'].includes(name)) {
@@ -1979,6 +1989,7 @@
 
   function unicodeToCalculator(input, options) {
     const preserveLongIdentifiers = Boolean(options && options.preserveLongIdentifiers);
+    const retainDeclaredIdentifiers = Boolean(options && options.retainDeclaredIdentifiers);
     let text = replaceUnicodeIndexedRoots(decodeUnicodeScripts(cleanClipboardText(input)));
     text = replaceNestedAbsoluteBars(text)
       .replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ufe00-\ufe0f]/g, '')
@@ -2020,7 +2031,9 @@
       const token = String.fromCodePoint(nextIdentifierCodePoint);
       occupiedIdentifierCodePoints.add(nextIdentifierCodePoint);
       nextIdentifierCodePoint += 1;
-      restorations.set(token, value);
+      restorations.set(token, retainDeclaredIdentifiers
+        ? DECLARED_IDENTIFIER_START + value + DECLARED_IDENTIFIER_END
+        : value);
       return token;
     };
     const protectOperator = (value) => {
@@ -3111,6 +3124,14 @@
         if (numericMerge || wordMerge) output += '⋅';
       } else if (previous && previous.kind === 'large') {
         if (output && !/\s$/u.test(output)) output += ' ';
+      } else if (token.fraction && previous && faithfulCanEnd(previous) &&
+                 output && !/\s$/u.test(output)) {
+        output += ' (' + token.text + ')';
+        previous = faithfulResult('(' + token.text + ')', 'operand');
+        explicitSpace = false;
+        applyPending = false;
+        invisibleTimesPending = false;
+        continue;
       } else if (explicitSpace && previous && faithfulCanEnd(previous) && faithfulCanStart(token) &&
                  !/\s$/u.test(output)) {
         output += ' ';
@@ -3344,7 +3365,7 @@
       return faithfulResult(
         faithfulFraction(childText(0), childText(1), faithfulMathMLDenominatorOptions(children[1])),
         'operand',
-        { scriptFence: true }
+        { scriptFence: true, fraction: true }
       );
     }
     if (name === 'msqrt') return faithfulResult(faithfulRoot('', rowText()), 'operand', { scriptFence: true });
@@ -4032,11 +4053,26 @@
         const ownerAnchors = topologyAnchorKey(ownerPrefixText);
         baseStart = Math.max(0, baseEnd - ownerAnchors.length);
 
-        // KaTeX splits the last digit of a multi-digit <mn> into the script
-        // owner (`1` + owner `0` for 10^n). Extend only a numeric run; letters
-        // remain separate implicit factors such as x followed by y^2.
+        // Older KaTeX splits the last digit of a multi-digit <mn> into the
+        // script owner (`1` + owner `0` for 10^n). Extend only across adjacent
+        // digit-only siblings in this exact layout branch. Scanning the whole
+        // text prefix would incorrectly cross fraction/vlist boundaries.
         if (/^\d+$/u.test(ownerAnchors)) {
-          while (baseStart > 0 && /\d/u.test(prefixAnchors[baseStart - 1])) baseStart -= 1;
+          let sibling = owner.previousElementSibling;
+          while (sibling) {
+            const siblingAnchors = topologyAnchorKey(sibling.textContent || '');
+            if (!/^\d+$/u.test(siblingAnchors) || siblingAnchors.length > baseStart) break;
+            const siblingEndRange = documentObject.createRange();
+            try {
+              siblingEndRange.selectNodeContents(visualBranch);
+              siblingEndRange.setEndAfter(sibling);
+            } catch (_error) {
+              return false;
+            }
+            if (topologyAnchorKey(siblingEndRange.toString()).length !== baseStart) break;
+            baseStart -= siblingAnchors.length;
+            sibling = sibling.previousElementSibling;
+          }
         }
 
         // A script on a closing fence is attached to the whole matched group
@@ -4191,6 +4227,28 @@
           start = baseSpan.end;
           baseStart = baseSpan.start;
           baseEnd = baseSpan.end;
+
+          // KaTeX <= 0.16 can express 10^n as sibling <mn>1</mn> followed by
+          // <msup><mn>0</mn>...</msup>, while its visible HTML attaches the
+          // script to the complete numeric run. Mirror that representation,
+          // but never cross an operator, wrapper, or layout boundary.
+          let numericBase = base;
+          while (numericBase && ['mrow', 'mstyle', 'mpadded'].includes(
+            (numericBase.localName || '').toLowerCase()
+          ) && elementChildren(numericBase).length === 1) {
+            numericBase = elementChildren(numericBase)[0];
+          }
+          if (numericBase && (numericBase.localName || '').toLowerCase() === 'mn' &&
+              /^\d+$/u.test(topologyAnchorKey(mathMLTokenText(numericBase)))) {
+            let sibling = node.previousElementSibling;
+            while (sibling && (sibling.localName || '').toLowerCase() === 'mn' &&
+                   /^\d+$/u.test(topologyAnchorKey(mathMLTokenText(sibling)))) {
+              const siblingSpan = layout.spans.find((candidate) => candidate.node === sibling);
+              if (!siblingSpan || siblingSpan.end !== baseStart) break;
+              baseStart = siblingSpan.start;
+              sibling = sibling.previousElementSibling;
+            }
+          }
 
           let token = base;
           while (token && ['mrow', 'mstyle', 'mpadded'].includes((token.localName || '').toLowerCase()) &&
@@ -4433,6 +4491,56 @@
     }
     if (outputMode === 'latex') return '$' + mathMLToLatexNode(mathElement) + '$';
     return mathMLToFaithful(mathElement);
+  }
+
+  function repairLegacyKatexNumericScriptBases(mathElement) {
+    if (!mathElement || typeof mathElement.cloneNode !== 'function') return null;
+    const repaired = mathElement.cloneNode(true);
+    let repairs = 0;
+    for (const script of Array.from(repaired.querySelectorAll('msup, msub, msubsup'))) {
+      const directBase = elementChildren(script)[0];
+      let numericBase = directBase;
+      while (numericBase && ['mrow', 'mstyle', 'mpadded'].includes(
+        (numericBase.localName || '').toLowerCase()
+      ) && elementChildren(numericBase).length === 1) {
+        numericBase = elementChildren(numericBase)[0];
+      }
+      if (!numericBase || (numericBase.localName || '').toLowerCase() !== 'mn' ||
+          !/^\d+$/u.test(topologyAnchorKey(mathMLTokenText(numericBase))) ||
+          Array.from(numericBase.attributes || []).length) continue;
+      const leading = [];
+      let candidate = script.previousElementSibling;
+      while (candidate && (candidate.localName || '').toLowerCase() === 'mn' &&
+             /^\d+$/u.test(topologyAnchorKey(mathMLTokenText(candidate))) &&
+             !Array.from(candidate.attributes || []).length) {
+        leading.unshift(candidate);
+        candidate = candidate.previousElementSibling;
+      }
+      if (!leading.length) continue;
+      numericBase.textContent = leading.map((item) => mathMLTokenText(item).trim()).join('') +
+        mathMLTokenText(numericBase).trim();
+      for (const item of leading) item.remove();
+      repairs += 1;
+    }
+    const rows = [];
+    if (repaired.matches && repaired.matches('math, mrow, mstyle, mpadded')) rows.push(repaired);
+    rows.push(...Array.from(repaired.querySelectorAll('math, mrow, mstyle, mpadded')));
+    for (const row of rows) {
+      let previous = null;
+      for (const child of Array.from(row.children || [])) {
+        const numeric = (child.localName || '').toLowerCase() === 'mn' &&
+          /^\d+$/u.test(topologyAnchorKey(mathMLTokenText(child))) &&
+          !Array.from(child.attributes || []).length;
+        if (numeric && previous) {
+          previous.textContent = mathMLTokenText(previous).trim() + mathMLTokenText(child).trim();
+          child.remove();
+          repairs += 1;
+          continue;
+        }
+        previous = numeric ? child : null;
+      }
+    }
+    return repairs ? repaired : null;
   }
 
   function findSelectedMathMLFragment(mathElement, selectedText, selectedOffset, visualText, preferredStructures, preferVisualFractions) {
@@ -5189,9 +5297,46 @@
     const rendered = mathElement ? mathMLToFaithful(mathElement) : '';
     const source = getMathSource(root, pageWindow);
     const faithfulSource = source ? latexToFaithful(source) : '';
-    return faithfulSourceAgreesWithRendered(faithfulSource, rendered)
-      ? faithfulSource
-      : (rendered || faithfulSource);
+    if (!faithfulSourceAgreesWithRendered(faithfulSource, rendered)) {
+      return rendered || faithfulSource;
+    }
+    // An adjacent stacked fraction is a separate multiplicative factor. Some
+    // renderers preserve that boundary while TeX source whitespace does not;
+    // keep the visible separating space so `10⁻⁴³ (unit/unit)` cannot look
+    // like a function call. This choice is cosmetic only: the compact forms
+    // must already be identical before rendered spacing can win.
+    const compact = (value) => String(value || '').replace(/\s+/gu, '');
+    if (rendered !== faithfulSource && compact(rendered) === compact(faithfulSource) &&
+        /\S\s+\([^\n]*\/[^\n]*\)/u.test(rendered)) return rendered;
+    return faithfulSource;
+  }
+
+  function calculatorRenderedMathText(root, mathElement, pageWindow) {
+    const renderedFaithful = mathElement ? mathMLToFaithful(mathElement) : '';
+    const renderedCalculator = mathElement ? mathMLToCalculator(mathElement) : '';
+    const source = getMathSource(root, pageWindow);
+    const faithfulSource = source ? latexToFaithful(source) : '';
+    const splitNumericScriptBase = mathElement && Array.from(
+      mathElement.querySelectorAll('msup, msub, msubsup')
+    ).some((script) => {
+      let base = elementChildren(script)[0];
+      while (base && ['mrow', 'mstyle', 'mpadded'].includes((base.localName || '').toLowerCase()) &&
+             elementChildren(base).length === 1) base = elementChildren(base)[0];
+      const previous = script.previousElementSibling;
+      return base && (base.localName || '').toLowerCase() === 'mn' &&
+        /^\d+$/u.test(topologyAnchorKey(mathMLTokenText(base))) &&
+        previous && (previous.localName || '').toLowerCase() === 'mn' &&
+        /^\d+$/u.test(topologyAnchorKey(mathMLTokenText(previous)));
+    });
+    // Some older renderers split a numeric base across adjacent MathML nodes
+    // (for example 10^−43 becomes 1 followed by 0^−43). Use the authenticated
+    // TeX source only for that legacy representation, and only when its
+    // complete readable form agrees with the sanitized rendered presentation.
+    // Normal MathML remains authoritative for functions, limits, and bars.
+    return splitNumericScriptBase && source &&
+        faithfulSourceAgreesWithRendered(faithfulSource, renderedFaithful)
+      ? latexToCalculator(source)
+      : (renderedCalculator || (source ? latexToCalculator(source) : ''));
   }
 
   function cssColorIsFullyTransparent(input) {
@@ -6192,7 +6337,7 @@
       return isDisplayMath(root) ? '$$' + source + '$$' : '$' + source + '$';
     }
     if (mode === 'calculator') {
-      if (math) return mathMLToCalculator(math);
+      if (math) return calculatorRenderedMathText(root, math, pageWindow);
       if (source) return latexToCalculator(source);
       return unicodeToCalculator(formatMathText(fallbackMathText(root)));
     }
@@ -7334,17 +7479,23 @@
     if (!selectedMath) return { kind: 'unmatched' };
     const safeSelectedMath = sanitizedMathMLClone(selectedMath);
     if (!safeSelectedMath) return { kind: 'unmatched' };
-    const text = mathMLFragmentText(safeSelectedMath, settings.outputMode);
+    const numericRepair = visualBranch && isGenuineKatexVisualBranch(visualBranch)
+      ? repairLegacyKatexNumericScriptBases(safeSelectedMath)
+      : null;
+    const outputMath = numericRepair && mathSelectionKey(numericRepair.textContent || '') === selectedKey
+      ? numericRepair
+      : safeSelectedMath;
+    const text = mathMLFragmentText(outputMath, settings.outputMode);
     if (!text || !text.trim()) return { kind: 'unmatched' };
     const documentObject = root.ownerDocument;
     const richFragment = documentObject.createDocumentFragment();
-    richFragment.appendChild(richMathNodeForElement(safeSelectedMath, null, documentObject));
+    richFragment.appendChild(richMathNodeForElement(outputMath, null, documentObject));
     return {
       kind: 'payload',
       payload: {
         text: finalizeRewrittenText(text),
         html: sanitizeRichFragment(richFragment),
-        mathML: serializeMathMLMarkup(safeSelectedMath),
+        mathML: serializeMathMLMarkup(outputMath),
         semanticPartial: true
       }
     };
@@ -7363,9 +7514,11 @@
     if (sourceMath && !safeMath) return null;
     const text = settings.outputMode === 'faithful' && safeMath
       ? faithfulRenderedMathText(root, safeMath, pageWindow)
-      : (safeMath && settings.outputMode !== 'latex'
-        ? mathMLFragmentText(safeMath, settings.outputMode)
-        : extractMathText(root, settings.outputMode, pageWindow));
+      : (settings.outputMode === 'calculator' && safeMath
+        ? calculatorRenderedMathText(root, safeMath, pageWindow)
+        : (safeMath && settings.outputMode !== 'latex'
+          ? mathMLFragmentText(safeMath, settings.outputMode)
+          : extractMathText(root, settings.outputMode, pageWindow)));
     if (!text || !text.trim()) return null;
     const documentObject = root.ownerDocument;
     const richFragment = documentObject.createDocumentFragment();
@@ -7688,9 +7841,11 @@
           ? ''
           : (settings.outputMode === 'faithful' && safeMath
             ? faithfulRenderedMathText(root, safeMath, pageWindow)
-            : (safeMath && settings.outputMode !== 'latex'
-              ? mathMLFragmentText(safeMath, settings.outputMode)
-              : extractMathText(root, settings.outputMode, pageWindow))),
+            : (settings.outputMode === 'calculator' && safeMath
+              ? calculatorRenderedMathText(root, safeMath, pageWindow)
+              : (safeMath && settings.outputMode !== 'latex'
+                ? mathMLFragmentText(safeMath, settings.outputMode)
+                : extractMathText(root, settings.outputMode, pageWindow)))),
         display: isDisplayMath(root),
         root,
         safeMath,
@@ -10727,6 +10882,150 @@
     });
   }
 
+  function pdfResponseHeader(responseHeaders, name) {
+    const wanted = String(name || '').toLowerCase();
+    const lines = String(responseHeaders || '').split(/\r?\n/);
+    for (const line of lines) {
+      const separator = line.indexOf(':');
+      if (separator < 1 || line.slice(0, separator).trim().toLowerCase() !== wanted) continue;
+      return line.slice(separator + 1).trim();
+    }
+    return '';
+  }
+
+  function invalidPdfResponse(message) {
+    const error = new Error(message);
+    error.code = 'CLEAN_MATH_COPY_INVALID_PDF_RESPONSE';
+    return error;
+  }
+
+  function assertPdfResponseMetadata(responseHeaders) {
+    const length = Number(pdfResponseHeader(responseHeaders, 'content-length'));
+    if (Number.isFinite(length) && length > MAX_PDF_FILE_BYTES) {
+      throw invalidPdfResponse('This PDF is larger than the 256 MB safety limit.');
+    }
+    const mediaType = pdfResponseHeader(responseHeaders, 'content-type').split(';')[0].trim().toLowerCase();
+    if (/^(?:text\/html|application\/(?:json|xhtml\+xml))$/.test(mediaType)) {
+      throw invalidPdfResponse('The request returned a web page instead of a PDF.');
+    }
+  }
+
+  async function validatedPdfArrayBuffer(value, responseHeaders) {
+    assertPdfResponseMetadata(responseHeaders);
+    let buffer;
+    if (value instanceof ArrayBuffer) {
+      buffer = value;
+    } else if (ArrayBuffer.isView(value)) {
+      buffer = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+    } else if (value && typeof value.arrayBuffer === 'function') {
+      buffer = await Reflect.apply(value.arrayBuffer, value, []);
+    } else {
+      throw invalidPdfResponse('The PDF server did not return binary data.');
+    }
+    if (!(buffer instanceof ArrayBuffer) || !buffer.byteLength) {
+      throw invalidPdfResponse('The PDF server returned an empty file.');
+    }
+    if (buffer.byteLength > MAX_PDF_FILE_BYTES) {
+      throw invalidPdfResponse('This PDF is larger than the 256 MB safety limit.');
+    }
+    const bytes = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, MAX_PDF_SIGNATURE_OFFSET + 5));
+    let signatureFound = false;
+    for (let offset = 0; offset < MAX_PDF_SIGNATURE_OFFSET && offset + 4 < bytes.length; offset += 1) {
+      if (bytes[offset] === 0x25 && bytes[offset + 1] === 0x50 && bytes[offset + 2] === 0x44 &&
+          bytes[offset + 3] === 0x46 && bytes[offset + 4] === 0x2d) {
+        signatureFound = true;
+        break;
+      }
+    }
+    if (!signatureFound) throw invalidPdfResponse('The request did not return a valid PDF file.');
+    return buffer;
+  }
+
+  async function requestCurrentPdfBytes(sourceUrl, pageWindow) {
+    const fetchFunction = pageWindow && pageWindow.fetch;
+    if (typeof fetchFunction !== 'function') throw new Error('This browser cannot request the current PDF.');
+    let requestedUrl;
+    let pageUrl;
+    try {
+      requestedUrl = new URL(sourceUrl, pageWindow.location.href);
+      pageUrl = new URL(pageWindow.location.href);
+    } catch (_error) {
+      throw invalidPdfResponse('The current PDF URL is invalid.');
+    }
+    requestedUrl.hash = '';
+    pageUrl.hash = '';
+    const localFile = requestedUrl.protocol === 'file:' && pageUrl.protocol === 'file:';
+    if ((!['http:', 'https:'].includes(requestedUrl.protocol) || requestedUrl.origin !== pageUrl.origin) &&
+        !localFile) {
+      throw invalidPdfResponse('The current PDF request crossed an origin boundary.');
+    }
+    const AbortControllerConstructor = pageWindow.AbortController || global.AbortController;
+    const controller = typeof AbortControllerConstructor === 'function'
+      ? new AbortControllerConstructor()
+      : null;
+    const schedule = pageWindow.setTimeout ? pageWindow.setTimeout.bind(pageWindow) : setTimeout;
+    const cancel = pageWindow.clearTimeout ? pageWindow.clearTimeout.bind(pageWindow) : clearTimeout;
+    const timeout = controller ? schedule(() => controller.abort(), 120000) : null;
+    try {
+      const response = await Promise.resolve(Reflect.apply(fetchFunction, pageWindow, [requestedUrl.href, {
+        credentials: 'include',
+        redirect: 'follow',
+        signal: controller ? controller.signal : undefined,
+        headers: { Accept: 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.1' }
+      }]));
+      if (!response || !response.ok) {
+        throw new Error('The PDF server returned HTTP ' + Number(response && response.status || 0) + '.');
+      }
+      if (response.url) {
+        let finalUrl;
+        try { finalUrl = new URL(response.url); }
+        catch (_error) { throw invalidPdfResponse('The PDF request returned an invalid final URL.'); }
+        const safeFinal = localFile
+          ? finalUrl.protocol === 'file:'
+          : ['http:', 'https:'].includes(finalUrl.protocol) && finalUrl.origin === requestedUrl.origin;
+        if (!safeFinal || finalUrl.username || finalUrl.password) {
+          throw invalidPdfResponse('The PDF request redirected across an origin boundary.');
+        }
+      }
+      const responseHeaders = (() => {
+        if (!response.headers || typeof response.headers.get !== 'function') return '';
+        return 'content-length: ' + String(response.headers.get('content-length') || '') + '\n' +
+          'content-type: ' + String(response.headers.get('content-type') || '');
+      })();
+      assertPdfResponseMetadata(responseHeaders);
+      const reader = response.body && typeof response.body.getReader === 'function'
+        ? response.body.getReader()
+        : null;
+      if (!reader) return validatedPdfArrayBuffer(await response.arrayBuffer(), responseHeaders);
+      const chunks = [];
+      let total = 0;
+      try {
+        while (true) {
+          const result = await reader.read();
+          if (result.done) break;
+          const chunk = result.value instanceof Uint8Array ? result.value : new Uint8Array(result.value || 0);
+          total += chunk.byteLength;
+          if (total > MAX_PDF_FILE_BYTES) {
+            try { await reader.cancel(); } catch (_error) { /* reject below */ }
+            throw invalidPdfResponse('This PDF is larger than the 256 MB safety limit.');
+          }
+          chunks.push(chunk);
+        }
+      } finally {
+        try { reader.releaseLock(); } catch (_error) { /* optional stream API */ }
+      }
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return validatedPdfArrayBuffer(bytes.buffer, responseHeaders);
+    } finally {
+      if (timeout != null) cancel(timeout);
+    }
+  }
+
   function isDirectPdfDocument(documentObject, pageWindow) {
     // Content scripts are injected separately into PDF subframes. Treat each
     // actual application/pdf document as its own viewer so embedded handouts
@@ -10736,17 +11035,19 @@
       (pageWindow || documentObject.defaultView));
   }
 
-  // The direct-PDF controller passes only bundled, integrity-pinned PDF.js and
-  // a root already authenticated by the controller's WeakSet. The renderer's
-  // DOM Range and copy handling therefore share the document being selected
-  // without weakening the trust boundary used by ordinary web pages.
-  function cleanMathCopyPdfViewerMain(rootId, pdfjs, workerUrl, analyzePage, bypassKey, loadPdfBytes, assetBaseUrl) {
+  // The controller passes integrity-pinned PDF.js and a root authenticated by
+  // its WeakSet. Rendering and copy handling then share the selected document.
+  function cleanMathCopyPdfViewerMain(
+    rootId, pdfjs, workerUrl, analyzePage, bypassKey, loadPdfBytes, sourceUrlInput
+  ) {
     'use strict';
     const root = document.getElementById(rootId);
     if (!root || !pdfjs || typeof pdfjs.getDocument !== 'function') return;
-    const sourceUrl = location.href.split('#')[0];
-    const packageBase = assetBaseUrl || 'https://cdn.jsdelivr.net/npm/pdfjs-dist@6.1.200/';
-    const localAssetBundle = /^(?:chrome|moz)-extension:/i.test(packageBase);
+    const sourceUrl = String(sourceUrlInput || location.href);
+    const sourceHash = (() => {
+      try { return new URL(sourceUrl, location.href).hash; } catch (_error) { return location.hash; }
+    })();
+    const packageBase = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@6.1.200/';
     const MAX_PDF_PAGES = 5000;
     const MAX_CANVAS_PIXELS = 8000000;
     const MAX_CANVAS_DIMENSION = 16384;
@@ -10769,7 +11070,7 @@
       return element;
     };
     const openBrowserViewer = () => {
-      try { sessionStorage.setItem(bypassKey, sourceUrl); } catch (_error) { /* ignore */ }
+      try { sessionStorage.setItem(bypassKey, sourceUrl.split('#')[0]); } catch (_error) { /* ignore */ }
       location.reload();
     };
     const fail = (error) => {
@@ -10877,12 +11178,11 @@
         cMapPacked: true,
         standardFontDataUrl: packageBase + 'standard_fonts/',
         iccUrl: packageBase + 'iccs/',
-        useWasm: localAssetBundle,
+        useWasm: false,
         enableScripting: false,
         isEvalSupported: false,
         fontExtraProperties: true
       };
-      if (localAssetBundle) loadingOptions.wasmUrl = packageBase + 'wasm/';
       let loadingTask = null;
       const createLoadingTask = (source) => {
         const task = pdfjs.getDocument({ ...loadingOptions, ...source });
@@ -10899,7 +11199,7 @@
         };
         return task;
       };
-      loadingTask = createLoadingTask({ url: sourceUrl });
+      loadingTask = createLoadingTask({ url: sourceUrl.split('#')[0] });
 
       let pdfDocument = null;
       let scale = 1;
@@ -11268,7 +11568,11 @@
         if (best !== currentPage) {
           currentPage = best; pageInput.value = String(best);
           evictDistantCanvases(currentPage);
-          try { history.replaceState(null, '', sourceUrl + '#page=' + best); } catch (_error) { /* ignore */ }
+          try {
+            const address = new URL(sourceUrl, location.href);
+            address.hash = 'page=' + best;
+            history.replaceState(null, '', address.href);
+          } catch (_error) { /* ignore */ }
         }
       };
       const searchDocument = async () => {
@@ -11413,7 +11717,7 @@
           }, { root: pagesHost, rootMargin: '120% 0px', threshold: 0.01 });
           for (const state of states) observer.observe(state.element);
         }
-        const hashMatch = location.hash.match(/(?:^#|[&#])page=(\d+)/i);
+        const hashMatch = sourceHash.match(/(?:^#|[&#])page=(\d+)/i);
         currentPage = Math.max(1, Math.min(pdfDocument.numPages, hashMatch ? Number(hashMatch[1]) : 1));
         pageInput.value = String(currentPage);
         loading.hidden = true;
@@ -11429,7 +11733,7 @@
     }
   }
 
-  function showPdfViewerBootstrapError(root, error) {
+  function showPdfViewerBootstrapError(root, error, pageWindow, sourceUrl) {
     if (!root || !root.ownerDocument) return;
     const documentObject = root.ownerDocument;
     root.hidden = false;
@@ -11440,27 +11744,21 @@
     heading.textContent = 'Clean Math Copy could not open this PDF';
     const detail = documentObject.createElement('p');
     detail.textContent = String(error && error.message || error || 'Unknown PDF error');
-    panel.append(heading, detail);
+    const browserViewer = documentObject.createElement('button');
+    browserViewer.type = 'button';
+    browserViewer.textContent = 'Open browser viewer';
+    browserViewer.style.cssText = 'padding:8px 12px;font:inherit;cursor:pointer';
+    browserViewer.addEventListener('click', () => {
+      try {
+        pageWindow.sessionStorage.setItem(PDF_VIEWER_BYPASS_KEY, String(sourceUrl || '').split('#')[0]);
+      } catch (_error) { /* a reload still gives the browser another chance */ }
+      pageWindow.location.reload();
+    });
+    panel.append(heading, detail, browserViewer);
     root.appendChild(panel);
   }
 
-  function startDirectPdfViewer(documentObject, pageWindow) {
-    if (!isDirectPdfDocument(documentObject, pageWindow)) return Promise.resolve(false);
-    if (documentObject.__cleanMathCopyPdfViewerRoot && documentObject.__cleanMathCopyPdfViewerRoot.isConnected) {
-      return Promise.resolve(true);
-    }
-    const sourceUrl = (() => {
-      try { return String(pageWindow.location.href || '').split('#')[0]; } catch (_error) { return ''; }
-    })();
-    try {
-      if (pageWindow.sessionStorage && pageWindow.sessionStorage.getItem(PDF_VIEWER_BYPASS_KEY) === sourceUrl) {
-        pageWindow.sessionStorage.removeItem(PDF_VIEWER_BYPASS_KEY);
-        documentObject.__cleanMathCopyPdfViewerBypassed = true;
-        return Promise.resolve(false);
-      }
-    } catch (_error) {
-      // Session storage is optional; the custom viewer still works without it.
-    }
+  function createPdfViewerRoot(documentObject, pageWindow) {
     let body = documentObject.body;
     if (!body) {
       body = documentObject.createElement('body');
@@ -11479,66 +11777,160 @@
     } catch (_error) {
       documentObject.__cleanMathCopyPdfViewerRoot = root;
     }
+    return root;
+  }
+
+  async function executePinnedClassicSource(classicSource, documentObject) {
+    const parent = documentObject.head || documentObject.documentElement;
+    let script = null;
+    const attributes = { textContent: classicSource };
+    const nonceSource = documentObject.querySelector && documentObject.querySelector('script[nonce]');
+    if (nonceSource) {
+      const nonce = nonceSource.nonce || nonceSource.getAttribute('nonce');
+      if (nonce) attributes.nonce = nonce;
+    }
+    try {
+      if (typeof GM_addElement === 'function') script = await GM_addElement(parent, 'script', attributes);
+      else if (global.GM && typeof global.GM.addElement === 'function') {
+        script = await global.GM.addElement(parent, 'script', attributes);
+      } else {
+        script = documentObject.createElement('script');
+        if (attributes.nonce) script.nonce = attributes.nonce;
+        script.textContent = classicSource;
+        parent.appendChild(script);
+      }
+    } finally {
+      try { if (script && typeof script.remove === 'function') script.remove(); } catch (_error) { /* ignore */ }
+    }
+  }
+
+  async function executePinnedPdfJsResource(moduleSource, documentObject, pageWindow, rootId) {
+    const source = String(moduleSource || '');
+    if (!source || source.length > 2 * 1024 * 1024) throw new Error('The bundled PDF engine is invalid.');
+    const exportOffset = source.lastIndexOf('export{');
+    const exportTail = exportOffset >= 0 ? source.slice(exportOffset) : '';
+    if (exportOffset < 0 || !/^export\{[\s\S]*\};\s*$/.test(exportTail) ||
+        !exportTail.includes('B as OPS') || !exportTail.includes('H as PasswordResponses') ||
+        !exportTail.includes('Lt as version') || !exportTail.includes('getDocument') ||
+        !exportTail.includes('GlobalWorkerOptions') || !exportTail.includes('OutputScale') ||
+        !exportTail.includes('TextLayer')) {
+      throw new Error('The bundled PDF engine has an unexpected format.');
+    }
+    const key = '__cleanMathCopyPdfJs_' + rootId.replace(/[^a-z0-9_-]/gi, '') + '_' + Math.random().toString(36).slice(2);
+    const classicBody = source.slice(0, exportOffset)
+      .replace(/\bimport\.meta\.url\b/g, JSON.stringify(PDFJS_API_SOURCE_URL));
+    const classicSource = ';(()=>{\n' + classicBody + '\nObject.defineProperty(globalThis,' + JSON.stringify(key) +
+      ',{value:{GlobalWorkerOptions,OPS:B,OutputScale,PasswordResponses:H,TextLayer,getDocument,version:Lt},configurable:true});\n})();';
+    try {
+      await executePinnedClassicSource(classicSource, documentObject);
+      const pdfjs = pageWindow[key];
+      if (!pdfjs || pdfjs.version !== '6.1.200' || typeof pdfjs.getDocument !== 'function') {
+        throw new Error('The pinned PDF engine was blocked by this page.');
+      }
+      return pdfjs;
+    } finally {
+      try { delete pageWindow[key]; } catch (_error) { /* random key dies with this document */ }
+    }
+  }
+
+  async function executePinnedPdfJsWorkerResource(moduleSource, documentObject, pageWindow) {
+    const source = String(moduleSource || '');
+    if (!source || source.length > 4 * 1024 * 1024) throw new Error('The bundled PDF worker is invalid.');
+    const exportOffset = source.lastIndexOf('export{');
+    const exportTail = exportOffset >= 0 ? source.slice(exportOffset) : '';
+    const assignment = 'globalThis.pdfjsWorker={WorkerMessageHandler};';
+    const assignmentOffset = source.lastIndexOf(assignment, exportOffset);
+    if (exportOffset < 0 || assignmentOffset < 0 || !/^export\{WorkerMessageHandler\};\s*$/.test(exportTail)) {
+      throw new Error('The bundled PDF worker has an unexpected format.');
+    }
+    const classicBody = source.slice(0, assignmentOffset)
+      .replace(/\bimport\.meta\.url\b/g, JSON.stringify(PDFJS_WORKER_SOURCE_URL));
+    const classicSource = ';(()=>{\n' + classicBody +
+      '\nObject.defineProperty(globalThis,"pdfjsWorker",{value:{WorkerMessageHandler},configurable:true,writable:true});\n})();';
+    await executePinnedClassicSource(classicSource, documentObject);
+    if (!pageWindow.pdfjsWorker || typeof pageWindow.pdfjsWorker.WorkerMessageHandler !== 'function') {
+      throw new Error('The pinned PDF worker was blocked by this page.');
+    }
+  }
+
+  function pagePdfWorkerResource(moduleSource, pageWindow) {
+    try {
+      const BlobConstructor = pageWindow.Blob;
+      const urlObject = pageWindow.URL;
+      if (typeof BlobConstructor !== 'function' || !urlObject || typeof urlObject.createObjectURL !== 'function') {
+        throw new Error('Page Blob URLs are unavailable.');
+      }
+      const blob = Reflect.construct(BlobConstructor, [[moduleSource], { type: 'text/javascript' }]);
+      const url = Reflect.apply(urlObject.createObjectURL, urlObject, [blob]);
+      return Promise.resolve({
+        url: String(url),
+        owned: true,
+        revoke: () => Reflect.apply(urlObject.revokeObjectURL, urlObject, [url])
+      });
+    } catch (_error) {
+      return userscriptModuleResource(PDFJS_WORKER_RESOURCE);
+    }
+  }
+
+  function startPdfViewer(documentObject, pageWindow, sourceUrl) {
+    if (documentObject.__cleanMathCopyPdfViewerRoot && documentObject.__cleanMathCopyPdfViewerRoot.isConnected) {
+      return Promise.resolve(true);
+    }
+    const root = createPdfViewerRoot(documentObject, pageWindow);
+    let resources = [];
+    const revokeOwnedResources = () => {
+      for (const resource of resources) {
+        if (resource && resource.owned) {
+          try {
+            if (typeof resource.revoke === 'function') resource.revoke();
+            else URL.revokeObjectURL(resource.url);
+          } catch (_error) { /* ignore */ }
+        }
+      }
+    };
 
     return Promise.all([
-      userscriptModuleResource(PDFJS_RESOURCE),
-      userscriptModuleResource(PDFJS_WORKER_RESOURCE)
-    ]).then(async ([apiResource, workerResource]) => {
-      const revokeOwnedResources = () => {
-        for (const resource of [apiResource, workerResource]) {
-          if (resource.owned) {
-            try { URL.revokeObjectURL(resource.url); } catch (_error) { /* ignore */ }
-          }
-        }
-      };
+      readUserscriptResourceText(PDFJS_RESOURCE),
+      readUserscriptResourceText(PDFJS_WORKER_RESOURCE)
+    ]).then(async ([apiSource, workerSource]) => {
+      const workerResource = await pagePdfWorkerResource(workerSource, pageWindow);
+      resources = [workerResource];
       try { pageWindow.addEventListener('pagehide', revokeOwnedResources, { once: true }); }
       catch (_error) { /* resources live until this document is discarded */ }
-      const apiImportUrl = (() => {
-        try {
-          const value = new URL(apiResource.url);
-          // Extension module caches can outlive a PDF document navigation.
-          // A per-document key prevents PDF.js state from the discarded
-          // viewer being reused when switching Native → Faithful.
-          value.searchParams.set('cleanMathCopyDocument', root.id);
-          return value.href;
-        } catch (_error) {
-          return apiResource.url + '#clean-math-copy-' + root.id;
-        }
-      })();
-      const pdfjs = await import(apiImportUrl);
-      if (!pdfjs || pdfjs.version !== '6.1.200' || typeof pdfjs.getDocument !== 'function') {
-        revokeOwnedResources();
-        throw new Error('The bundled PDF engine has an unexpected version.');
-      }
-      const loadPdfBytes = () => {
-        const fetchFunction = pageWindow && pageWindow.fetch;
-        if (typeof fetchFunction !== 'function') return Promise.reject(new Error('PDF bytes are unavailable.'));
-        return Promise.resolve(Reflect.apply(fetchFunction, pageWindow, [sourceUrl, { credentials: 'include' }]))
-          .then((response) => {
-            if (!response || !response.ok) throw new Error('The PDF server returned an error.');
-            return response.arrayBuffer();
-          });
-      };
-      const bundledAssetBase = (() => {
-        try {
-          const resourceUrl = new URL(workerResource.url);
-          if (/^(?:chrome|moz)-extension:$/.test(resourceUrl.protocol)) {
-            return new URL('./', resourceUrl).href;
-          }
-        } catch (_error) {
-          // Userscript-manager resource URLs use the pinned CDN fallback.
-        }
-        return '';
-      })();
+      const pdfjs = await executePinnedPdfJsResource(apiSource, documentObject, pageWindow, root.id);
+      await executePinnedPdfJsWorkerResource(workerSource, documentObject, pageWindow);
+      const loadPdfBytes = () => requestCurrentPdfBytes(sourceUrl, pageWindow);
       cleanMathCopyPdfViewerMain(
         root.id, pdfjs, workerResource.url, analyzePdfPageText, PDF_VIEWER_BYPASS_KEY, loadPdfBytes,
-        bundledAssetBase
+        sourceUrl
       );
       return true;
     }).catch((error) => {
-      showPdfViewerBootstrapError(root, error);
+      revokeOwnedResources();
+      showPdfViewerBootstrapError(root, error, pageWindow, sourceUrl);
       return false;
     });
+  }
+
+  function startDirectPdfViewer(documentObject, pageWindow) {
+    if (!isDirectPdfDocument(documentObject, pageWindow)) return Promise.resolve(false);
+    if (documentObject.__cleanMathCopyPdfViewerRoot && documentObject.__cleanMathCopyPdfViewerRoot.isConnected) {
+      return Promise.resolve(true);
+    }
+    const sourceUrl = (() => {
+      try { return String(pageWindow.location.href || ''); } catch (_error) { return ''; }
+    })();
+    const requestUrl = sourceUrl.split('#')[0];
+    try {
+      if (pageWindow.sessionStorage && pageWindow.sessionStorage.getItem(PDF_VIEWER_BYPASS_KEY) === requestUrl) {
+        pageWindow.sessionStorage.removeItem(PDF_VIEWER_BYPASS_KEY);
+        documentObject.__cleanMathCopyPdfViewerBypassed = true;
+        return Promise.resolve(false);
+      }
+    } catch (_error) {
+      // Session storage is optional; the custom viewer still works without it.
+    }
+    return startPdfViewer(documentObject, pageWindow, sourceUrl);
   }
 
   function loadInitialSettings() {
@@ -13123,17 +13515,7 @@
     let injected = null;
     const injectionParent = documentObject.head || documentObject.documentElement;
     try {
-      const extensionRelayBridge = userscriptGlobal &&
-        typeof userscriptGlobal.GM_cleanMathCopyInstallPageRelay === 'function'
-        ? userscriptGlobal.GM_cleanMathCopyInstallPageRelay
-        : (typeof global.GM_cleanMathCopyInstallPageRelay === 'function'
-          ? global.GM_cleanMathCopyInstallPageRelay
-          : null);
-      if (extensionRelayBridge && extensionRelayBridge(carrierId, eventName, Boolean(googleDocs))) {
-        // A Manifest V3 MAIN-world content script installed the relay without
-        // relying on inline script execution, which strict page CSP can block.
-        injected = { remove() {} };
-      } else if (typeof GM_addElement === 'function') {
+      if (typeof GM_addElement === 'function') {
         injected = GM_addElement(injectionParent, 'script', { textContent: source });
       } else if (global.GM && typeof global.GM.addElement === 'function') {
         injected = global.GM.addElement(injectionParent, 'script', { textContent: source });
@@ -13399,7 +13781,7 @@
         // same tab leaves PDF.js workers permanently stalled in Chromium.
         // The toolbar's explicit browser-viewer escape lasts for this native
         // document. A normal reload starts a fresh document and restores the
-        // custom viewer; a popup mode change must not replace the browser's
+        // custom viewer; a stored mode change must not replace the browser's
         // privileged viewer in place, which can strand PDF.js in Chromium.
         if (documentObject.__cleanMathCopyPdfViewerBypassed) return;
         if (!viewerStartPending) {
@@ -13793,7 +14175,7 @@
         updateSettings({ outputMode: mode });
       };
       const modeMenus = [
-        { mode: 'faithful', label: 'Faithful readable (recommended)' },
+        { mode: 'faithful', label: 'Readable text (recommended)' },
         { mode: 'calculator', label: 'Calculator-safe' },
         { mode: 'latex', label: 'Original LaTeX' },
         { mode: 'native', label: 'Original copy/paste' }

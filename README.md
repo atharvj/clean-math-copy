@@ -1,23 +1,22 @@
 # Clean Math Copy
 
-Copies equations as accurate, readable text and removes accidental spacing or line breaks from ordinary copied text. It supports rendered web math, Google Docs, Word for the web, and selectable PDFs.
+Copies equations as accurate, readable text and removes accidental spacing or line breaks from ordinary copied text. It supports rendered web math, Google Docs, Word for the web, and selectable PDFs opened in the browser.
+
+## Install
+
+Install the [raw userscript](https://raw.githubusercontent.com/atharvj/clean-math-copy/main/clean-math-copy.user.js) with Tampermonkey or Violentmonkey.
+That one userscript is the entire install; no companion extension is required.
 
 ## Modes
 
-- ✓ **Faithful readable** — closest clear plain-text version, such as `S = ∫ d⁴x √(−g) R`
+- ✓ **Readable text** — closest clear plain-text version, such as `S = ∫ d⁴x √(−g) R`
 - **Calculator-safe** — executable syntax where possible
 - **Original LaTeX** — LaTeX output
 - **Original copy/paste** — no rewriting
 
 The active mode always has a checkmark.
 
-## Install
-
-For full web and PDF support, download the extension ZIP from [Releases](https://github.com/atharvj/clean-math-copy/releases), unzip it, then use **Load unpacked** on your browser's extensions page. Disable the userscript if you install the extension so two copy handlers do not run together.
-
-For regular web pages only, install the [raw userscript](https://raw.githubusercontent.com/atharvj/clean-math-copy/main/clean-math-copy.user.js) with Tampermonkey or Violentmonkey. Chromium does not let userscript managers run inside its native PDF tabs, which is why the companion extension is required for PDFs.
-
-Images without selectable or accessible text are left unchanged; they require OCR.
+PDFs open normally; on Chromium, the userscript replaces supported PDF tabs with a selectable view. Browsers that block userscripts inside their protected PDF viewer cannot be changed by a userscript. Image-only PDFs require OCR.
 
 ## Development
 
@@ -27,7 +26,6 @@ Requires Node.js 20.19+.
 npm install
 npm run check
 npm run browser-smoke
-npm run pdf-extension-smoke
 ```
 
 [MIT License](./LICENSE)
