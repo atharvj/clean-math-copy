@@ -32,6 +32,7 @@ test('browser smoke runner observes launch errors and awaits graceful and forced
   assert.match(runner, /SIGTERM/);
   assert.match(runner, /SIGKILL/);
   assert.match(runner, /await waitForChildExit/);
+  assert.match(runner, /Date\.now\(\) \+ 120000/);
 });
 
 test('browser smoke exercises both page and isolated userscript worlds', () => {

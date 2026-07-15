@@ -43,7 +43,11 @@ function delay(milliseconds) {
 }
 
 async function waitForResult(port, processState, isolatedFixture) {
-  const deadline = Date.now() + 45000;
+  // A cold sandboxed Chromium launch on GitHub's shared Linux runners can
+  // spend 40+ seconds initializing DBus and the extension process before the
+  // DevTools endpoint is usable. Keep the smoke deterministic without
+  // weakening the sandbox or turning a slow, valid launch into a false fail.
+  const deadline = Date.now() + 120000;
   const expectedFixture = new URL(isolatedFixture);
   let lastError = null;
   let lastTitle = '';
