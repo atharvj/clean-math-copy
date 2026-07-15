@@ -42,6 +42,54 @@ function renderedKatex(source, display = false) {
   });
 }
 
+function giveCssStackGeometry(root, left = 10, width = 60) {
+  const rows = root.querySelectorAll(':scope > :nth-child(1), :scope > :nth-child(2)');
+  rows[0].getBoundingClientRect = () => ({
+    left, right: left + width, top: 10, bottom: 30, width, height: 20
+  });
+  rows[1].getBoundingClientRect = () => ({
+    left, right: left + width, top: 31, bottom: 51, width, height: 20
+  });
+}
+
+function cssStackLimitFixture() {
+  const instance = dom([
+    '<style>',
+    '.lim,.intbl{display:inline-table;vertical-align:middle;text-align:center;margin:0 .12em}',
+    '.lim>em,.lim>strong,.intbl>em,.intbl>strong{display:table-row;font-style:normal;font-weight:inherit}',
+    '.intbl>em{border-bottom:.08em solid currentColor}',
+    '</style>',
+    '<p id="lead">And it is written in symbols as:</p>',
+    '<p id="equation" class="center large">',
+    '<span class="lim"><em>lim</em><strong>x→1</strong></span>',
+    '<span class="intbl"><em>x<sup>2</sup>−1</em><strong>x−1</strong></span> = 2',
+    '</p>'
+  ].join(''), 'https://www.mathsisfun.com/calculus/limits.html');
+  const document = instance.window.document;
+  const limit = document.querySelector('.lim');
+  const fraction = document.querySelector('.intbl');
+  giveCssStackGeometry(limit, 10, 35);
+  giveCssStackGeometry(fraction, 48, 60);
+  return {
+    instance,
+    document,
+    lead: document.querySelector('#lead'),
+    equation: document.querySelector('#equation'),
+    limit,
+    fraction
+  };
+}
+
+function selectRange(window, startContainer, startOffset, endContainer, endOffset) {
+  const range = window.document.createRange();
+  range.setStart(startContainer, startOffset);
+  range.setEnd(endContainer, endOffset);
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return selection;
+}
+
 function splitOldKatexNumericPower(root, insertInvisibleTimes = false) {
   const superscript = Array.from(root.querySelectorAll('.katex-mathml msup')).find((candidate) => {
     const children = Array.from(candidate.children || []);
@@ -2237,6 +2285,1002 @@ test('falls back to the MathJax MathItem list when container lookup rejects rend
     }
   };
   assert.equal(cleanCopy.extractMathText(root, 'faithful', pageWindow), '√x');
+});
+
+test('reconstructs legacy CSS-stacked limits and fractions without leaking Markdown emphasis', () => {
+  const { instance, document, lead, equation, limit } = cssStackLimitFixture();
+  const limitTop = limit.firstElementChild.firstChild;
+  const equationTail = equation.lastChild;
+  const fullSelection = selectRange(
+    instance.window,
+    lead.firstChild,
+    0,
+    equationTail,
+    equationTail.nodeValue.length
+  );
+  const full = cleanCopy.getCopyPayload(
+    document,
+    fullSelection,
+    { outputMode: 'faithful' },
+    instance.window,
+    equation
+  );
+  assert.equal(full.reason, 'css-stacked-math');
+  assert.equal(
+    full.text,
+    'And it is written in symbols as:\n\nlim_(x → 1) (x² − 1)/(x − 1) = 2'
+  );
+  assert.equal(/[\n\r\s]$/u.test(full.text), false);
+  assert.match(full.html, /x<sup>2<\/sup> − 1/u);
+  assert.doesNotMatch(full.html, /<(?:em|strong)\b|class=|\*lim\*|\*\*/iu);
+
+  const formulaSelection = selectRange(
+    instance.window,
+    limitTop,
+    0,
+    equationTail,
+    equationTail.nodeValue.length
+  );
+  const expected = {
+    faithful: 'lim_(x → 1) (x² − 1)/(x − 1) = 2',
+    calculator: 'limit(((x^(2)-1)/(x-1)),x->1) = 2',
+    latex: '$\\lim_{x\\to 1}\\frac{x^{2}-1}{x-1}$ = 2'
+  };
+  for (const [outputMode, text] of Object.entries(expected)) {
+    const payload = cleanCopy.getCopyPayload(
+      document,
+      formulaSelection,
+      { outputMode },
+      instance.window,
+      equation
+    );
+    assert.equal(payload.reason, 'css-stacked-math', outputMode);
+    assert.equal(payload.text, text, outputMode);
+    assert.doesNotMatch(payload.html, /<(?:em|strong)\b|class=/iu, outputMode);
+  }
+  assert.equal(
+    cleanCopy.getCopyPayload(document, formulaSelection, { outputMode: 'native' }, instance.window, equation),
+    null,
+    'Original copy/paste remains a hard opt-out'
+  );
+});
+
+test('CSS-stacked math keeps every strict partial selection exact', () => {
+  const { instance, document, equation, limit, fraction } = cssStackLimitFixture();
+  const topLimit = limit.firstElementChild.firstChild;
+  const lowerLimit = limit.lastElementChild.firstChild;
+  const numerator = fraction.firstElementChild;
+  const denominator = fraction.lastElementChild.firstChild;
+  const exponent = numerator.querySelector('sup').firstChild;
+  const cases = [
+    ['literal operator', topLimit, 0, topLimit, 3, 'lim'],
+    ['whole limit', topLimit, 0, lowerLimit, lowerLimit.nodeValue.length, 'lim_(x → 1)'],
+    ['numerator', numerator.firstChild, 0, numerator.lastChild, numerator.lastChild.nodeValue.length, 'x² − 1'],
+    ['superscript only', exponent, 0, exponent, 1, '²'],
+    ['denominator', denominator, 0, denominator, denominator.nodeValue.length, 'x − 1']
+  ];
+  for (const [name, start, startOffset, end, endOffset, expected] of cases) {
+    const selection = selectRange(instance.window, start, startOffset, end, endOffset);
+    const payload = cleanCopy.getCopyPayload(
+      document,
+      selection,
+      { outputMode: 'faithful' },
+      instance.window,
+      equation
+    );
+    assert.equal(payload.reason, 'css-stacked-math', name);
+    assert.equal(payload.text, expected, name);
+    assert.equal(payload.text.includes('= 2'), false, name + ' must not widen to the equation tail');
+    assert.equal(/[\n\r\s]$/u.test(payload.text), false, name);
+  }
+
+  const numeratorSelection = selectRange(
+    instance.window,
+    numerator.firstChild,
+    0,
+    numerator.lastChild,
+    numerator.lastChild.nodeValue.length
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      document,
+      numeratorSelection,
+      { outputMode: 'calculator' },
+      instance.window,
+      equation
+    ).text,
+    'x^(2)-1'
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      document,
+      numeratorSelection,
+      { outputMode: 'latex' },
+      instance.window,
+      equation
+    ).text,
+    '$x^{2}-1$'
+  );
+
+  const wholeLimitSelection = selectRange(
+    instance.window,
+    topLimit,
+    0,
+    lowerLimit,
+    lowerLimit.nodeValue.length
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      document,
+      wholeLimitSelection,
+      { outputMode: 'calculator' },
+      instance.window,
+      equation
+    ),
+    null,
+    'an incomplete limit must not silently lose its selected lower bound'
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      document,
+      wholeLimitSelection,
+      { outputMode: 'latex' },
+      instance.window,
+      equation
+    ).text,
+    '$\\lim_{x\\to 1}$'
+  );
+
+  const exponentSelection = selectRange(instance.window, exponent, 0, exponent, 1);
+  for (const outputMode of ['calculator', 'latex']) {
+    assert.equal(
+      cleanCopy.getCopyPayload(document, exponentSelection, { outputMode }, instance.window, equation),
+      null,
+      outputMode + ' must not emit a dangling script with no selected base'
+    );
+  }
+  const literalLimitSelection = selectRange(instance.window, topLimit, 0, topLimit, 3);
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      document,
+      literalLimitSelection,
+      { outputMode: 'latex' },
+      instance.window,
+      equation
+    ).text,
+    '$\\lim$'
+  );
+});
+
+test('CSS-stacked cross-row partials retain the selected fraction structure', () => {
+  const instance = dom([
+    '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+    '.fraction>em{border-bottom:1px solid currentColor}</style>',
+    '<p id="target">Before <span class="fraction"><em>a+b+c+d</em><strong>e+f+g+h</strong></span> after</p>'
+  ].join(''));
+  const document = instance.window.document;
+  const target = document.querySelector('#target');
+  const fraction = target.querySelector('.fraction');
+  giveCssStackGeometry(fraction);
+  const numerator = fraction.firstElementChild.firstChild;
+  const denominator = fraction.lastElementChild.firstChild;
+  const partial = selectRange(instance.window, numerator, 2, denominator, 3);
+  assert.equal(
+    cleanCopy.getCopyPayload(document, partial, { outputMode: 'faithful' }, instance.window, target).text,
+    '(b + c + d)/(e + f)'
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(document, partial, { outputMode: 'calculator' }, instance.window, target).text,
+    '(b+c+d)/(e+f)'
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(document, partial, { outputMode: 'latex' }, instance.window, target).text,
+    '$\\frac{b+c+d}{e+f}$'
+  );
+
+  const crossing = selectRange(instance.window, target.firstChild, 0, denominator, 3);
+  assert.equal(
+    cleanCopy.getCopyPayload(document, crossing, { outputMode: 'faithful' }, instance.window, target).text,
+    'Before (a + b + c + d)/(e + f)'
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(document, crossing, { outputMode: 'calculator' }, instance.window, target).text,
+    'Before (a+b+c+d)/(e+f)'
+  );
+
+  // Start inside a generated superscript rather than at the numerator base.
+  const scripted = dom([
+    '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+    '.fraction>em{border-bottom:1px solid currentColor}</style>',
+    '<span id="target" class="fraction"><em>x<sup>2</sup></em><strong>y</strong></span>'
+  ].join(''));
+  const scriptedTarget = scripted.window.document.querySelector('#target');
+  giveCssStackGeometry(scriptedTarget);
+  const scriptText = scriptedTarget.querySelector('sup').firstChild;
+  const scriptDenominator = scriptedTarget.lastElementChild.firstChild;
+  const danglingSelection = selectRange(scripted.window, scriptText, 0, scriptDenominator, 1);
+  for (const outputMode of ['faithful', 'calculator', 'latex']) {
+    assert.equal(
+      cleanCopy.getCopyPayload(
+        scripted.window.document,
+        danglingSelection,
+        { outputMode },
+        scripted.window,
+        scriptedTarget
+      ),
+      null,
+      outputMode + ' must reject a base-less script nested in a partial fraction'
+    );
+  }
+});
+
+test('CSS-stacked math canonicalizes direct Unicode roots and scripts in every semantic mode', () => {
+  const instance = dom([
+    '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+    '.fraction>em{border-bottom:1px solid currentColor}</style>',
+    '<span id="target" class="fraction"><em>√(x²+1)</em><strong>y₁</strong></span>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  giveCssStackGeometry(target);
+  const selection = selectContents(instance.window, target);
+  const expected = {
+    faithful: '√(x² + 1)/y₁',
+    calculator: '(sqrt(x^(2)+1))/(y_(1))',
+    latex: '$\\frac{\\sqrt{x^{2}+1}}{y_{1}}$'
+  };
+  for (const [outputMode, text] of Object.entries(expected)) {
+    const payload = cleanCopy.getCopyPayload(
+      instance.window.document,
+      selection,
+      { outputMode },
+      instance.window,
+      target
+    );
+    assert.equal(payload && payload.text, text, outputMode);
+  }
+
+  const numerator = target.firstElementChild.firstChild;
+  const scriptOffset = numerator.nodeValue.indexOf('²');
+  const scriptOnly = selectRange(instance.window, numerator, scriptOffset, numerator, scriptOffset + 1);
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      instance.window.document,
+      scriptOnly,
+      { outputMode: 'faithful' },
+      instance.window,
+      target
+    ).text,
+    '²'
+  );
+  for (const outputMode of ['calculator', 'latex']) {
+    assert.equal(
+      cleanCopy.getCopyPayload(
+        instance.window.document,
+        scriptOnly,
+        { outputMode },
+        instance.window,
+        target
+      ),
+      null,
+      outputMode + ' must not invent a base for a selected Unicode script'
+    );
+  }
+});
+
+test('CSS-stacked math scopes Unicode fences, variants, relations, and implicit products safely', () => {
+  const copy = (top, outputMode = 'faithful') => {
+    const instance = dom([
+      '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+      '.fraction>em{border-bottom:1px solid currentColor}</style>',
+      '<span id="target" class="fraction"><em>', top, '</em><strong>z</strong></span>'
+    ].join(''));
+    const target = instance.window.document.querySelector('#target');
+    giveCssStackGeometry(target);
+    const payload = cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      { outputMode },
+      instance.window,
+      target
+    );
+    return payload && payload.text;
+  };
+
+  assert.equal(copy('√|x|'), '√|x|/z');
+  assert.equal(copy('√|x|', 'calculator'), '(sqrt(abs(x)))/z');
+  assert.equal(copy('√|x|', 'latex'), '$\\frac{\\sqrt{|x|}}{z}$');
+  assert.equal(copy('√[x+1]'), '√(x + 1)/z');
+  assert.equal(copy('√[x+1]', 'calculator'), 'sqrt(x+1)/z');
+  assert.equal(copy('𝑥²'), '𝑥²/z');
+  assert.equal(copy('𝑥²', 'calculator'), '(x^(2))/z');
+  assert.equal(copy('𝑥²', 'latex'), '$\\frac{\\mathit{x}^{2}}{z}$');
+  assert.equal(copy('𝛼+β', 'calculator'), '(alpha+beta)/z');
+  assert.equal(copy('𝛼+β', 'latex'), '$\\frac{\\alpha+\\beta }{z}$');
+  assert.equal(copy('x~y'), 'x∼y/z');
+  assert.equal(copy('x~y', 'calculator'), '(x~=y)/z');
+  assert.equal(copy('sin² z', 'calculator'), '(sin(z)^(2))/z');
+  assert.equal(copy('sin² z', 'latex'), '$\\frac{\\sin ^{2} z}{z}$');
+  assert.equal(copy('log₂ z', 'calculator'), '(log(z)/log(2))/z');
+  assert.equal(copy('log₂ z', 'latex'), '$\\frac{\\log _{2} z}{z}$');
+  assert.equal(copy('√(−gR)', 'calculator'), 'sqrt(-g*R)/z');
+  assert.equal(copy('√(−gR)', 'latex'), '$\\frac{\\sqrt{-gR}}{z}$');
+  assert.equal(copy('50%'), '50%/z');
+  assert.equal(copy('50%', 'calculator'), '(50/100)/z');
+  assert.equal(copy('50%', 'latex'), '$\\frac{50\\%}{z}$');
+  assert.equal(copy('{x}', 'latex'), '$\\frac{\\{x\\}}{z}$');
+  assert.equal(copy('A\\B', 'latex'), '$\\frac{A\\backslash B}{z}$');
+  for (const subscript of ['xᵢ', 'aₙ', 'vₓ', 'xᵦ']) {
+    assert.notEqual(copy(subscript), null, subscript);
+    assert.notEqual(copy(subscript, 'latex'), null, subscript + ' LaTeX');
+  }
+});
+
+test('CSS-stacked partial fractions reject unbalanced delimiters, dangling operators, and relation scripts', () => {
+  const instance = dom([
+    '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+    '.fraction>em{border-bottom:1px solid currentColor}</style>',
+    '<span id="target" class="fraction"><em>√(x+1)</em><strong>y</strong></span>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  giveCssStackGeometry(target);
+  const numerator = target.firstElementChild.firstChild;
+  const denominator = target.lastElementChild.firstChild;
+  const partial = selectRange(instance.window, numerator, 2, denominator, 1);
+  for (const outputMode of ['faithful', 'calculator', 'latex']) {
+    assert.equal(
+      cleanCopy.getCopyPayload(instance.window.document, partial, { outputMode }, instance.window, target),
+      null,
+      outputMode + ' rejects an unmatched closing delimiter'
+    );
+  }
+
+  for (const top of ['x+', '*x', 'x=', 'x/', 'x→', '([x)]', '|x', 'x|']) {
+    const sample = dom([
+      '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+      '.fraction>em{border-bottom:1px solid currentColor}</style>',
+      '<span id="target" class="fraction"><em>', top, '</em><strong>y</strong></span>'
+    ].join(''));
+    const sampleTarget = sample.window.document.querySelector('#target');
+    giveCssStackGeometry(sampleTarget);
+    assert.equal(
+      cleanCopy.getCopyPayload(
+        sample.window.document,
+        selectContents(sample.window, sampleTarget),
+        { outputMode: 'calculator' },
+        sample.window,
+        sampleTarget
+      ),
+      null,
+      top
+    );
+  }
+
+  for (const relation of ['≤', '→', '±', '&lt;']) {
+    const sample = dom([
+      '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+      '.fraction>em{border-bottom:1px solid currentColor}</style>',
+      '<span id="target" class="fraction"><em>', relation, '<sup>2</sup></em><strong>y</strong></span>'
+    ].join(''));
+    const sampleTarget = sample.window.document.querySelector('#target');
+    giveCssStackGeometry(sampleTarget);
+    for (const outputMode of ['calculator', 'latex']) {
+      assert.equal(
+        cleanCopy.getCopyPayload(
+          sample.window.document,
+          selectContents(sample.window, sampleTarget),
+          { outputMode },
+          sample.window,
+          sampleTarget
+        ),
+        null,
+        relation + ' ' + outputMode
+      );
+    }
+  }
+});
+
+test('CSS-stacked math keeps adjacent scripts, products, and fractions semantic', () => {
+  const copy = (tail, outputMode) => {
+    const instance = dom([
+      '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+      '.fraction>em{border-bottom:1px solid currentColor}</style>',
+      '<span id="target"><span class="fraction"><em>x</em><strong>y</strong></span>', tail, '</span>'
+    ].join(''));
+    const target = instance.window.document.querySelector('#target');
+    Array.from(target.querySelectorAll('.fraction')).forEach((root, index) =>
+      giveCssStackGeometry(root, 10 + index * 62, 60));
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      { outputMode },
+      instance.window,
+      target
+    ).text;
+  };
+  assert.equal(copy('<sup>2</sup>', 'faithful'), '(x/y)²');
+  assert.equal(copy('<sup>2</sup>', 'latex'), '${\\frac{x}{y}}^{2}$');
+  assert.equal(copy('<sub>i</sub>', 'faithful'), '(x/y)ᵢ');
+  assert.equal(copy(' \n <sup>2</sup>', 'faithful'), '(x/y)²');
+  assert.equal(copy(' <!--layout--> ×z', 'calculator'), '(x/y)*z');
+  assert.equal(copy('z', 'calculator'), '(x/y)*z');
+  assert.equal(copy('z', 'latex'), '$\\frac{x}{y}z$');
+  assert.equal(copy('×z', 'calculator'), '(x/y)*z');
+  assert.equal(copy('×z', 'latex'), '$\\frac{x}{y}\\times z$');
+  const second = '<span class="fraction"><em>a</em><strong>b</strong></span>';
+  assert.equal(copy(second, 'faithful'), '(x/y)(a/b)');
+  assert.equal(copy(second, 'calculator'), '(x/y)*(a/b)');
+  assert.equal(copy(second, 'latex'), '$\\frac{x}{y}\\frac{a}{b}$');
+
+  const incomplete = dom([
+    '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+    '.fraction>em{border-bottom:1px solid currentColor}</style>',
+    '<span id="target"><span class="fraction"><em>x</em><strong>y</strong></span>×z</span>'
+  ].join(''));
+  const incompleteTarget = incomplete.window.document.querySelector('#target');
+  giveCssStackGeometry(incompleteTarget.querySelector('.fraction'));
+  const tail = incompleteTarget.lastChild;
+  const partial = selectRange(
+    incomplete.window,
+    incompleteTarget.querySelector('.fraction > em').firstChild,
+    0,
+    tail,
+    1
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      incomplete.window.document,
+      partial,
+      { outputMode: 'calculator' },
+      incomplete.window,
+      incompleteTarget
+    ),
+    null,
+    'a selected multiplication sign without its operand fails native'
+  );
+});
+
+test('CSS-stacked recovery fails closed on prose, citations, UI stacks, and incomplete drags', () => {
+  const fixture = (top, bottom, tail = '', className = 'fraction') => {
+    const instance = dom([
+      '<style>.fraction,.intbl,.lim{display:inline-table}',
+      '.fraction>em,.fraction>strong,.intbl>em,.intbl>strong,.lim>em,.lim>strong{display:table-row}',
+      '.fraction>em,.intbl>em{border-bottom:1px solid currentColor}</style>',
+      '<span id="target"><span class="', className, '"><em>', top, '</em><strong>', bottom,
+      '</strong></span>', tail, '</span>'
+    ].join(''));
+    const target = instance.window.document.querySelector('#target');
+    giveCssStackGeometry(target.firstElementChild);
+    const copy = (outputMode, selection = selectContents(instance.window, target)) =>
+      cleanCopy.getCopyPayload(
+        instance.window.document,
+        selection,
+        { outputMode },
+        instance.window,
+        target
+      );
+    return { instance, target, copy };
+  };
+
+  const prose = fixture('x', 'y', ' is 2');
+  assert.equal(prose.copy('faithful').text, 'x/y is 2');
+  assert.equal(prose.copy('calculator').text, 'x/y is 2');
+  assert.equal(prose.copy('latex').text, '$\\frac{x}{y}$ is 2');
+  assert.doesNotMatch(prose.copy('calculator').text, /\*i\*s|\bis2\b/u);
+
+  const limitProse = fixture('lim', 'x→0', ' is 2', 'lim');
+  assert.equal(limitProse.copy('faithful').text, 'lim_(x → 0) is 2');
+  assert.equal(limitProse.copy('latex').text, '$\\lim_{x\\to 0}$ is 2');
+  assert.equal(limitProse.copy('calculator'), null);
+
+  const citation = fixture('x', 'y', '<sup>[1]</sup>');
+  for (const outputMode of ['faithful', 'calculator', 'latex']) {
+    const payload = citation.copy(outputMode);
+    assert.doesNotMatch(payload.text, /\^\(?\[1\]|_\(?\[1\]/u, outputMode);
+    assert.match(payload.html, /<sup>\[1\]<\/sup>/u, outputMode);
+  }
+
+  for (const tail of ['<sup>2</sup><sup>3</sup>', '<sub>i</sub><sub>j</sub>']) {
+    const repeated = fixture('x', 'y', tail);
+    for (const outputMode of ['faithful', 'calculator', 'latex']) {
+      assert.equal(repeated.copy(outputMode), null, tail + ' ' + outputMode);
+    }
+  }
+  const mixedScripts = fixture('x', 'y', '<sup>2</sup><sub>i</sub>');
+  assert.equal(mixedScripts.copy('faithful').text, '(x/y)²ᵢ');
+  assert.equal(mixedScripts.copy('latex').text, '${\\frac{x}{y}}^{2}_{i}$');
+
+  for (const [top, bottom] of [
+    ['v1.2', 'v2.3'], ['1st', '2nd'], ['10kg', '20kg']
+  ]) {
+    const widget = fixture(top, bottom);
+    for (const outputMode of ['faithful', 'calculator', 'latex']) {
+      assert.equal(widget.copy(outputMode), null, top + '/' + bottom + ' ' + outputMode);
+    }
+  }
+  assert.notEqual(
+    fixture('v1.2', 'v2.3', '', 'intbl').copy('faithful'),
+    null,
+    'an authenticated legacy math renderer can intentionally use version-like operands'
+  );
+
+  const accents = fixture('x⃗+ŷ', 'z');
+  assert.equal(accents.copy('faithful').text, '(x⃗ + ŷ)/z');
+  assert.equal(accents.copy('calculator'), null);
+  assert.equal(accents.copy('latex').text, '$\\frac{\\vec{x}+\\hat{y}}{z}$');
+  const unsupportedAccent = fixture('x̄', 'z');
+  assert.equal(unsupportedAccent.copy('calculator'), null);
+
+  const radicalFunction = fixture('√sin(x)', 'z');
+  assert.equal(radicalFunction.copy('faithful').text, '√(sin(x))/z');
+  assert.equal(radicalFunction.copy('calculator').text, '(sqrt(sin(x)))/z');
+  assert.equal(radicalFunction.copy('latex').text, '$\\frac{\\sqrt{\\sin (x)}}{z}$');
+  const radicalBraces = fixture('√{x+1}', 'z');
+  assert.equal(radicalBraces.copy('faithful').text, '√(x + 1)/z');
+  assert.equal(radicalBraces.copy('calculator').text, 'sqrt(x+1)/z');
+  assert.equal(radicalBraces.copy('latex').text, '$\\frac{\\sqrt{x+1}}{z}$');
+  for (const glyph of ['√', '∛', '∜']) {
+    const loneRadical = fixture(glyph, 'z');
+    for (const outputMode of ['faithful', 'calculator', 'latex']) {
+      assert.equal(loneRadical.copy(outputMode), null, 'lone ' + glyph + ' ' + outputMode);
+    }
+  }
+
+  for (const [top, bottom] of [['(x]', 'z'], ['[x)', 'z']]) {
+    const malformed = fixture(top, bottom);
+    for (const outputMode of ['faithful', 'calculator', 'latex']) {
+      assert.equal(malformed.copy(outputMode), null, top + ' ' + outputMode);
+    }
+  }
+
+  const partialRows = fixture('(x+y)', '(y+z)');
+  const numerator = partialRows.target.querySelector('em').firstChild;
+  const denominator = partialRows.target.querySelector('strong').firstChild;
+  const malformedTop = selectRange(
+    partialRows.instance.window,
+    numerator,
+    1,
+    numerator,
+    numerator.nodeValue.length
+  );
+  for (const outputMode of ['faithful', 'calculator', 'latex']) {
+    assert.equal(partialRows.copy(outputMode, malformedTop), null, 'unbalanced numerator ' + outputMode);
+  }
+  const malformedBottom = selectRange(
+    partialRows.instance.window,
+    denominator,
+    0,
+    denominator,
+    denominator.nodeValue.length - 1
+  );
+  for (const outputMode of ['faithful', 'calculator', 'latex']) {
+    assert.equal(partialRows.copy(outputMode, malformedBottom), null, 'unbalanced denominator ' + outputMode);
+  }
+
+  const partialLimit = fixture('lim', 'x→1', '', 'lim');
+  const limitTop = partialLimit.target.querySelector('em').firstChild;
+  const limitBottom = partialLimit.target.querySelector('strong').firstChild;
+  const danglingBound = selectRange(partialLimit.instance.window, limitTop, 0, limitBottom, 2);
+  for (const outputMode of ['faithful', 'calculator', 'latex']) {
+    assert.equal(partialLimit.copy(outputMode, danglingBound), null, 'incomplete limit ' + outputMode);
+  }
+});
+
+test('CSS-stacked lower limits keep nested bounds and bind only to a same-line body', () => {
+  const instance = dom([
+    '<style>.lim,.fraction{display:inline-table}.lim>em,.lim>strong,.fraction>em,.fraction>strong{display:table-row}',
+    '.fraction>em{border-bottom:1px solid currentColor}</style>',
+    '<p id="target"><span class="lim"><em>lim</em><strong>x→a<sup>2</sup></strong></span>',
+    '<span class="fraction"><em>x</em><strong>y</strong></span></p>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const limit = target.querySelector('.lim');
+  const fraction = target.querySelector('.fraction');
+  giveCssStackGeometry(limit, 10, 35);
+  giveCssStackGeometry(fraction, 48, 35);
+
+  const limitOnly = selectContents(instance.window, limit);
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      instance.window.document,
+      limitOnly,
+      { outputMode: 'calculator' },
+      instance.window,
+      target
+    ),
+    null,
+    'a nested lower bound is still incomplete without a selected body'
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      instance.window.document,
+      limitOnly,
+      { outputMode: 'latex' },
+      instance.window,
+      target
+    ).text,
+    '$\\lim_{x\\to a^{2}}$'
+  );
+
+  const plainBody = dom([
+    '<style>.lim{display:inline-table}.lim>em,.lim>strong{display:table-row}</style>',
+    '<span id="target"><span class="lim"><em>lim</em><strong>x→0</strong></span>sin(x)</span>'
+  ].join(''));
+  const plainBodyTarget = plainBody.window.document.querySelector('#target');
+  giveCssStackGeometry(plainBodyTarget.querySelector('.lim'), 10, 35);
+  const plainBodySelection = selectContents(plainBody.window, plainBodyTarget);
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      plainBody.window.document,
+      plainBodySelection,
+      { outputMode: 'calculator' },
+      plainBody.window,
+      plainBodyTarget
+    ).text,
+    'limit(sin(x),x->0)'
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      plainBody.window.document,
+      plainBodySelection,
+      { outputMode: 'latex' },
+      plainBody.window,
+      plainBodyTarget
+    ).text,
+    '$\\lim_{x\\to 0}{\\sin (x)}$'
+  );
+
+  plainBodyTarget.lastChild.nodeValue = 'f(x) = L';
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      plainBody.window.document,
+      selectContents(plainBody.window, plainBodyTarget),
+      { outputMode: 'calculator' },
+      plainBody.window,
+      plainBodyTarget
+    ).text,
+    'limit(f(x),x->0)=L'
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      plainBody.window.document,
+      selectContents(plainBody.window, plainBodyTarget),
+      { outputMode: 'latex' },
+      plainBody.window,
+      plainBodyTarget
+    ).text,
+    '$\\lim_{x\\to 0}{f(x)} = L$'
+  );
+  plainBodyTarget.lastChild.nodeValue = 'f(x) → L';
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      plainBody.window.document,
+      selectContents(plainBody.window, plainBodyTarget),
+      { outputMode: 'calculator' },
+      plainBody.window,
+      plainBodyTarget
+    ).text,
+    'limit(f(x),x->0)->L'
+  );
+  plainBodyTarget.lastChild.nodeValue = 'f(x) = result';
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      plainBody.window.document,
+      selectContents(plainBody.window, plainBodyTarget),
+      { outputMode: 'calculator' },
+      plainBody.window,
+      plainBodyTarget
+    ),
+    null,
+    'prose is never absorbed into a recovered limit equation'
+  );
+
+  // The DOM siblings remain adjacent, but the visual body has wrapped to a
+  // later line. It must never become the first limit's argument.
+  const rows = fraction.children;
+  rows[0].getBoundingClientRect = () => ({ left: 10, right: 45, top: 100, bottom: 120, width: 35, height: 20 });
+  rows[1].getBoundingClientRect = () => ({ left: 10, right: 45, top: 121, bottom: 141, width: 35, height: 20 });
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      { outputMode: 'calculator' },
+      instance.window,
+      target
+    ),
+    null,
+    'a wrapped fraction is not silently attached to the preceding limit'
+  );
+
+  giveCssStackGeometry(fraction, 25, 35);
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      { outputMode: 'calculator' },
+      instance.window,
+      target
+    ),
+    null,
+    'materially overlapping roots are not grouped as a limit body'
+  );
+});
+
+test('comments and wbr nodes do not break a CSS-stacked limit from its body', () => {
+  const { instance, document, equation, limit, fraction } = cssStackLimitFixture();
+  limit.after(document.createComment('layout separator'), document.createElement('wbr'));
+  const tail = equation.lastChild;
+  const selection = selectRange(
+    instance.window,
+    limit.firstElementChild.firstChild,
+    0,
+    tail,
+    tail.nodeValue.length
+  );
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      document,
+      selection,
+      { outputMode: 'calculator' },
+      instance.window,
+      equation
+    ).text,
+    'limit(((x^(2)-1)/(x-1)),x->1) = 2'
+  );
+  assert.equal(fraction.isConnected, true);
+});
+
+test('the installed listener writes semantic plain and rich text for CSS-stacked math', () => {
+  const { instance, document, equation, limit } = cssStackLimitFixture();
+  const tail = equation.lastChild;
+  selectRange(
+    instance.window,
+    limit.firstElementChild.firstChild,
+    0,
+    tail,
+    tail.nodeValue.length
+  );
+  cleanCopy.install(document, instance.window, { registerMenus: false });
+  const clipboard = new Map();
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  equation.dispatchEvent(event);
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(clipboard.get('text/plain'), 'lim_(x → 1) (x² − 1)/(x − 1) = 2');
+  assert.match(clipboard.get('text/html'), /x<sup>2<\/sup> − 1/u);
+  assert.doesNotMatch(clipboard.get('text/html'), /<(?:em|strong)\b|class=|\*\*/iu);
+});
+
+test('CSS-stacked math authentication fails closed for lookalikes, hidden content, and false geometry', () => {
+  const copy = (markup, configure, mode = 'faithful') => {
+    const instance = dom(markup);
+    const target = instance.window.document.querySelector('#target');
+    if (configure) configure(instance.window, target);
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      { outputMode: mode },
+      instance.window,
+      target
+    );
+  };
+  const style = [
+    '<style>.stack{display:inline-table}.stack>em,.stack>strong{display:table-row}',
+    '.fraction>em{border-bottom:1px solid currentColor}</style>'
+  ].join('');
+  assert.equal(copy(
+    style + '<p id="target"><span class="stack"><em>ordinary</em><strong>emphasis</strong></span></p>'
+  ), null, 'two rows without a fraction rule or known operator are not math');
+  assert.equal(copy(
+    style + '<p id="target"><span class="stack fraction"><em>Current plan</em><strong>Next revision</strong></span></p>',
+    (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+  ), null, 'a bordered two-row status widget is not a fraction');
+  assert.equal(copy(
+    style + '<p id="target"><span class="stack fraction"><em>2025</em><strong>2026</strong></span></p>',
+    (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+  ), null, 'a numeric year/status widget is not guessed to be a fraction');
+  for (const rows of [
+    ['2025/01', '2026/01'],
+    ['2025–26', '2026–27'],
+    ['1×2', '3×4'],
+    ['10 kg', '20 kg'],
+    ['Speed 10', 'Speed 20'],
+    ['2025 Q1', '2026 Q2']
+  ]) {
+    assert.equal(copy(
+      style + '<p id="target"><span class="stack fraction"><em>' + rows[0] +
+        '</em><strong>' + rows[1] + '</strong></span></p>',
+      (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+    ), null, 'numeric/status rows stay native: ' + rows.join(' / '));
+  }
+  assert.equal(copy(
+    style + '<p id="target"><span class="stack"><em>max</em><strong>speed</strong></span></p>',
+    (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+  ), null, 'ordinary max/min labels are not authenticated as bounded operators');
+  assert.equal(copy(
+    style + '<p id="target"><span class="stack fraction"><em>x<a href="#">2</a></em><strong>y</strong></span></p>',
+    (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+  ), null, 'interactive descendants cannot authenticate a formula');
+  assert.equal(copy(
+    style + '<p id="target"><span class="stack fraction"><em>x<span style="display:none">SECRET</span></em><strong>y</strong></span></p>',
+    (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+  ), null, 'hidden descendants cannot be promoted into copied math');
+  assert.equal(copy(
+    style + '<p id="target"><span class="stack fraction"><em>x</em><strong>y</strong></span></p>',
+    (_window, target) => {
+      const rows = target.querySelectorAll('em,strong');
+      rows[0].getBoundingClientRect = () => ({ left: 0, right: 20, top: 0, bottom: 10, width: 20, height: 10 });
+      rows[1].getBoundingClientRect = () => ({ left: 30, right: 50, top: 12, bottom: 22, width: 20, height: 10 });
+    }
+  ), null, 'non-overlapping rows are not a visual stack');
+  assert.equal(copy(
+    style + '<p id="target"><span class="stack fraction"><em>x</em><strong>y</strong></span></p>',
+    (_window, target) => {
+      const rows = target.querySelectorAll('em,strong');
+      rows[0].getBoundingClientRect = () => ({ left: 0, right: 20, top: 0, bottom: 20, width: 20, height: 20 });
+      rows[1].getBoundingClientRect = () => ({ left: 0, right: 20, top: 1, bottom: 21, width: 20, height: 20 });
+    }
+  ), null, 'overlapping rows are not a visible numerator and denominator');
+
+  for (const ancestorStyle of ['display:none', 'opacity:0', 'clip-path:circle(0)']) {
+    assert.equal(copy(
+      style + '<div id="target" style="' + ancestorStyle + '"><span class="stack fraction"><em>SECRET</em><strong>x</strong></span></div>',
+      (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+    ), null, 'hidden ancestor: ' + ancestorStyle);
+  }
+  assert.equal(copy(
+    style + '<div id="target" style="overflow:hidden;width:10px;height:30px"><span class="stack fraction"><em>x</em><strong>y</strong></span></div>',
+    (_window, target) => {
+      target.getBoundingClientRect = () => ({ left: 0, right: 10, top: 0, bottom: 30, width: 10, height: 30 });
+      giveCssStackGeometry(target.querySelector('.stack'), 100, 20);
+    }
+  ), null, 'a stack fully outside a clipping ancestor is not visible math');
+  assert.equal(copy(
+    style + '<div id="target" style="overflow:hidden;width:10px;height:60px"><span class="stack fraction"><em>x</em><strong>y</strong></span></div>',
+    (_window, target) => {
+      target.getBoundingClientRect = () => ({ left: 0, right: 10, top: 0, bottom: 60, width: 10, height: 60 });
+      giveCssStackGeometry(target.querySelector('.stack'), 9, 20);
+    }
+  ), null, 'a nearly fully clipped stack is not promoted from one visible pixel');
+  assert.equal(copy(
+    style + '<p id="target">before <span class="stack fraction" contenteditable="true"><em>x</em><strong>y</strong></span> after</p>',
+    (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+  ), null, 'an embedded editable root is never rewritten from an outside selection');
+  assert.equal(copy(
+    style + '<p id="target">before <span contenteditable="true"><span class="stack fraction"><em>x</em><strong>y</strong></span></span> after</p>',
+    (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+  ), null, 'a stack inherited from an editable ancestor is never rewritten');
+  assert.equal(copy(
+    style + '<p id="target"><span class="stack fraction"><em><bdo dir="rtl">12</bdo></em><strong>x</strong></span></p>',
+    (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+  ), null, 'bidi-overridden DOM order is not guessed');
+
+  const valid = copy(
+    style + '<p id="target"><span class="stack fraction"><em>a</em><strong>b</strong></span></p>',
+    (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+  );
+  assert.equal(valid.text, 'a/b', 'single-variable fractions remain supported');
+
+  const knownNumeric = copy(
+    style + '<p id="target"><span class="stack intbl fraction"><em>1</em><strong>2</strong></span></p>',
+    (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+  );
+  assert.equal(knownNumeric.text, '1/2', 'known math renderers retain numeric-only fractions');
+  const semanticNumeric = copy(
+    style + '<p id="target"><span class="stack math-fraction fraction"><em>1</em><strong>2</strong></span></p>',
+    (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
+  );
+  assert.equal(semanticNumeric.text, '1/2', 'explicit cross-site math semantics retain numeric fractions');
+
+  const ordinary = dom('<p id="target">Use <em>real emphasis</em> here.</p>');
+  const ordinaryTarget = ordinary.window.document.querySelector('#target');
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      ordinary.window.document,
+      selectContents(ordinary.window, ordinaryTarget),
+      cleanCopy.DEFAULT_SETTINGS,
+      ordinary.window,
+      ordinaryTarget
+    ),
+    null,
+    'ordinary semantic emphasis stays on the browser path'
+  );
+});
+
+test('CSS-stacked math preserves surrounding rich prose and table spans', () => {
+  const instance = dom([
+    '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+    '.fraction>em{border-bottom:1px solid currentColor}</style>',
+    '<div id="target"><p><em>Important</em>: ',
+    '<span class="fraction"><em>x</em><strong>y</strong></span></p>',
+    '<table><tbody><tr><td>A</td><td colspan="2">B</td><td>C</td></tr></tbody></table></div>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  giveCssStackGeometry(target.querySelector('.fraction'));
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, 'Important: x/y\n\nA\tB\t\tC');
+  assert.match(payload.html, /<em>Important<\/em>/u);
+  assert.match(payload.html, /<table><tbody><tr><td>A<\/td><td colspan="2">B<\/td><td>C<\/td><\/tr><\/tbody><\/table>/u);
+  assert.doesNotMatch(payload.html, /class="fraction"|<strong>y<\/strong>/u);
+
+  const tableInstance = dom([
+    '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+    '.fraction>em{border-bottom:1px solid currentColor}</style>',
+    '<table><tbody><tr id="target"><td><span class="fraction"><em>x</em><strong>y</strong></span></td>',
+    '<td>tail</td></tr></tbody></table>'
+  ].join(''));
+  const tableRow = tableInstance.window.document.querySelector('#target');
+  giveCssStackGeometry(tableRow.querySelector('.fraction'));
+  const partial = selectRange(
+    tableInstance.window,
+    tableRow.querySelector('.fraction > em').firstChild,
+    0,
+    tableRow.lastElementChild.firstChild,
+    4
+  );
+  const partialPayload = cleanCopy.getCopyPayload(
+    tableInstance.window.document,
+    partial,
+    cleanCopy.DEFAULT_SETTINGS,
+    tableInstance.window,
+    tableRow
+  );
+  assert.match(partialPayload.html, /<table><tbody><tr><td>/u);
+  assert.doesNotMatch(partialPayload.html, /<!--StartFragment--><tr\b/u, 'partial rows are wrapped in valid table context');
+
+  const preserved = dom([
+    '<style>.fraction{display:inline-table}.fraction>em,.fraction>strong{display:table-row}',
+    '.fraction>em{border-bottom:1px solid currentColor}</style>',
+    '<span id="target"><span class="fraction"><em>x</em><strong>y</strong></span>',
+    '<span style="white-space:pre-wrap">  alpha  \n  beta  </span></span>'
+  ].join(''));
+  const preservedTarget = preserved.window.document.querySelector('#target');
+  giveCssStackGeometry(preservedTarget.querySelector('.fraction'));
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      preserved.window.document,
+      selectContents(preserved.window, preservedTarget),
+      cleanCopy.DEFAULT_SETTINGS,
+      preserved.window,
+      preservedTarget
+    ).text,
+    'x/y  alpha  \n  beta  ',
+    'authored pre-wrap spacing survives beside rewritten math'
+  );
+});
+
+test('CSS-stacked math discovery is bounded before document-sized layout work', () => {
+  const roots = Array.from({ length: 129 }, (_value, index) =>
+    '<span class="stack fraction"><em>x<sup>2</sup>+' + index + '</em><strong>y</strong></span>'
+  ).join(' ');
+  const instance = dom([
+    '<style>.stack{display:inline-table}.stack>em,.stack>strong{display:table-row}',
+    '.fraction>em{border-bottom:1px solid currentColor}</style>',
+    '<div id="target">', roots, '</div>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  assert.equal(
+    cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    ),
+    null
+  );
 });
 
 test('preserves semantic blocks, lists, tables, image alt text, and preformatted text around math', () => {

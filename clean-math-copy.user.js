@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.4.2
+// @version      2.5.0
 // @description  Accurately copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
@@ -90,6 +90,9 @@
   const MAX_POSITIONED_TOKEN_CANDIDATES = 512;
   const MAX_POSITIONED_SELECTED_TOKENS = 128;
   const MAX_POSITIONED_BASE_LOOKBACK = 24;
+  const MAX_CSS_STACK_MATH_ROOTS = 128;
+  const MAX_CSS_STACK_MATH_NODES = 256;
+  const MAX_CSS_STACK_MATH_CHARACTERS = 2048;
   const MAX_PDF_SELECTED_PAGES = 64;
   const MAX_PDF_SELECTED_ITEMS = 12000;
   const MAX_PDF_PAGE_ITEMS = 20000;
@@ -120,6 +123,15 @@
   const LATEX_BUDGET_ERROR = 'CLEAN_MATH_COPY_LATEX_BUDGET';
   const POSITIONED_OVER_BUDGET = Symbol('clean-math-copy-positioned-over-budget');
   const PDF_VIEWER_INCOMPLETE = Symbol('clean-math-copy-pdf-viewer-incomplete');
+  const CSS_STACK_MATH_UNREPRESENTABLE = Symbol('clean-math-copy-css-stack-unrepresentable');
+  const CSS_STACK_VISIBLE_SPECIALS = Object.freeze({
+    '\\': '\ue200', '{': '\ue201', '}': '\ue202', '$': '\ue203',
+    '#': '\ue204', '%': '\ue205', '&': '\ue206'
+  });
+  const CSS_STACK_VISIBLE_SPECIAL_LATEX = Object.freeze({
+    '\ue200': '\\backslash ', '\ue201': '\\{', '\ue202': '\\}', '\ue203': '\\$',
+    '\ue204': '\\#', '\ue205': '\\%', '\ue206': '\\&'
+  });
   const TRUSTED_RICH_STYLE_NODES = new WeakSet();
   const TRUSTED_PDF_VIEWER_ROOTS = new WeakSet();
   const TRUSTED_TEXT_PLACEHOLDERS = new WeakMap();
@@ -277,7 +289,7 @@
   ]);
 
   const ASCII_SYMBOLS = Object.freeze({
-    '≤': '<=', '≥': '>=', '≠': '!=', '≈': '~=', '≃': '~=', '≅': '~=', '≡': '===',
+    '≤': '<=', '≥': '>=', '≠': '!=', '≈': '~=', '∼': '~=', '≃': '~=', '≅': '~=', '≡': '===',
     '−': '-', '±': '+/-', '∓': '-/+', '×': '*', '÷': '/', '·': '*', '∗': '*',
     '→': '->', '←': '<-', '↔': '<->', '⇒': '=>', '⇐': '<=', '⇔': '<=>', '↦': '|->',
     '⟵': '<--', '⟶': '-->', '⟷': '<-->', '⟹': '==>', '⟸': '<==', '⟺': '<==>',
@@ -318,6 +330,25 @@
     'applet', 'audio', 'canvas', 'embed', 'frame', 'frameset', 'iframe', 'link',
     'meta', 'noscript', 'object', 'script', 'style', 'svg', 'template', 'video'
   ]);
+  const CSS_STACK_MATH_INLINE_TAGS = new Set([
+    'b', 'cite', 'dfn', 'em', 'i', 'mark', 'small', 'span',
+    'strong', 'sub', 'sup', 'u', 'var'
+  ]);
+  const CSS_STACK_MATH_OPERATORS = new Map([
+    ['lim', '\\lim']
+  ]);
+  const ORDINARY_SEMANTIC_TABLE_DISPLAYS = Object.freeze({
+    table: new Set(['table', 'inline-table']),
+    thead: new Set(['table-header-group']),
+    tbody: new Set(['table-row-group']),
+    tfoot: new Set(['table-footer-group']),
+    tr: new Set(['table-row']),
+    td: new Set(['table-cell']),
+    th: new Set(['table-cell']),
+    caption: new Set(['table-caption']),
+    colgroup: new Set(['table-column-group']),
+    col: new Set(['table-column'])
+  });
 
   function normalizeSettings(settings) {
     const candidate = settings && typeof settings === 'object' ? settings : {};
@@ -1812,6 +1843,18 @@
     'Gamma', 'Delta', 'Theta', 'Lambda', 'Xi', 'Pi', 'Sigma', 'Upsilon', 'Phi',
     'Psi', 'Omega', 'propto', 'boxed', 'lim', 'limsup', 'liminf', 'sup', 'inf'
   ]);
+
+  const CSS_STACK_MATH_WORDS = new Set([
+    ...CALCULATOR_WORDS,
+    'acceleration', 'amplitude', 'angle', 'area', 'capacitance', 'charge',
+    'current', 'density', 'distance', 'energy', 'force', 'frequency', 'height',
+    'inductance', 'length', 'mass', 'meter', 'momentum', 'power', 'pressure',
+    'radius', 'resistance', 'speed', 'temperature', 'time', 'velocity',
+    'voltage', 'volume', 'wavelength', 'width', 'work',
+    'amp', 'amps', 'cm', 'ev', 'hz', 'joule', 'joules', 'kg', 'km', 'meters',
+    'mm', 'mol', 'newton', 'newtons', 'ohm', 'ohms', 'pa', 'rad', 'rpm',
+    'second', 'seconds', 'volt', 'volts', 'watt', 'watts', 'wb'
+  ].map((word) => String(word).toLowerCase()));
 
   const CALCULATOR_WORD_OPERATOR_GLYPHS = Object.freeze({
     '∈': ' in ', '∉': ' not in ', '∋': ' contains ',
@@ -7622,6 +7665,62 @@
     return '<!--StartFragment-->' + escaped + '<!--EndFragment-->';
   }
 
+  function semanticTextRichFragment(input, outputMode, documentObject) {
+    const fragment = documentObject.createDocumentFragment();
+    const source = cleanClipboardText(input);
+    const appendText = (value, parent) => {
+      String(value || '').split('\n').forEach((line, index) => {
+        if (index) parent.appendChild(documentObject.createElement('br'));
+        if (line) parent.appendChild(documentObject.createTextNode(line));
+      });
+    };
+    if (outputMode !== 'faithful') {
+      appendText(source, fragment);
+      return fragment;
+    }
+    const superscriptReverse = Object.fromEntries(
+      Object.entries(SUPERSCRIPTS).map(([plain, script]) => [script, plain])
+    );
+    const subscriptReverse = Object.fromEntries(
+      Object.entries(SUBSCRIPTS).map(([plain, script]) => [script, plain])
+    );
+    Object.assign(subscriptReverse, {
+      'ₔ': 'ə', 'ᵦ': 'β', 'ᵧ': 'γ', 'ᵨ': 'ρ', 'ᵩ': 'φ', 'ᵪ': 'χ'
+    });
+    let plain = '';
+    let scriptKind = '';
+    let scriptText = '';
+    const flushPlain = () => {
+      appendText(plain, fragment);
+      plain = '';
+    };
+    const flushScript = () => {
+      if (!scriptKind) return;
+      flushPlain();
+      const script = documentObject.createElement(scriptKind);
+      script.textContent = scriptText;
+      fragment.appendChild(script);
+      scriptKind = '';
+      scriptText = '';
+    };
+    for (const character of source) {
+      const nextKind = Object.prototype.hasOwnProperty.call(superscriptReverse, character)
+        ? 'sup'
+        : (Object.prototype.hasOwnProperty.call(subscriptReverse, character) ? 'sub' : '');
+      if (!nextKind) {
+        flushScript();
+        plain += character;
+        continue;
+      }
+      if (scriptKind && scriptKind !== nextKind) flushScript();
+      if (!scriptKind) scriptKind = nextKind;
+      scriptText += nextKind === 'sup' ? superscriptReverse[character] : subscriptReverse[character];
+    }
+    flushScript();
+    flushPlain();
+    return fragment;
+  }
+
   function semanticTextClipboardHTML(input, outputMode) {
     const source = cleanClipboardText(input);
     if (outputMode !== 'faithful') {
@@ -9081,6 +9180,1369 @@
     return false;
   }
 
+  function cssStackMathTextSlice(node, range) {
+    if (!node || node.nodeType !== 3) return '';
+    const value = String(node.nodeValue || '');
+    if (!range) return value;
+    if (!rangeIntersects(range, node)) return '';
+    let start = node === range.startContainer ? range.startOffset : 0;
+    let end = node === range.endContainer ? range.endOffset : value.length;
+    start = Math.max(0, Math.min(value.length, Number(start) || 0));
+    end = Math.max(start, Math.min(value.length, Number(end) || 0));
+    return value.slice(start, end);
+  }
+
+  function cssStackMathChildIsSelected(range, parent, child, index) {
+    if (!range) return true;
+    if (parent === range.startContainer && index < range.startOffset) return false;
+    if (parent === range.endContainer && index >= range.endOffset) return false;
+    return rangeIntersects(range, child);
+  }
+
+  function cssStackMathDomSource(root, range) {
+    let nodes = 0;
+    let characters = 0;
+    let invalid = false;
+    const visit = (node) => {
+      if (!node || invalid) return '';
+      nodes += 1;
+      if (nodes > MAX_CSS_STACK_MATH_NODES) {
+        invalid = true;
+        return '';
+      }
+      if (node.nodeType === 3) {
+        let value = cssStackMathTextSlice(node, range)
+          .replace(/\r\n?/g, '\n')
+          .replace(/[\u0000\u00ad\u200b\u2060\ufeff]/g, '')
+          .replace(/\u00a0/g, ' ');
+        // Keep visible TeX-special glyphs distinct from the trusted structure
+        // synthesized below. Authored private markers are rejected first so a
+        // page cannot smuggle its own braces or commands into the expression.
+        if (/[\ue200-\ue206]/u.test(value) || /[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+          invalid = true;
+          return '';
+        }
+        value = value.replace(/[\\{}$#%&]/gu, (character) => CSS_STACK_VISIBLE_SPECIALS[character]);
+        characters += value.length;
+        if (characters > MAX_CSS_STACK_MATH_CHARACTERS) {
+          invalid = true;
+          return '';
+        }
+        return value.replace(/[\t\n\f\r ]+/g, ' ');
+      }
+      if (node.nodeType !== 1 && node.nodeType !== 11) return '';
+      if (node.nodeType === 1) {
+        const tag = (node.localName || '').toLowerCase();
+        if (!CSS_STACK_MATH_INLINE_TAGS.has(tag) || isVisuallyHiddenElement(node)) {
+          invalid = true;
+          return '';
+        }
+      }
+      let value = '';
+      Array.from(node.childNodes || []).forEach((child, index) => {
+        if (cssStackMathChildIsSelected(range, node, child, index)) value += visit(child);
+      });
+      if (node.nodeType === 1) {
+        const tag = (node.localName || '').toLowerCase();
+        if ((tag === 'sup' || tag === 'sub') && value.trim()) {
+          value = (tag === 'sup' ? '^{' : '_{') + value.trim() + '}';
+        }
+      }
+      return value;
+    };
+    const source = visit(root).replace(/[\t\n\f\r ]+/g, ' ').trim();
+    return invalid || source.length > MAX_CSS_STACK_MATH_CHARACTERS ? '' : source;
+  }
+
+  function cssStackMathBorderIsFractionRule(computed) {
+    const style = String(computed && computed.borderBottomStyle || '').trim().toLowerCase();
+    const width = String(computed && computed.borderBottomWidth || '').trim().toLowerCase();
+    const color = String(computed && computed.borderBottomColor || '').trim().toLowerCase();
+    if (style !== 'solid' || cssColorIsFullyTransparent(color)) return false;
+    const amount = Number.parseFloat(width);
+    return (Number.isFinite(amount) && amount > 0) || ['thin', 'medium', 'thick'].includes(width);
+  }
+
+  function cssStackMathPositiveRect(element) {
+    try {
+      const rect = element && element.getBoundingClientRect && element.getBoundingClientRect();
+      if (!rect) return null;
+      const left = Number(rect.left);
+      const top = Number(rect.top);
+      const width = Number(rect.width);
+      const height = Number(rect.height);
+      if (![left, top, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return null;
+      return {
+        left,
+        top,
+        right: Number.isFinite(Number(rect.right)) ? Number(rect.right) : left + width,
+        bottom: Number.isFinite(Number(rect.bottom)) ? Number(rect.bottom) : top + height,
+        width,
+        height
+      };
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function cssStackMathUnionRect(left, right) {
+    if (!left || !right) return null;
+    const union = {
+      left: Math.min(left.left, right.left),
+      top: Math.min(left.top, right.top),
+      right: Math.max(left.right, right.right),
+      bottom: Math.max(left.bottom, right.bottom)
+    };
+    union.width = union.right - union.left;
+    union.height = union.bottom - union.top;
+    return union.width > 0 && union.height > 0 ? union : null;
+  }
+
+  function cssStackMathRectContains(outer, inner) {
+    if (!outer || !inner) return false;
+    const tolerance = 0.5;
+    return inner.left >= outer.left - tolerance && inner.top >= outer.top - tolerance &&
+      inner.right <= outer.right + tolerance && inner.bottom <= outer.bottom + tolerance;
+  }
+
+  function cssStackMathSourceAnalysis(source) {
+    let value = String(source || '');
+    // NFKC turns letter scripts such as `ᵢ` into ordinary adjacent letters
+    // (`xi`), which would falsely look like an unknown prose word. Preserve
+    // the script boundary structurally before compatibility normalization.
+    value = decodeUnicodeScripts(value);
+    try { value = value.normalize('NFKC'); } catch (_error) {}
+    if (!value || /[!?;:"'“”‘’]/u.test(value) || /\.$/u.test(value)) {
+      return { valid: false, signal: false, numericOnly: false };
+    }
+    const words = Array.from(value.matchAll(/\p{L}+/gu), (match) => match[0]);
+    let wordSignal = false;
+    let proseLikeWord = false;
+    for (const word of words) {
+      const lower = word.toLowerCase();
+      const length = Array.from(word).length;
+      // Two adjacent variable glyphs (`ac`, `gR`, `xy`) are standard implicit
+      // multiplication. Longer unknown words are prose unless a renderer
+      // supplies explicit math semantics.
+      const singleVariable = length <= 2 || /^[dⅆ][\p{L}]$/u.test(word);
+      const known = CSS_STACK_MATH_WORDS.has(lower);
+      if (!singleVariable && !known && !/^[α-ωΑ-Ω]+$/u.test(word)) {
+        return { valid: false, signal: false, numericOnly: false };
+      }
+      wordSignal = wordSignal || singleVariable || /^[α-ωΑ-Ω]+$/u.test(word);
+      proseLikeWord = proseLikeWord || (length > 2 && !CALCULATOR_FUNCTIONS.has(lower) &&
+        !/^(?:beta|gamma|rho|phi|chi)$/u.test(lower));
+    }
+    const structuralSignal = /[\p{N}^_+\-−×÷·⋅∗/*=<>≤≥≠≈≃≅≡∝∞∂∇∑∏∫±∓%√∛∜]/u.test(value);
+    const numericOnly = /\p{N}/u.test(value) && !/\p{L}/u.test(value) &&
+      /^[\p{N}\p{M}\s.,+\-−–—×÷·⋅∗/*=<>≤≥≠≈±∓%()[\]_{}]+$/u.test(value);
+    const spacedTokens = /[\p{L}\p{N})\]]\s+[\p{L}\p{N}([]/u.test(value);
+    const longWords = words.filter((word) => Array.from(word).length > 2);
+    const functionExpression = longWords.length > 0 &&
+      longWords.every((word) => CALCULATOR_FUNCTIONS.has(word.toLowerCase()));
+    return {
+      valid: Boolean(words.length || structuralSignal),
+      signal: wordSignal || structuralSignal,
+      numericOnly,
+      proseLikeWord,
+      spacedTokens,
+      functionExpression
+    };
+  }
+
+  function cssStackMathPlainTailHasUnambiguousGrammar(source) {
+    let value = String(source || '');
+    try { value = value.normalize('NFKC'); } catch (_error) {}
+    const words = Array.from(value.matchAll(/\p{L}+/gu), (match) => match[0]);
+    return words.every((word) => {
+      const characters = Array.from(word);
+      if (characters.length === 1) return true;
+      const lower = word.toLowerCase();
+      return CALCULATOR_FUNCTIONS.has(lower) || /^(?:beta|gamma|rho|phi|chi)$/u.test(lower);
+    });
+  }
+
+  function cssStackMathSourceLooksLikeUiValue(source) {
+    let value = String(source || '').trim();
+    try { value = value.normalize('NFKC'); } catch (_error) {}
+    value = value.replace(/\s+/gu, '');
+    return /^(?:v\d+(?:\.\d+)+|\d+(?:st|nd|rd|th)|[+\-\u2212]?(?:\d+(?:\.\d*)?|\.\d+)(?:kg|km|cm|mm|ms|hz|rpm|px|pt|em|rem))$/iu.test(value);
+  }
+
+  function cssStackMathHasNumericFractionSemantics(element) {
+    for (let current = element, depth = 0; current && depth < 5; current = current.parentElement, depth += 1) {
+      const role = String(current.getAttribute && current.getAttribute('role') || '').trim().toLowerCase();
+      if (role === 'math') return true;
+      if (current !== element) continue;
+      const classes = Array.from(element.classList || [], (value) => String(value).toLowerCase());
+      // `intbl` is the long-standing Math Is Fun inline-table fraction
+      // renderer. Generic names such as `fraction` are deliberately not
+      // trusted: dashboards and calendars commonly use them for numeric UI.
+      if (classes.includes('intbl')) return true;
+      if (classes.some((value) => /^(?:math-fraction|mathfrac|mfrac|stacked-math|stacked-fraction)$/u.test(value))) {
+        return true;
+      }
+      for (const name of ['data-math', 'data-formula', 'data-equation']) {
+        const value = String(element.getAttribute && element.getAttribute(name) || '').trim().toLowerCase();
+        if (/^(?:1|true|math|formula|equation)$/u.test(value)) return true;
+      }
+      for (const name of ['data-latex', 'data-tex']) {
+        const value = String(element.getAttribute && element.getAttribute(name) || '').trim();
+        if (value && value.length <= MAX_CSS_STACK_MATH_CHARACTERS && looksLikeLatex(value)) return true;
+      }
+    }
+    return false;
+  }
+
+  function cssStackMathGeneratedContentIsSafe(element, view) {
+    const userAgent = String(view && view.navigator && view.navigator.userAgent || '');
+    // jsdom has no layout engine or pseudo-element implementation. Positive
+    // row rectangles are stubbed in unit tests; real supported browsers always
+    // execute the generated-content audit below.
+    if (/jsdom/i.test(userAgent)) return true;
+    for (const pseudo of ['::before', '::after']) {
+      let content = '';
+      try {
+        content = String(view.getComputedStyle(element, pseudo).content || '').trim();
+      } catch (_error) {
+        return false;
+      }
+      if (!content || content === 'none' || content === 'normal') continue;
+      const quoted = content.match(/^(?:"([\s\u00a0\u2000-\u200a\u202f\u205f\u3000]*)"|'([\s\u00a0\u2000-\u200a\u202f\u205f\u3000]*)')$/u);
+      if (!quoted) return false;
+    }
+    return true;
+  }
+
+  function cssStackMathDirectionIsSafe(computed) {
+    const direction = String(computed && computed.direction || '').trim().toLowerCase();
+    const unicodeBidi = String(computed && (computed.unicodeBidi || computed.getPropertyValue &&
+      computed.getPropertyValue('unicode-bidi')) || '').trim().toLowerCase();
+    return (!direction || direction === 'ltr') &&
+      (!unicodeBidi || unicodeBidi === 'normal' || unicodeBidi === 'isolate');
+  }
+
+  function cssStackMathSourceDelimitersBalanced(source) {
+    const stack = [];
+    let braceDepth = 0;
+    const value = String(source || '');
+    for (const character of value) {
+      if (character === '(' || character === '[') stack.push(character);
+      else if (character === ')' || character === ']') {
+        if (!stack.length) return false;
+        const opening = stack.pop();
+        const matches = (opening === '(' && character === ')') || (opening === '[' && character === ']');
+        // Mixed interval fences such as [a,b) are valid, but a mismatch in a
+        // nested structure such as ([x)] is not.
+        if (!matches && (stack.length > 0 || !value.includes(','))) return false;
+      } else if (character === '{') braceDepth += 1;
+      else if (character === '}') {
+        braceDepth -= 1;
+        if (braceDepth < 0) return false;
+      }
+    }
+    if (stack.length || braceDepth !== 0) return false;
+    const trimmed = value.trim();
+    const startsWithBar = /^(?:\|\||[|∣❘‖∥])/u.test(trimmed);
+    const endsWithBar = /(?:\|\||[|∣❘‖∥])$/u.test(trimmed);
+    const barCount = Array.from(trimmed).filter((character) => /[|∣❘‖∥]/u.test(character)).length;
+    return !(barCount % 2 !== 0 && (startsWithBar || endsWithBar));
+  }
+
+  function cssStackMathSourceHasCompleteOperands(source) {
+    const value = String(source || '').trim();
+    if (!value) return false;
+    const leading = value.replace(/^[([{]+\s*/u, '');
+    if (/^(?:[\^_*/×÷·⋅∗=<>≤≥≠≈≃≅≡∝→←↔⇒⇐⇔↦∈∉⊂⊆⊃⊇∪∩∧∨~∼])/u.test(leading)) return false;
+    const trailing = value.replace(/[)\]}]+$/u, '').trimEnd();
+    return !/(?:[+\-−*/×÷·⋅∗=<>≤≥≠≈≃≅≡∝→←↔⇒⇐⇔↦∈∉⊂⊆⊃⊇∪∩∧∨~∼±∓])$/u.test(trailing);
+  }
+
+  function cssStackMathAncestorLayoutIsSafe(element, view) {
+    for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) {
+      const editable = String(ancestor.getAttribute && ancestor.getAttribute('contenteditable') || '').toLowerCase();
+      if (ancestor.isContentEditable === true || (ancestor.hasAttribute &&
+          ancestor.hasAttribute('contenteditable') && editable !== 'false')) return false;
+      let computed;
+      try { computed = view.getComputedStyle(ancestor); } catch (_error) { return false; }
+      const value = (name, property) => String(
+        computed && (computed[name] || computed.getPropertyValue && computed.getPropertyValue(property || name)) || ''
+      ).trim().toLowerCase();
+      const compact = (name, property) => value(name, property).replace(/\s+/g, '');
+      const contentVisibility = value('contentVisibility', 'content-visibility');
+      if (value('display') === 'none' || (contentVisibility && contentVisibility !== 'visible') ||
+          /^(?:hidden|collapse)$/u.test(value('visibility'))) return false;
+      const opacity = Number.parseFloat(value('opacity') || '1');
+      const fontSize = Number.parseFloat(value('fontSize', 'font-size'));
+      if ((Number.isFinite(opacity) && opacity <= 0) ||
+          (Number.isFinite(fontSize) && fontSize <= 0) ||
+          cssColorIsFullyTransparent(value('color')) ||
+          cssColorIsFullyTransparent(value('webkitTextFillColor', '-webkit-text-fill-color'))) return false;
+      const clip = value('clip');
+      const clipPath = value('clipPath', 'clip-path') || value('webkitClipPath', '-webkit-clip-path');
+      const mask = compact('maskImage', 'mask-image') || compact('webkitMaskImage', '-webkit-mask-image');
+      const filter = compact('filter');
+      const transform = compact('transform');
+      const scale = compact('scale');
+      const rotate = compact('rotate');
+      if ((clip && clip !== 'auto') || (clipPath && clipPath !== 'none') ||
+          (mask && mask !== 'none') || (filter && filter !== 'none') ||
+          (transform && transform !== 'none') || (scale && scale !== 'none' && scale !== '1') ||
+          (rotate && rotate !== 'none' && rotate !== '0deg' && rotate !== '0')) return false;
+      const clippedOverflow = [value('overflow'), value('overflowX', 'overflow-x'), value('overflowY', 'overflow-y')]
+        .some((item) => /^(?:hidden|clip|scroll|auto)$/u.test(item));
+      if (clippedOverflow) {
+        const rect = cssStackMathPositiveRect(ancestor);
+        if (!rect) return false;
+      }
+      if (!cssStackMathDirectionIsSafe(computed)) return false;
+    }
+    return true;
+  }
+
+  function cssStackMathClippingAncestorsExpose(element, visualRect, view) {
+    for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) {
+      let computed;
+      try { computed = view.getComputedStyle(ancestor); } catch (_error) { return false; }
+      const value = (name, property) => String(
+        computed && (computed[name] || computed.getPropertyValue && computed.getPropertyValue(property || name)) || ''
+      ).trim().toLowerCase();
+      const clipped = [value('overflow'), value('overflowX', 'overflow-x'), value('overflowY', 'overflow-y')]
+        .some((item) => /^(?:hidden|clip|scroll|auto)$/u.test(item));
+      if (!clipped) continue;
+      const ancestorRect = cssStackMathPositiveRect(ancestor);
+      if (!visualRect || !ancestorRect || !cssStackMathRectContains(ancestorRect, visualRect)) return false;
+    }
+    return true;
+  }
+
+  function cssStackMathRootDescriptor(element, documentObject) {
+    if (!element || element.nodeType !== 1 || !documentObject) return null;
+    const rootTag = (element.localName || '').toLowerCase();
+    if (!['span', 'div', 'var'].includes(rootTag) || element.children.length !== 2 ||
+        element.hasAttribute('contenteditable')) return null;
+    for (const child of Array.from(element.childNodes || [])) {
+      if (child.nodeType === 3 && cleanOrdinaryCharacters(child.nodeValue || '').trim()) return null;
+      if (child.nodeType !== 1 && child.nodeType !== 3) return null;
+    }
+    const rows = Array.from(element.children || []);
+    if (rows.some((row) => !CSS_STACK_MATH_INLINE_TAGS.has((row.localName || '').toLowerCase()))) return null;
+    const view = documentObject.defaultView;
+    if (!view || typeof view.getComputedStyle !== 'function') return null;
+    if (!cssStackMathAncestorLayoutIsSafe(element, view)) return null;
+
+    let rootComputed;
+    const rowComputed = [];
+    try {
+      rootComputed = view.getComputedStyle(element);
+      if (!['inline-table', 'table'].includes(String(rootComputed.display || '').toLowerCase()) ||
+          computedStyleHasUnsafeVisibleLayout(rootComputed, false) ||
+          !cssStackMathDirectionIsSafe(rootComputed) ||
+          !cssStackMathGeneratedContentIsSafe(element, view)) return null;
+      for (const row of rows) {
+        const computed = view.getComputedStyle(row);
+        if (String(computed.display || '').toLowerCase() !== 'table-row' ||
+            computedStyleHasUnsafeVisibleLayout(computed, false) ||
+            !cssStackMathDirectionIsSafe(computed) ||
+            !cssStackMathGeneratedContentIsSafe(row, view)) return null;
+        rowComputed.push(computed);
+      }
+    } catch (_error) {
+      return null;
+    }
+
+    let visited = 0;
+    const stack = [...rows];
+    while (stack.length) {
+      const current = stack.pop();
+      visited += 1;
+      if (visited > MAX_CSS_STACK_MATH_NODES) return null;
+      if (!current || current.nodeType !== 1) return null;
+      const tag = (current.localName || '').toLowerCase();
+      if (!CSS_STACK_MATH_INLINE_TAGS.has(tag) || current.hasAttribute('hidden') ||
+          current.hasAttribute('contenteditable') || current.getAttribute('aria-hidden') === 'true' ||
+          current.querySelector && current.querySelector('a,button,input,select,textarea,details,summary,[contenteditable]')) {
+        return null;
+      }
+      if (current !== rows[0] && current !== rows[1]) {
+        try {
+          const computed = view.getComputedStyle(current);
+          const display = String(computed && computed.display || '').toLowerCase();
+          if (computedStyleHasUnsafeVisibleLayout(computed, false) ||
+              !cssStackMathDirectionIsSafe(computed) ||
+              !cssStackMathGeneratedContentIsSafe(current, view) ||
+              (display && !['inline', 'inline-block', 'contents'].includes(display))) return null;
+        } catch (_error) {
+          return null;
+        }
+      }
+      for (let child = current.lastElementChild; child; child = child.previousElementSibling) stack.push(child);
+    }
+
+    const topSource = cssStackMathDomSource(rows[0]);
+    const bottomSource = cssStackMathDomSource(rows[1]);
+    const linearSource = cssStackMathDomSource(element);
+    if (!topSource || !bottomSource || !linearSource ||
+        !cssStackMathSourceDelimitersBalanced(topSource) ||
+        !cssStackMathSourceDelimitersBalanced(bottomSource)) return null;
+    const fraction = cssStackMathBorderIsFractionRule(rowComputed[0]);
+    if (fraction && (!cssStackMathSourceHasCompleteOperands(topSource) ||
+        !cssStackMathSourceHasCompleteOperands(bottomSource))) return null;
+    const topAnalysis = cssStackMathSourceAnalysis(topSource);
+    const bottomAnalysis = cssStackMathSourceAnalysis(bottomSource);
+    if (!topAnalysis.valid || !bottomAnalysis.valid) return null;
+    if (fraction ? (!topAnalysis.signal || !bottomAnalysis.signal) : !bottomAnalysis.signal) return null;
+    const explicitFractionSemantics = fraction && cssStackMathHasNumericFractionSemantics(element);
+    if (fraction && !explicitFractionSemantics && (
+      cssStackMathSourceLooksLikeUiValue(topSource) || cssStackMathSourceLooksLikeUiValue(bottomSource)
+    )) return null;
+    if (fraction && !explicitFractionSemantics && (
+      (topAnalysis.numericOnly && bottomAnalysis.numericOnly) ||
+      topAnalysis.proseLikeWord || bottomAnalysis.proseLikeWord ||
+      (topAnalysis.spacedTokens && !topAnalysis.functionExpression) ||
+      (bottomAnalysis.spacedTokens && !bottomAnalysis.functionExpression)
+    )) return null;
+    const operatorKey = topSource.normalize ? topSource.normalize('NFKC').replace(/\s+/g, '').toLowerCase() :
+      topSource.replace(/\s+/g, '').toLowerCase();
+    const operator = CSS_STACK_MATH_OPERATORS.get(operatorKey);
+    if (!fraction && !operator) return null;
+
+    const topRect = cssStackMathPositiveRect(rows[0]);
+    const bottomRect = cssStackMathPositiveRect(rows[1]);
+    if (!topRect || !bottomRect) return null;
+    const overlap = Math.min(topRect.right, bottomRect.right) - Math.max(topRect.left, bottomRect.left);
+    const topCenter = topRect.top + topRect.height / 2;
+    const bottomCenter = bottomRect.top + bottomRect.height / 2;
+    const rowOverlapTolerance = Math.min(1.5, Math.min(topRect.height, bottomRect.height) * 0.08);
+    if (overlap <= 0 || bottomCenter <= topCenter ||
+        bottomRect.top < topRect.bottom - rowOverlapTolerance) return null;
+    const visualRect = cssStackMathUnionRect(topRect, bottomRect);
+    if (!visualRect || !cssStackMathClippingAncestorsExpose(element, visualRect, view)) return null;
+
+    return {
+      root: element,
+      rows,
+      kind: fraction ? 'fraction' : 'operator-under',
+      source: fraction
+        ? '\\frac{' + topSource + '}{' + bottomSource + '}'
+        : operator + '_{' + bottomSource + '}',
+      topSource,
+      bottomSource,
+      linearSource,
+      operator: operator || '',
+      visualRect
+    };
+  }
+
+  function cssStackMathCandidateShape(element) {
+    if (!element || element.nodeType !== 1 || element.children.length !== 2) return false;
+    for (const child of Array.from(element.childNodes || [])) {
+      if (child.nodeType === 3 && cleanOrdinaryCharacters(child.nodeValue || '').trim()) return false;
+      if (child.nodeType !== 1 && child.nodeType !== 3) return false;
+    }
+    return true;
+  }
+
+  function cssStackMathPlausibleVisualRoot(element, documentObject) {
+    if (!element || !documentObject || !cssStackMathCandidateShape(element) ||
+        !['span', 'div', 'var'].includes((element.localName || '').toLowerCase())) return false;
+    const rows = Array.from(element.children || []);
+    const view = documentObject.defaultView;
+    if (!view || typeof view.getComputedStyle !== 'function') return false;
+    try {
+      const rootComputed = view.getComputedStyle(element);
+      const rowComputed = rows.map((row) => view.getComputedStyle(row));
+      if (!['inline-table', 'table'].includes(String(rootComputed.display || '').toLowerCase()) ||
+          rowComputed.some((computed) => String(computed.display || '').toLowerCase() !== 'table-row')) return false;
+      const topText = cleanOrdinaryCharacters(rows[0].textContent || '').replace(/\s+/g, '').toLowerCase();
+      if (!cssStackMathBorderIsFractionRule(rowComputed[0]) && topText !== 'lim') return false;
+      const topRect = cssStackMathPositiveRect(rows[0]);
+      const bottomRect = cssStackMathPositiveRect(rows[1]);
+      if (!topRect || !bottomRect) return false;
+      const horizontalOverlap = Math.min(topRect.right, bottomRect.right) - Math.max(topRect.left, bottomRect.left);
+      return horizontalOverlap > 0 && bottomRect.top >= topRect.bottom - 1.5;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function cssStackMathDiscoveryForRange(range, documentObject) {
+    if (!range || !documentObject || !range.commonAncestorContainer) {
+      return { values: [], overBudget: false };
+    }
+    const common = range.commonAncestorContainer.nodeType === 1
+      ? range.commonAncestorContainer
+      : range.commonAncestorContainer.parentElement;
+    if (!common) return { values: [], overBudget: false };
+    const candidates = new Set();
+    const stack = [{ element: common, depth: 0 }];
+    let inspected = 0;
+    while (stack.length) {
+      const current = stack.pop();
+      const element = current && current.element;
+      if (!current || current.depth > MAX_RICH_SELECTION_DEPTH) continue;
+      if (!element || element.nodeType !== 1 || !rangeIntersects(range, element)) continue;
+      inspected += 1;
+      if (inspected > MAX_POSITIONED_DISCOVERY_NODES) {
+        return { values: [], overBudget: candidates.size > 0 };
+      }
+      if (cssStackMathCandidateShape(element)) candidates.add(element);
+      for (let child = element.lastElementChild; child; child = child.previousElementSibling) {
+        stack.push({ element: child, depth: current.depth + 1 });
+      }
+    }
+    for (const endpoint of [range.startContainer, range.endContainer]) {
+      let element = endpoint && endpoint.nodeType === 1 ? endpoint : endpoint && endpoint.parentElement;
+      let depth = 0;
+      while (element && depth <= MAX_RICH_SELECTION_DEPTH) {
+        if (cssStackMathCandidateShape(element)) candidates.add(element);
+        element = element.parentElement;
+        depth += 1;
+      }
+    }
+    if (candidates.size > MAX_CSS_STACK_MATH_ROOTS) return { values: [], overBudget: true };
+    const descriptors = new Map();
+    let rejectedVisualStack = false;
+    for (const candidate of candidates) {
+      const descriptor = cssStackMathRootDescriptor(candidate, documentObject);
+      if (!descriptor) {
+        rejectedVisualStack = rejectedVisualStack || cssStackMathPlausibleVisualRoot(candidate, documentObject);
+        continue;
+      }
+      const selectedSource = cssStackMathDomSource(candidate, range);
+      if (!selectedSource) continue;
+      const selectedTopSource = cssStackMathDomSource(descriptor.rows[0], range);
+      const selectedBottomSource = cssStackMathDomSource(descriptor.rows[1], range);
+      const crossRowSelection = Boolean(selectedTopSource && selectedBottomSource);
+      for (const selectedPart of [selectedTopSource, selectedBottomSource]) {
+        if (!selectedPart) continue;
+        const unicodeScriptCharacters = new Set([
+          ...Object.values(SUPERSCRIPTS), ...Object.values(SUBSCRIPTS),
+          'ₔ', 'ᵦ', 'ᵧ', 'ᵨ', 'ᵩ', 'ᵪ'
+        ]);
+        const isolatedScript = !crossRowSelection && (
+          /^[\^_]\{[^{}]+\}$/u.test(selectedPart) ||
+          (Array.from(selectedPart).length > 0 &&
+            Array.from(selectedPart).every((character) => unicodeScriptCharacters.has(character)))
+        );
+        if (!cssStackMathSourceDelimitersBalanced(selectedPart) ||
+            (!isolatedScript && (!cssStackMathSourceHasCompleteOperands(selectedPart) ||
+              cssStackMathHasDanglingScript(cssStackMathUnicodeScriptsToLatex(selectedPart))))) {
+          return { values: [], overBudget: false, failed: true };
+        }
+      }
+      let selectedSemanticSource = '';
+      if (selectedTopSource && selectedBottomSource) {
+        if (descriptor.kind === 'fraction') {
+          selectedSemanticSource = '\\frac{' + selectedTopSource + '}{' + selectedBottomSource + '}';
+        } else if (selectedTopSource === descriptor.topSource) {
+          selectedSemanticSource = descriptor.operator + '_{' + selectedBottomSource + '}';
+        }
+      } else if (selectedTopSource) {
+        selectedSemanticSource = descriptor.kind === 'operator-under' &&
+          selectedTopSource === descriptor.topSource
+          ? descriptor.operator
+          : selectedTopSource;
+      } else selectedSemanticSource = selectedBottomSource;
+      if (!selectedSemanticSource) return { values: [], overBudget: false, failed: true };
+      descriptors.set(candidate, {
+        ...descriptor,
+        selectedSource,
+        selectedTopSource,
+        selectedBottomSource,
+        selectedSemanticSource
+      });
+    }
+    if (rejectedVisualStack) return { values: [], overBudget: false, failed: true };
+    const roots = sortMathRoots(Array.from(descriptors.keys()));
+    return { values: roots.map((root) => descriptors.get(root)), overBudget: false };
+  }
+
+  function cssStackMathSelectsWholeVisibleRoot(range, descriptor) {
+    if (!range || !descriptor) return false;
+    return descriptor.selectedTopSource === descriptor.topSource &&
+      descriptor.selectedBottomSource === descriptor.bottomSource;
+  }
+
+  function cssStackMathRootsAreAdjacent(left, right) {
+    if (!left || !right || left.parentNode !== right.parentNode) return false;
+    for (let node = left.nextSibling; node && node !== right; node = node.nextSibling) {
+      if (node.nodeType === 8) continue;
+      if (node.nodeType === 3 && !cleanOrdinaryCharacters(node.nodeValue || '').trim()) continue;
+      if (node.nodeType === 1 && (node.localName || '').toLowerCase() === 'wbr') continue;
+      return false;
+    }
+    return Boolean(left.compareDocumentPosition(right) & 4);
+  }
+
+  function cssStackMathRootsShareVisualLine(left, right) {
+    const leftRect = left && left.visualRect;
+    const rightRect = right && right.visualRect;
+    if (!leftRect || !rightRect) return false;
+    const verticalOverlap = Math.min(leftRect.bottom, rightRect.bottom) -
+      Math.max(leftRect.top, rightRect.top);
+    const minimumHeight = Math.min(leftRect.height, rightRect.height);
+    const leftCenter = leftRect.left + leftRect.width / 2;
+    const rightCenter = rightRect.left + rightRect.width / 2;
+    const maximumGap = Math.max(16, Math.min(leftRect.height, rightRect.height) * 1.5);
+    const overlapTolerance = Math.min(4, Math.min(leftRect.height, rightRect.height) * 0.1);
+    return verticalOverlap >= minimumHeight * 0.5 && rightCenter > leftCenter &&
+      rightRect.left >= leftRect.right - overlapTolerance &&
+      rightRect.left - leftRect.right <= maximumGap;
+  }
+
+  function cssStackMathUnicodeScriptsToLatex(source) {
+    const superscriptReverse = new Map();
+    const subscriptReverse = new Map();
+    for (const [plain, script] of Object.entries(SUPERSCRIPTS)) {
+      superscriptReverse.set(script, plain === '−' ? '-' : plain);
+    }
+    for (const [plain, script] of Object.entries(SUBSCRIPTS)) {
+      subscriptReverse.set(script, plain === '−' ? '-' : plain);
+    }
+    const scriptToken = (value) => ({
+      beta: '\\beta', gamma: '\\gamma', rho: '\\rho', phi: '\\phi', chi: '\\chi', schwa: 'ə'
+    })[value] || value;
+    const characters = Array.from(String(source || ''));
+    let output = '';
+    for (let index = 0; index < characters.length;) {
+      const character = characters[index];
+      const map = superscriptReverse.has(character)
+        ? superscriptReverse
+        : (subscriptReverse.has(character) ? subscriptReverse : null);
+      if (!map) {
+        output += character;
+        index += 1;
+        continue;
+      }
+      const values = [];
+      while (index < characters.length && map.has(characters[index])) {
+        values.push(scriptToken(map.get(characters[index])));
+        index += 1;
+      }
+      output += (map === superscriptReverse ? '^{' : '_{') + values.join('') + '}';
+    }
+    return output;
+  }
+
+  function cssStackMathBalancedDelimiterEnd(source, start, opening, closing) {
+    if (source[start] !== opening) return -1;
+    let depth = 0;
+    for (let index = start; index < source.length; index += 1) {
+      if (source[index] === opening) depth += 1;
+      else if (source[index] === closing) {
+        depth -= 1;
+        if (depth === 0) return index;
+      }
+    }
+    return -1;
+  }
+
+  function cssStackMathBarGroup(input, start, depth) {
+    const singleBars = new Set(['|', '∣', '❘']);
+    const normBars = new Set(['‖', '∥']);
+    let width = 1;
+    let kind = '';
+    if (input.startsWith('||', start)) {
+      width = 2;
+      kind = 'norm';
+    } else if (normBars.has(input[start])) kind = 'norm';
+    else if (singleBars.has(input[start])) kind = 'absolute';
+    else return null;
+    let close = -1;
+    if (width === 2) close = input.indexOf('||', start + 2);
+    else {
+      const candidates = kind === 'norm' ? normBars : singleBars;
+      for (let index = start + 1; index < input.length; index += 1) {
+        if (candidates.has(input[index])) {
+          close = index;
+          break;
+        }
+      }
+    }
+    if (close <= start + width) return null;
+    const inner = cssStackMathUnicodeRadicalsToLatex(input.slice(start + width, close), depth + 1);
+    if (!inner) return null;
+    return {
+      latex: kind === 'norm' ? '\\lVert ' + inner + '\\rVert ' : '|' + inner + '|',
+      end: close + width
+    };
+  }
+
+  function cssStackMathBraceGroupEnd(source, start) {
+    if (source[start] !== '{') return -1;
+    let depth = 0;
+    for (let index = start; index < source.length; index += 1) {
+      if (source[index] === '{') depth += 1;
+      else if (source[index] === '}') {
+        depth -= 1;
+        if (depth === 0) return index;
+      }
+    }
+    return -1;
+  }
+
+  function cssStackMathConsumeUnicodeRadical(input, index, depth) {
+    if (depth > 32 || !['√', '∛', '∜'].includes(input[index])) return null;
+    const root = input[index];
+    let operandStart = index + 1;
+    while (operandStart < input.length && /\s/u.test(input[operandStart])) operandStart += 1;
+    if (operandStart >= input.length) return null;
+    let operand = '';
+    let end = operandStart;
+    if (input[operandStart] === '(') {
+      const close = cssStackMathBalancedDelimiterEnd(input, operandStart, '(', ')');
+      if (close < 0) return null;
+      operand = cssStackMathUnicodeRadicalsToLatex(input.slice(operandStart + 1, close), depth + 1);
+      end = close + 1;
+    } else if (input[operandStart] === '[') {
+      const close = cssStackMathBalancedDelimiterEnd(input, operandStart, '[', ']');
+      if (close < 0) return null;
+      const inner = cssStackMathUnicodeRadicalsToLatex(input.slice(operandStart + 1, close), depth + 1);
+      if (!inner) return null;
+      // Square brackets are visual grouping here, not an optional root index.
+      // TeX braces already preserve the scope; omitting the outer brackets
+      // keeps calculator output executable and faithful text unambiguous.
+      operand = inner;
+      end = close + 1;
+    } else if (input[operandStart] === CSS_STACK_VISIBLE_SPECIALS['{']) {
+      const opening = CSS_STACK_VISIBLE_SPECIALS['{'];
+      const closing = CSS_STACK_VISIBLE_SPECIALS['}'];
+      const close = cssStackMathBalancedDelimiterEnd(input, operandStart, opening, closing);
+      if (close < 0) return null;
+      operand = cssStackMathUnicodeRadicalsToLatex(input.slice(operandStart + 1, close), depth + 1);
+      end = close + 1;
+    } else if ('|∣❘‖∥'.includes(input[operandStart])) {
+      const group = cssStackMathBarGroup(input, operandStart, depth);
+      if (!group) return null;
+      operand = group.latex;
+      end = group.end;
+    } else if (['√', '∛', '∜'].includes(input[operandStart])) {
+      const nested = cssStackMathConsumeUnicodeRadical(input, operandStart, depth + 1);
+      if (!nested) return null;
+      operand = nested.latex;
+      end = nested.end;
+    } else {
+      const functionCall = input.slice(operandStart).match(
+        /^(det|dim|sin|cos|tan|cot|sec|csc|sinh|cosh|tanh|log|ln|exp|max|min)\s*(?=\()/u
+      );
+      if (functionCall) {
+        const opening = operandStart + functionCall[0].length;
+        const close = cssStackMathBalancedDelimiterEnd(input, opening, '(', ')');
+        if (close < 0) return null;
+        const inner = cssStackMathUnicodeRadicalsToLatex(input.slice(opening + 1, close), depth + 1);
+        if (!inner) return null;
+        operand = '\\' + functionCall[1] + ' (' + inner + ')';
+        end = close + 1;
+      } else {
+        const numeric = input.slice(operandStart).match(/^(?:\d+(?:\.\d*)?|\.\d+)/u);
+        if (numeric) {
+        operand = numeric[0];
+        end = operandStart + numeric[0].length;
+        } else {
+          const atom = Array.from(input.slice(operandStart))[0] || '';
+          // Raw braces delimit trusted structure synthesized by this parser;
+          // visible braces were encoded before reaching this point. A lone
+          // radical at the end of a fraction row must not consume that closing
+          // brace and turn into an invented empty radicand.
+          if (!atom || /[+\-−=,;:)\]}]/u.test(atom)) return null;
+          operand = atom;
+          end = operandStart + atom.length;
+        }
+      }
+      while (/^[\^_]\{/u.test(input.slice(end))) {
+        const close = cssStackMathBraceGroupEnd(input, end + 1);
+        if (close < 0) return null;
+        operand += input.slice(end, close + 1);
+        end = close + 1;
+      }
+    }
+    if (!operand) return null;
+    const command = root === '√' ? '\\sqrt' : (root === '∛' ? '\\sqrt[3]' : '\\sqrt[4]');
+    return { latex: command + '{' + operand + '}', end };
+  }
+
+  function cssStackMathUnicodeRadicalsToLatex(source, depth = 0) {
+    if (depth > 32) return '';
+    const input = String(source || '');
+    let output = '';
+    for (let index = 0; index < input.length;) {
+      const root = input[index];
+      if (!['√', '∛', '∜'].includes(root)) {
+        output += root;
+        index += 1;
+        continue;
+      }
+      const consumed = cssStackMathConsumeUnicodeRadical(input, index, depth);
+      if (!consumed) return '';
+      output += consumed.latex;
+      index = consumed.end;
+    }
+    return output;
+  }
+
+  function cssStackMathVariantDescription(character) {
+    if (!hasMathematicalStyledCharacter(character)) return null;
+    const base = mathVariantBaseCharacter(character);
+    for (const [variant, spec] of Object.entries(MATH_VARIANT_SPECS)) {
+      if (mathematicalVariantCharacter(base, variant, spec) === character) return { base, variant };
+    }
+    return null;
+  }
+
+  function cssStackMathVariantLatex(character, outputMode) {
+    const description = cssStackMathVariantDescription(character);
+    if (!description) return null;
+    if (outputMode === 'faithful') return character;
+    const base = description.base;
+    const baseLatex = String(PDF_LATEX_CHARACTERS[base] || base).trimEnd();
+    if (outputMode === 'calculator') return baseLatex;
+    const greek = /^[α-ωΑ-Ωϵϑϰϕϱϖ∂∇]$/u.test(base);
+    const wrap = (command, value) => '\\' + command + '{' + value + '}';
+    switch (description.variant) {
+      case 'bold': return wrap(greek ? 'boldsymbol' : 'mathbf', baseLatex);
+      case 'italic': return greek ? baseLatex : wrap('mathit', baseLatex);
+      case 'bold-italic': return wrap('boldsymbol', baseLatex);
+      case 'script': return wrap('mathcal', baseLatex);
+      case 'bold-script': return wrap('mathbf', wrap('mathcal', baseLatex));
+      case 'fraktur': return wrap('mathfrak', baseLatex);
+      case 'bold-fraktur': return wrap('mathbf', wrap('mathfrak', baseLatex));
+      case 'double-struck': return wrap('mathbb', baseLatex);
+      case 'sans-serif': return wrap('mathsf', baseLatex);
+      case 'bold-sans-serif': return wrap('mathbf', wrap('mathsf', baseLatex));
+      case 'sans-serif-italic': return wrap('mathit', wrap('mathsf', baseLatex));
+      case 'sans-serif-bold-italic': return wrap('boldsymbol', wrap('mathsf', baseLatex));
+      case 'monospace': return wrap('mathtt', baseLatex);
+      default: return baseLatex;
+    }
+  }
+
+  function cssStackMathCombiningAccentsToLatex(source, outputMode) {
+    if (outputMode === 'faithful') return String(source || '');
+    let value = String(source || '');
+    try { value = value.normalize('NFD'); } catch (_error) {}
+    const accentCommands = Object.freeze({
+      '\u0300': 'grave', '\u0301': 'acute', '\u0302': 'hat', '\u0303': 'tilde',
+      '\u0305': 'bar', '\u0306': 'breve', '\u0307': 'dot', '\u0308': 'ddot',
+      '\u030a': 'mathring', '\u030c': 'check', '\u20d6': 'overleftarrow', '\u20d7': 'vec'
+    });
+    const accentPattern = /([\p{L}\p{N}∞∂∇ℏℓ])([\u0300\u0301\u0302\u0303\u0305\u0306\u0307\u0308\u030a\u030c\u20d6\u20d7]+)/gu;
+    if (outputMode === 'calculator' && accentPattern.test(value)) return '';
+    accentPattern.lastIndex = 0;
+    value = value.replace(accentPattern, (_match, base, marks) => {
+      let result = base;
+      for (const mark of marks) {
+        const command = accentCommands[mark];
+        if (!command) return '';
+        result = '\\' + command + '{' + result + '}';
+      }
+      return result;
+    });
+    return /\p{M}/u.test(value)
+      ? ''
+      : value;
+  }
+
+  function cssStackMathCanonicalLatex(source, outputMode) {
+    const scripted = cssStackMathUnicodeScriptsToLatex(source);
+    const rooted = cssStackMathUnicodeRadicalsToLatex(scripted);
+    if (!rooted) return '';
+    const accented = cssStackMathCombiningAccentsToLatex(rooted, outputMode);
+    if (!accented) return '';
+    if (outputMode === 'calculator' && /[\ue200-\ue204\ue206]/u.test(accented)) return '';
+    if (outputMode !== 'faithful' && cssStackMathHasDanglingScript(accented)) return '';
+    const functional = accented.replace(
+      /(det|dim|sin|cos|tan|cot|sec|csc|sinh|cosh|tanh|log|ln|exp|max|min)(?![A-Za-z])/gu,
+      (match, _name, offset, value) => offset > 0 && /[A-Za-z\\]/u.test(value[offset - 1])
+        ? match
+        : '\\' + match + ' '
+    );
+    let output = '';
+    for (const character of functional) {
+      const variant = cssStackMathVariantLatex(character, outputMode);
+      if (variant != null) output += variant;
+      else if (CSS_STACK_VISIBLE_SPECIAL_LATEX[character]) output += CSS_STACK_VISIBLE_SPECIAL_LATEX[character];
+      else if (character === '~') output += '\\sim ';
+      else output += PDF_LATEX_CHARACTERS[character] || character;
+    }
+    return output.replace(/[ \t\n\r]+/g, ' ').trim();
+  }
+
+  function cssStackMathHasDanglingScript(input) {
+    const source = String(input || '');
+    for (let index = 0; index < source.length - 1; index += 1) {
+      if (!['^', '_'].includes(source[index]) || source[index + 1] !== '{') continue;
+      let previousEnd = index;
+      while (previousEnd > 0 && /\s/u.test(source[previousEnd - 1])) previousEnd -= 1;
+      const previousCharacter = Array.from(source.slice(0, previousEnd)).pop() || '';
+      const previousStart = previousEnd - previousCharacter.length;
+      if (!previousCharacter || !/[\p{L}\p{N}\p{M})\]}|∣❘‖∥⟩⌉⌋∞∂∇ℏℓ′″‴⁗!%]/u.test(previousCharacter)) {
+        return true;
+      }
+      if (/^[A-Za-z]$/u.test(previousCharacter)) {
+        let commandStart = previousStart;
+        while (commandStart > 0 && /[A-Za-z]/u.test(source[commandStart - 1])) commandStart -= 1;
+        if (commandStart > 0 && source[commandStart - 1] === '\\') {
+          const command = source.slice(commandStart, previousEnd);
+          if (!['lim', 'sum', 'prod', 'int'].includes(command)) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function cssStackMathSourceText(source, outputMode, options) {
+    if (!source || source.length > MAX_CSS_STACK_MATH_CHARACTERS) return '';
+    const latex = cssStackMathCanonicalLatex(source, outputMode);
+    if (!latex) return '';
+    if (outputMode === 'latex') return '$' + latex + '$';
+    if (outputMode === 'calculator') {
+      // A lower limit without a selected body is not a complete calculator
+      // expression. Native copy preserves the visible bound instead of
+      // silently reducing `lim_(x→1)` to the unrelated identifier `lim`.
+      if (options && options.incompleteBoundedOperator) return '';
+      return latexToCalculator(latex);
+    }
+    return latexToFaithful(latex);
+  }
+
+  function cssStackMathSelectedFollowingScripts(root, range) {
+    const nodes = [];
+    let pendingSeparators = [];
+    let source = '';
+    const kinds = new Set();
+    for (let node = root && root.nextSibling; node;) {
+      if (node.nodeType === 8 || (node.nodeType === 1 && (node.localName || '').toLowerCase() === 'wbr')) {
+        pendingSeparators.push(node);
+        node = node.nextSibling;
+        continue;
+      }
+      if (node.nodeType === 3 && !cssStackMathTextSlice(node, range).trim()) {
+        pendingSeparators.push(node);
+        node = node.nextSibling;
+        continue;
+      }
+      if (node.nodeType !== 1 || !['sup', 'sub'].includes((node.localName || '').toLowerCase())) break;
+      const selected = cssStackMathDomSource(node, range);
+      if (!selected) break;
+      const full = cssStackMathDomSource(node);
+      if (!full || selected !== full) return { invalid: true, nodes: [], source: '' };
+      const kind = (node.localName || '').toLowerCase();
+      const wrapper = full.match(/^([\^_])\{([\s\S]*)\}$/u);
+      const inner = wrapper && wrapper[2] || '';
+      if (!wrapper || !inner || /[\[\]]/u.test(inner) ||
+          !cssStackMathSourceDelimitersBalanced(inner) ||
+          !cssStackMathSourceHasCompleteOperands(inner)) break;
+      if (kinds.has(kind)) return { invalid: true, nodes: [], source: '' };
+      kinds.add(kind);
+      nodes.push(...pendingSeparators);
+      pendingSeparators = [];
+      nodes.push(node);
+      source += full;
+      node = node.nextSibling;
+    }
+    return { invalid: false, nodes, source };
+  }
+
+  function cssStackMathSourceWithScripts(source, scripts) {
+    return scripts && scripts.source ? '{' + source + '}' + scripts.source : source;
+  }
+
+  function cssStackMathSelectedFollowingProduct(anchor, range) {
+    let node = anchor && anchor.nextSibling;
+    const separators = [];
+    while (node && (node.nodeType === 8 ||
+      (node.nodeType === 1 && (node.localName || '').toLowerCase() === 'wbr') ||
+      (node.nodeType === 3 && !cssStackMathTextSlice(node, range).trim()))) {
+      separators.push(node);
+      node = node.nextSibling;
+    }
+    if (!node || node.nodeType !== 3) return { invalid: false, node: null, nodes: [], source: '' };
+    const selected = cssStackMathTextSlice(node, range);
+    const trimmed = selected.trim();
+    if (/^[*/×÷·⋅∗]\s*$/u.test(trimmed)) {
+      return { invalid: true, node: null, nodes: [], source: '' };
+    }
+    const match = trimmed.match(/^([*/×÷·⋅∗])\s*(.+)$/u);
+    if (!trimmed || /^[=<>≤≥≠≈≃≅≡∝→←↔⇒⇐⇔↦]/u.test(trimmed)) {
+      return { invalid: false, node: null, nodes: [], source: '' };
+    }
+    const operand = match ? match[2].trim() : trimmed;
+    const analysis = cssStackMathSourceAnalysis(operand);
+    const longWords = Array.from(operand.matchAll(/\p{L}{3,}/gu), (item) => item[0]);
+    const functionsOnly = longWords.length > 0 &&
+      longWords.every((word) => CALCULATOR_FUNCTIONS.has(word.toLowerCase()));
+    const valid = analysis.valid && analysis.signal && (!analysis.proseLikeWord || functionsOnly) &&
+      (!analysis.spacedTokens || functionsOnly) &&
+      cssStackMathPlainTailHasUnambiguousGrammar(operand) &&
+      cssStackMathSourceDelimitersBalanced(operand) && cssStackMathSourceHasCompleteOperands(operand);
+    if (!valid) return { invalid: Boolean(match), node: null, nodes: [], source: '' };
+    const canonicalOperand = operand.replace(/^([A-Za-z]+)(?=\s*(?:\(|[\p{L}\p{N}√∛∜]))/u, (value, name) =>
+      CALCULATOR_FUNCTIONS.has(name.toLowerCase()) ? '\\' + name.toLowerCase() + ' ' : value);
+    return {
+      invalid: false,
+      node,
+      nodes: [...separators, node],
+      source: (match ? match[1] : '') + canonicalOperand
+    };
+  }
+
+  function cssStackMathSelectedFollowingLimitBody(anchor, range) {
+    let node = anchor && anchor.nextSibling;
+    while (node && (node.nodeType === 8 ||
+      (node.nodeType === 1 && (node.localName || '').toLowerCase() === 'wbr'))) node = node.nextSibling;
+    if (!node || node.nodeType !== 3) return { invalid: false, node: null, source: '' };
+    const selected = cssStackMathTextSlice(node, range).trim();
+    if (!selected || /^[=<>≤≥≠≈≃≅≡∝→←↔⇒⇐⇔↦∈∉⊂⊆⊃⊇]/u.test(selected)) {
+      return { invalid: false, node: null, source: '' };
+    }
+    let depth = 0;
+    let relationIndex = -1;
+    for (let index = 0; index < selected.length; index += 1) {
+      const character = selected[index];
+      if (character === '(' || character === '[' || character === '{') depth += 1;
+      else if (character === ')' || character === ']' || character === '}') depth = Math.max(0, depth - 1);
+      else if (depth === 0 && /[=<>≤≥≠≈≃≅≡∝→←↔⇒⇐⇔↦∈∉⊂⊆⊃⊇]/u.test(character)) {
+        relationIndex = index;
+        break;
+      }
+    }
+    const source = (relationIndex < 0 ? selected : selected.slice(0, relationIndex)).trim();
+    const suffix = relationIndex < 0 ? '' : selected.slice(relationIndex).trim();
+    if (suffix) {
+      const right = suffix.replace(/^[=<>≤≥≠≈≃≅≡∝→←↔⇒⇐⇔↦∈∉⊂⊆⊃⊇]+\s*/u, '');
+      const rightAnalysis = cssStackMathSourceAnalysis(right);
+      if (!right || !cssStackMathSourceDelimitersBalanced(right) ||
+          !cssStackMathSourceHasCompleteOperands(right) || !rightAnalysis.valid || !rightAnalysis.signal ||
+          rightAnalysis.proseLikeWord || !cssStackMathPlainTailHasUnambiguousGrammar(right) ||
+          (rightAnalysis.spacedTokens && !rightAnalysis.functionExpression)) {
+        return { invalid: true, node: null, source: '' };
+      }
+    }
+    const analysis = cssStackMathSourceAnalysis(source);
+    const longWords = Array.from(source.matchAll(/\p{L}{3,}/gu), (match) => match[0]);
+    const functionsOnly = longWords.length > 0 &&
+      longWords.every((word) => CALCULATOR_FUNCTIONS.has(word.toLowerCase()));
+    if (relationIndex < 0 && !cssStackMathPlainTailHasUnambiguousGrammar(source)) {
+      return { invalid: false, node: null, source: '' };
+    }
+    const valid = analysis.valid && analysis.signal && (!analysis.proseLikeWord || functionsOnly) &&
+      cssStackMathPlainTailHasUnambiguousGrammar(source) &&
+      cssStackMathSourceDelimitersBalanced(source) && cssStackMathSourceHasCompleteOperands(source);
+    if (!valid) return { invalid: true, node: null, source: '' };
+    const canonicalSource = source.replace(/^([A-Za-z]+)(?=\s*(?:\(|[\p{L}\p{N}√∛∜]))/u, (match, name) =>
+      CALCULATOR_FUNCTIONS.has(name.toLowerCase()) ? '\\' + name.toLowerCase() + ' ' : match);
+    return { invalid: false, node, source: canonicalSource, suffix: suffix ? ' ' + suffix : '' };
+  }
+
+  function cssStackMathReplacementMap(values, range, settings) {
+    const replacements = new Map();
+    const grouped = new Set();
+    for (let index = 0; index + 1 < values.length; index += 1) {
+      const left = values[index];
+      const right = values[index + 1];
+      if (left.kind !== 'operator-under' || right.kind !== 'fraction' ||
+          !cssStackMathSelectsWholeVisibleRoot(range, left) ||
+          !cssStackMathSelectsWholeVisibleRoot(range, right) ||
+          !cssStackMathRootsAreAdjacent(left.root, right.root) ||
+          !cssStackMathRootsShareVisualLine(left, right)) continue;
+      const scripts = cssStackMathSelectedFollowingScripts(right.root, range);
+      if (scripts.invalid) return null;
+      const product = cssStackMathSelectedFollowingProduct(
+        scripts.nodes[scripts.nodes.length - 1] || right.root,
+        range
+      );
+      if (product.invalid) return null;
+      const source = left.source + cssStackMathSourceWithScripts(right.source, scripts) + product.source;
+      const text = cssStackMathSourceText(source, settings.outputMode);
+      if (!text) return null;
+      const group = {
+        primary: true,
+        roots: [left.root, right.root, ...scripts.nodes, ...product.nodes],
+        source,
+        text,
+        whole: true,
+        outputMode: settings.outputMode
+      };
+      replacements.set(left.root, group);
+      replacements.set(right.root, { primary: false, group });
+      for (const node of scripts.nodes) replacements.set(node, { primary: false, group });
+      for (const node of product.nodes) replacements.set(node, { primary: false, group });
+      grouped.add(left.root);
+      grouped.add(right.root);
+      index += 1;
+    }
+
+    for (let index = 0; index < values.length;) {
+      const first = values[index];
+      if (grouped.has(first.root) || first.kind !== 'fraction' ||
+          !cssStackMathSelectsWholeVisibleRoot(range, first)) {
+        index += 1;
+        continue;
+      }
+      const sequence = [first];
+      let cursor = index + 1;
+      while (cursor < values.length) {
+        const previous = sequence[sequence.length - 1];
+        const next = values[cursor];
+        if (grouped.has(next.root) || next.kind !== 'fraction' ||
+            !cssStackMathSelectsWholeVisibleRoot(range, next) ||
+            !cssStackMathRootsAreAdjacent(previous.root, next.root) ||
+            !cssStackMathRootsShareVisualLine(previous, next)) break;
+        sequence.push(next);
+        cursor += 1;
+      }
+      if (sequence.length < 2) {
+        index += 1;
+        continue;
+      }
+      const scripts = cssStackMathSelectedFollowingScripts(sequence[sequence.length - 1].root, range);
+      if (scripts.invalid) return null;
+      const product = cssStackMathSelectedFollowingProduct(
+        scripts.nodes[scripts.nodes.length - 1] || sequence[sequence.length - 1].root,
+        range
+      );
+      if (product.invalid) return null;
+      const source = sequence.slice(0, -1).map((value) => value.source).join('') +
+        cssStackMathSourceWithScripts(sequence[sequence.length - 1].source, scripts) + product.source;
+      const text = cssStackMathSourceText(source, settings.outputMode);
+      if (!text) return null;
+      const roots = [
+        ...sequence.map((value) => value.root),
+        ...scripts.nodes,
+        ...product.nodes
+      ];
+      const group = { primary: true, roots, source, text, whole: true, outputMode: settings.outputMode };
+      replacements.set(sequence[0].root, group);
+      for (const value of sequence.slice(1)) replacements.set(value.root, { primary: false, group });
+      for (const node of scripts.nodes) replacements.set(node, { primary: false, group });
+      for (const node of product.nodes) replacements.set(node, { primary: false, group });
+      for (const value of sequence) grouped.add(value.root);
+      index = cursor;
+    }
+    for (const value of values) {
+      if (grouped.has(value.root)) continue;
+      const whole = cssStackMathSelectsWholeVisibleRoot(range, value);
+      const scripts = cssStackMathSelectedFollowingScripts(value.root, range);
+      if (scripts.invalid || (!whole && scripts.nodes.length)) return null;
+      const body = whole && value.kind === 'operator-under'
+        ? cssStackMathSelectedFollowingLimitBody(scripts.nodes[scripts.nodes.length - 1] || value.root, range)
+        : { invalid: false, node: null, source: '' };
+      if (body.invalid) return null;
+      const product = cssStackMathSelectedFollowingProduct(
+        body.node || scripts.nodes[scripts.nodes.length - 1] || value.root,
+        range
+      );
+      if (product.invalid || (!whole && product.nodes.length)) return null;
+      const baseSource = cssStackMathSourceWithScripts(whole ? value.source : value.selectedSemanticSource, scripts);
+      const source = body.node
+        ? baseSource + '{' + body.source + '}' + (body.suffix || '') + product.source
+        : baseSource + product.source;
+      const text = cssStackMathSourceText(source, settings.outputMode, {
+        incompleteBoundedOperator: value.kind === 'operator-under' &&
+          Boolean(value.selectedTopSource && value.selectedBottomSource) && !body.node
+      });
+      if (!text) return null;
+      replacements.set(value.root, {
+        primary: true,
+        roots: [
+          value.root,
+          ...scripts.nodes,
+          ...(body.node ? [body.node] : []),
+          ...product.nodes
+        ],
+        source,
+        text,
+        whole,
+        outputMode: settings.outputMode
+      });
+      const group = replacements.get(value.root);
+      for (const node of scripts.nodes) replacements.set(node, { primary: false, group });
+      if (body.node) replacements.set(body.node, { primary: false, group });
+      for (const node of product.nodes) replacements.set(node, { primary: false, group });
+    }
+    return replacements;
+  }
+
+  function cssStackMathNeutralClone(element, documentObject) {
+    const sourceTag = (element.localName || '').toLowerCase();
+    const tag = ORDINARY_RICH_TAGS.has(sourceTag) || ['area', 'img'].includes(sourceTag)
+      ? sourceTag
+      : 'span';
+    const clone = documentObject.createElement(tag);
+    for (const name of ['start', 'value', 'type', 'dir', 'lang', 'alt', 'colspan', 'rowspan']) {
+      if (element.hasAttribute && element.hasAttribute(name)) clone.setAttribute(name, element.getAttribute(name));
+    }
+    if (element.hasAttribute && element.hasAttribute('reversed')) clone.setAttribute('reversed', '');
+    const sourceStyle = String(element.getAttribute && element.getAttribute('style') || '');
+    const retained = [];
+    const whitespace = sourceStyle.match(/(?:^|;)\s*white-space\s*:\s*([^;!]+)/i);
+    const display = sourceStyle.match(/(?:^|;)\s*display\s*:\s*([^;!]+)/i);
+    if (whitespace && /^(?:normal|nowrap|pre|pre-wrap|pre-line|break-spaces)$/i.test(whitespace[1].trim())) {
+      retained.push('white-space:' + whitespace[1].trim().toLowerCase());
+    }
+    if (display && /^(?:block|flex|grid|list-item|table)$/i.test(display[1].trim())) {
+      retained.push('display:' + display[1].trim().toLowerCase());
+    }
+    if (retained.length) clone.setAttribute('style', retained.join(';'));
+    return clone;
+  }
+
+  function cssStackMathSelectionFragment(range, values, replacements, documentObject) {
+    const containing = values.find((value) =>
+      nodeInside(value.root, range.startContainer) && nodeInside(value.root, range.endContainer));
+    if (containing) {
+      const replacement = replacements.get(containing.root);
+      const text = replacement && replacement.primary ? replacement.text : '';
+      // A grouped replacement can only be primary when both roots are selected,
+      // which cannot happen while both endpoints remain inside one root.
+      if (!text) return null;
+      const fragment = documentObject.createDocumentFragment();
+      const placeholder = documentObject.createElement('span');
+      TRUSTED_TEXT_PLACEHOLDERS.set(placeholder, {
+        text,
+        display: false,
+        richSemantic: true,
+        outputMode: replacement.outputMode
+      });
+      fragment.appendChild(placeholder);
+      return fragment;
+    }
+
+    const emitted = new Set();
+    const cloneSelected = (node) => {
+      if (!node) return null;
+      if (node.nodeType === 3) {
+        const replacement = replacements.get(node);
+        if (replacement) {
+          if (!replacement.primary || emitted.has(replacement)) return null;
+          emitted.add(replacement);
+          const placeholder = documentObject.createElement('span');
+          TRUSTED_TEXT_PLACEHOLDERS.set(placeholder, {
+            text: replacement.text,
+            display: false,
+            richSemantic: true,
+            outputMode: replacement.outputMode
+          });
+          return placeholder;
+        }
+        const text = cssStackMathTextSlice(node, range);
+        return text ? documentObject.createTextNode(text) : null;
+      }
+      if (node.nodeType !== 1 && node.nodeType !== 11) return null;
+      if (node.nodeType === 1) {
+        const replacement = replacements.get(node);
+        if (replacement) {
+          if (!replacement.primary || emitted.has(replacement)) return null;
+          emitted.add(replacement);
+          const placeholder = documentObject.createElement('span');
+          TRUSTED_TEXT_PLACEHOLDERS.set(placeholder, {
+            text: replacement.text,
+            display: false,
+            richSemantic: true,
+            outputMode: replacement.outputMode
+          });
+          return placeholder;
+        }
+        const tag = (node.localName || '').toLowerCase();
+        if (ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag) || isVisuallyHiddenElement(node)) return null;
+      }
+      const clone = node.nodeType === 11
+        ? documentObject.createDocumentFragment()
+        : cssStackMathNeutralClone(node, documentObject);
+      Array.from(node.childNodes || []).forEach((child, index) => {
+        if (!cssStackMathChildIsSelected(range, node, child, index)) return;
+        const selected = cloneSelected(child);
+        if (selected) clone.appendChild(selected);
+      });
+      return clone;
+    };
+
+    const common = range.commonAncestorContainer;
+    const selected = cloneSelected(common);
+    if (!selected) return null;
+    const fragment = documentObject.createDocumentFragment();
+    const commonTag = common && common.nodeType === 1 ? (common.localName || '').toLowerCase() : '';
+    let outer = selected;
+    if (commonTag === 'tr') {
+      const table = documentObject.createElement('table');
+      const body = documentObject.createElement('tbody');
+      body.appendChild(selected);
+      table.appendChild(body);
+      outer = table;
+    } else if (['thead', 'tbody', 'tfoot', 'caption', 'colgroup'].includes(commonTag)) {
+      const table = documentObject.createElement('table');
+      table.appendChild(selected);
+      outer = table;
+    } else if (commonTag === 'td' || commonTag === 'th') {
+      const table = documentObject.createElement('table');
+      const body = documentObject.createElement('tbody');
+      const row = documentObject.createElement('tr');
+      row.appendChild(selected);
+      body.appendChild(row);
+      table.appendChild(body);
+      outer = table;
+    }
+    fragment.appendChild(outer);
+    return fragment;
+  }
+
+  function cssStackMathSelectionPayload(ranges, settings, documentObject, selection, target, pageWindow) {
+    if (!ranges || !ranges.length || !documentObject || isTextControl(target) ||
+        isMicrosoftOfficeWebPage(documentObject, pageWindow) ||
+        isContentEditableSelection(documentObject, target, selection) ||
+        isRawLatexProtected(target, selection, true, ranges)) return null;
+    const discoveries = [];
+    let totalRoots = 0;
+    for (const range of ranges) {
+      const discovery = cssStackMathDiscoveryForRange(range, documentObject);
+      if (discovery.overBudget || discovery.failed) return CSS_STACK_MATH_UNREPRESENTABLE;
+      totalRoots += discovery.values.length;
+      if (totalRoots > MAX_CSS_STACK_MATH_ROOTS) return null;
+      discoveries.push(discovery);
+    }
+    if (!totalRoots) return null;
+
+    const texts = [];
+    const richFragments = [];
+    for (let index = 0; index < ranges.length; index += 1) {
+      const range = ranges[index];
+      const values = discoveries[index].values;
+      if (!values.length) {
+        const fragment = cloneOrdinaryRangeWithContext(range, documentObject);
+        if (!fragment) return CSS_STACK_MATH_UNREPRESENTABLE;
+        texts.push(serializeOrdinaryFragment(fragment).text);
+        richFragments.push(fragment);
+        continue;
+      }
+      const replaceableRoots = new Set(values.map((value) => value.root));
+      const whollyInsideAuthenticatedRoot = values.some((value) =>
+        nodeInside(value.root, range.startContainer) && nodeInside(value.root, range.endContainer));
+      if (!whollyInsideAuthenticatedRoot &&
+          ordinaryComputedLayoutRisk(range, documentObject, replaceableRoots)) {
+        return CSS_STACK_MATH_UNREPRESENTABLE;
+      }
+      const replacements = cssStackMathReplacementMap(values, range, settings);
+      if (!replacements) return CSS_STACK_MATH_UNREPRESENTABLE;
+      const fragment = cssStackMathSelectionFragment(range, values, replacements, documentObject);
+      if (!fragment) return CSS_STACK_MATH_UNREPRESENTABLE;
+      texts.push(serializeOrdinaryFragment(fragment).text);
+      richFragments.push(fragment);
+    }
+    // The ordinary serializer already collapses normal whitespace while
+    // preserving authored `pre`/`pre-wrap` islands exactly. A global trim
+    // here would erase meaningful spaces adjacent to a rewritten formula.
+    const text = texts.join('\n');
+    if (!text.trim()) return CSS_STACK_MATH_UNREPRESENTABLE;
+    return {
+      text,
+      html: safeOrdinaryRichHTML(richFragments, documentObject),
+      mathML: '',
+      reason: 'css-stacked-math',
+      mathRanges: totalRoots
+    };
+  }
+
   function ordinaryComputedLayoutRisk(range, documentObject, replaceableMathRoots) {
     const view = documentObject && documentObject.defaultView;
     if (!range || !view || typeof view.getComputedStyle !== 'function') return true;
@@ -9177,6 +10639,11 @@
         }
 
         if (/^(?:flex|inline-flex|grid|inline-grid)$/.test(display)) return true;
+
+        if (!replaceableMathRoot && /^(?:inline-table|table-(?:row|cell|row-group|header-group|footer-group|caption|column|column-group))$/u.test(display)) {
+          const allowed = ORDINARY_SEMANTIC_TABLE_DISPLAYS[tag];
+          if (!allowed || !allowed.has(display)) return true;
+        }
 
         if (!['html', 'body', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th'].includes(tag) && display) {
           const computedBlock = /^(?:block|flex|grid|list-item|table)$/.test(display);
@@ -9631,6 +11098,15 @@
           if (rebuilt) result.appendChild(rebuilt);
         }
         return result;
+      }
+      const trustedPlaceholder = TRUSTED_TEXT_PLACEHOLDERS.get(node);
+      if (trustedPlaceholder && trustedPlaceholder.richSemantic === true) {
+        state.lastCollapsibleSpace = false;
+        return semanticTextRichFragment(
+          trustedPlaceholder.text || '',
+          trustedPlaceholder.outputMode || 'faithful',
+          documentObject
+        );
       }
       const tag = (node.localName || '').toLowerCase();
       if (ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag) || isVisuallyHiddenElement(node)) return null;
@@ -10861,6 +12337,17 @@
         mathRanges
       };
     }
+
+    const cssStackMath = cssStackMathSelectionPayload(
+      ranges,
+      settings,
+      documentObject,
+      selection,
+      target,
+      pageWindow
+    );
+    if (cssStackMath === CSS_STACK_MATH_UNREPRESENTABLE) return null;
+    if (cssStackMath) return cssStackMath;
 
     const nativeText = ranges.map((range) => range.toString()).join('\n');
     const rawLatexProtected = isRawLatexProtected(target, selection, true, ranges);

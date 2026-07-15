@@ -3,7 +3,20 @@
 <head>
   <meta charset="utf-8">
   <title>Clean Math Copy browser smoke</title>
-  <style>.mwe-math-element-block { display: block; overflow: auto hidden; }</style>
+  <style>
+    .mwe-math-element-block { display: block; overflow: auto hidden; }
+    .lim, .intbl { display: inline-table; vertical-align: middle; text-align: center; margin: 0 .12em; }
+    .lim > em, .lim > strong, .intbl > em, .intbl > strong {
+      display: table-row;
+      font-style: normal;
+      font-weight: inherit;
+    }
+    .intbl > em { border-bottom: .08em solid currentColor; }
+    .pseudo-fraction { display: inline-table; }
+    .pseudo-fraction > em, .pseudo-fraction > strong { display: table-row; }
+    .pseudo-fraction > em { border-bottom: 1px solid currentColor; }
+    .pseudo-fraction > em::before { content: "SECRET"; }
+  </style>
 </head>
 <body>
   <span id="unicode-partial">0.666 × 10⁻²⁵</span>
@@ -50,6 +63,10 @@
     </span>
     <span class="visual-layout">a∣b</span>
   </span>
+
+  <p id="css-stack-lead">And it is written in symbols as:</p>
+  <p id="css-stack-equation"><span class="lim"><em>lim</em><strong>x→1</strong></span><span class="intbl"><em>x<sup>2</sup>−1</em><strong>x−1</strong></span> = 2</p>
+  <span id="css-stack-pseudo" class="pseudo-fraction"><em>x</em><strong>y</strong></span>
 
   <main id="wikipedia-quadratic">
     <p>Given a general quadratic equation of the form <span class="nowrap">⁠<span class="mwe-math-element mwe-math-element-inline"><span class="mwe-math-mathml-inline mwe-math-mathml-a11y" style="display:none"><math alttext="{\displaystyle \textstyle ax^{2}+bx+c=0}"><semantics><mrow><mi>a</mi><msup><mi>x</mi><mn>2</mn></msup><mo>+</mo><mi>b</mi><mi>x</mi><mo>+</mo><mi>c</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">{\displaystyle \textstyle ax^{2}+bx+c=0}</annotation></semantics></math></span><img class="mwe-math-fallback-image-inline" aria-hidden="true" alt="{\displaystyle \textstyle ax^{2}+bx+c=0}"></span>⁠</span>, the values can be found using the quadratic formula,</p>
@@ -138,7 +155,10 @@
         }
         document.title = 'WAIT page-world browser smoke';
         const frame = document.createElement('iframe');
-        frame.hidden = true;
+        // Keep a real layout box so geometry-sensitive copy paths are tested.
+        // Moving the frame offscreen avoids visual noise without turning the
+        // document into display:none content with synthetic zero rectangles.
+        frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:720px;border:0;pointer-events:none';
         frame.src = '/browser-smoke.html?page-world=1' + (nativeMode ? '&native=1' : '');
         frame.addEventListener('load', () => {
           const pageTitle = frame.contentDocument.title;
@@ -302,6 +322,37 @@
 
       const renderedRelation = copyRange(document.querySelector('#relation-renderer .visual-layout'));
       assertEqual('relational bar stays relational', renderedRelation.plain, 'a ∣ b');
+
+      const cssStackEquation = document.querySelector('#css-stack-equation');
+      const cssStackLimit = cssStackEquation.querySelector('.lim');
+      const cssStackTail = cssStackEquation.lastChild;
+      const cssStackSelection = getSelection();
+      const cssStackRange = document.createRange();
+      cssStackRange.setStart(cssStackLimit.firstElementChild.firstChild, 0);
+      cssStackRange.setEnd(cssStackTail, cssStackTail.nodeValue.length);
+      cssStackSelection.removeAllRanges();
+      cssStackSelection.addRange(cssStackRange);
+      const cssStack = dispatchCopy(cssStackEquation);
+      assertEqual(
+        'CSS-stacked limit and fraction stay semantic',
+        cssStack.plain,
+        'lim_(x → 1) (x² − 1)/(x − 1) = 2'
+      );
+      assertEqual(
+        'CSS layout emphasis never leaks into rich copy',
+        /<(?:em|strong)\b|\*\*/i.test(cssStack.html),
+        false
+      );
+      const cssNumerator = cssStackEquation.querySelector('.intbl > em');
+      const cssNumeratorRange = document.createRange();
+      cssNumeratorRange.setStart(cssNumerator.firstChild, 0);
+      cssNumeratorRange.setEnd(cssNumerator.lastChild, cssNumerator.lastChild.nodeValue.length);
+      cssStackSelection.removeAllRanges();
+      cssStackSelection.addRange(cssNumeratorRange);
+      assertEqual('CSS-stacked numerator selection stays exact', dispatchCopy(cssStackEquation).plain, 'x² − 1');
+      const pseudoFraction = copyContents(document.querySelector('#css-stack-pseudo'));
+      assertEqual('generated CSS math content fails closed', pseudoFraction.prevented, false);
+      assertEqual('generated CSS math content stays native', pseudoFraction.plain, '');
 
       const wikipediaTarget = document.querySelector('#wikipedia-quadratic');
       const wikipediaRange = document.createRange();
