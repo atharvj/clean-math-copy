@@ -4,16 +4,18 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const scriptPath = path.join(__dirname, '..', 'clean-math-copy.user.js');
 const source = fs.readFileSync(scriptPath, 'utf8');
 const packageJson = require('../package.json');
 const packageLock = require('../package-lock.json');
+const manifest = require('../manifest.json');
 
 test('ships a valid installable userscript metadata block', () => {
   assert.match(source, /^\/\/ ==UserScript==/);
   assert.match(source, /\/\/ @name\s+Clean Math Copy/);
-  assert.match(source, /\/\/ @version\s+2\.3\.1/);
+  assert.match(source, /\/\/ @version\s+2\.4\.0/);
   assert.match(source, /\/\/ @namespace\s+https:\/\/github\.com\/atharvj\/clean-math-copy/);
   assert.match(source, /\/\/ @homepageURL\s+https:\/\/github\.com\/atharvj\/clean-math-copy/);
   assert.match(source, /\/\/ @supportURL\s+https:\/\/github\.com\/atharvj\/clean-math-copy\/issues/);
@@ -26,6 +28,12 @@ test('ships a valid installable userscript metadata block', () => {
   assert.match(source, /\/\/ @grant\s+GM\.addElement/);
   assert.match(source, /\/\/ @grant\s+GM_addValueChangeListener/);
   assert.match(source, /\/\/ @grant\s+GM\.addValueChangeListener/);
+  assert.match(source, /\/\/ @grant\s+GM_unregisterMenuCommand/);
+  assert.match(source, /\/\/ @grant\s+GM\.unregisterMenuCommand/);
+  assert.match(source, /\/\/ @grant\s+GM_getResourceText/);
+  assert.match(source, /\/\/ @grant\s+GM_getResourceURL/);
+  assert.match(source, /\/\/ @grant\s+GM\.getResourceText/);
+  assert.match(source, /\/\/ @grant\s+GM\.getResourceUrl/);
   assert.match(source, /\/\/ @match\s+https:\/\/\*\/\*/);
   assert.match(source, /\/\/ ==\/UserScript==/);
   assert.match(source, /const STORAGE_KEY = 'cleanMathCopy\.settings\.v3'/);
@@ -34,18 +42,37 @@ test('ships a valid installable userscript metadata block', () => {
 
 test('release metadata and package manifests use one consistent version', () => {
   const versions = Array.from(source.matchAll(/^\/\/ @version\s+(\S+)$/gm), (match) => match[1]);
-  assert.deepEqual(versions, ['2.3.1']);
+  assert.deepEqual(versions, ['2.4.0']);
   assert.equal(packageJson.version, versions[0]);
   assert.equal(packageLock.version, versions[0]);
   assert.equal(packageLock.packages[''].version, versions[0]);
+  assert.equal(manifest.version, versions[0]);
+  assert.equal(packageJson.devDependencies['pdfjs-dist'], '6.1.200');
+  assert.equal(packageLock.packages['node_modules/pdfjs-dist'].version, '6.1.200');
   assert.equal((source.match(/^\/\/ @updateURL\s+/gm) || []).length, 1);
   assert.equal((source.match(/^\/\/ @downloadURL\s+/gm) || []).length, 1);
 });
 
-test('the installable artifact has no network-loaded runtime dependencies', () => {
+test('the installable userscript has no unpinned executable runtime dependency', () => {
   assert.doesNotMatch(source, /\/\/ @require\s+/);
   assert.doesNotMatch(source, /fetch\s*\(/);
   assert.doesNotMatch(source, /XMLHttpRequest/);
   assert.doesNotMatch(source, /\beval\s*\(/);
   assert.doesNotMatch(source, /\.innerHTML\s*=/);
+
+  const resources = Array.from(source.matchAll(
+    /^\/\/ @resource\s+(clean_math_copy_pdfjs(?:_worker)?)\s+(\S+)#sha256=([a-f0-9]{64})$/gm
+  ));
+  assert.equal(resources.length, 2);
+  const files = {
+    clean_math_copy_pdfjs: 'extension/vendor/pdf.min.mjs',
+    clean_math_copy_pdfjs_worker: 'extension/vendor/pdf.worker.min.mjs'
+  };
+  for (const [, name, url, expectedHash] of resources) {
+    assert.match(url, /^https:\/\/cdn\.jsdelivr\.net\/npm\/pdfjs-dist@6\.1\.200\/build\//);
+    const digest = crypto.createHash('sha256')
+      .update(fs.readFileSync(path.join(__dirname, '..', files[name])))
+      .digest('hex');
+    assert.equal(digest, expectedHash, name + ' vendor hash must match userscript metadata');
+  }
 });

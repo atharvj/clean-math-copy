@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.3.1
+// @version      2.4.0
 // @description  Faithfully copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
@@ -15,17 +15,25 @@
 // @run-at       document-start
 // @sandbox      raw
 // @inject-into  auto
+// @resource     clean_math_copy_pdfjs https://cdn.jsdelivr.net/npm/pdfjs-dist@6.1.200/build/pdf.min.mjs#sha256=4ba2f15599b03fde8755ad91349920c21dadd3e8fd6b6460a7663d46d4cf21b5
+// @resource     clean_math_copy_pdfjs_worker https://cdn.jsdelivr.net/npm/pdfjs-dist@6.1.200/build/pdf.worker.min.mjs#sha256=2ab9e09667296dab1a618868b3ce6e6c23d5b8f48120ae7c5b34e7e335ed01fa
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_getResourceText
+// @grant        GM_getResourceURL
 // @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
 // @grant        GM_setClipboard
 // @grant        GM_addElement
 // @grant        unsafeWindow
 // @grant        GM.getValue
 // @grant        GM.setValue
+// @grant        GM.getResourceText
+// @grant        GM.getResourceUrl
 // @grant        GM.addValueChangeListener
 // @grant        GM.registerMenuCommand
+// @grant        GM.unregisterMenuCommand
 // @grant        GM.setClipboard
 // @grant        GM.addElement
 // ==/UserScript==
@@ -46,6 +54,11 @@
   'use strict';
 
   const STORAGE_KEY = 'cleanMathCopy.settings.v3';
+  const PDFJS_RESOURCE = 'clean_math_copy_pdfjs';
+  const PDFJS_WORKER_RESOURCE = 'clean_math_copy_pdfjs_worker';
+  const PDF_VIEWER_BYPASS_KEY = 'cleanMathCopy.pdfViewerBypass.v1';
+  const PDF_RENDER_SELECTION_EVENT = 'clean-math-copy-pdf-render-selection-v1';
+  const PDF_SELECTION_READY_EVENT = 'clean-math-copy-pdf-selection-ready-v1';
   const MATHML_NAMESPACE = 'http://www.w3.org/1998/Math/MathML';
   const MAX_CLIPBOARD_MARKUP_LENGTH = 1024 * 1024;
   const GOOGLE_DOCS_SLICE_TYPE = 'application/x-vnd.google-docs-document-slice-clip+wrapped';
@@ -75,6 +88,12 @@
   const MAX_POSITIONED_TOKEN_CANDIDATES = 512;
   const MAX_POSITIONED_SELECTED_TOKENS = 128;
   const MAX_POSITIONED_BASE_LOOKBACK = 24;
+  const MAX_PDF_SELECTED_PAGES = 64;
+  const MAX_PDF_SELECTED_ITEMS = 12000;
+  const MAX_PDF_PAGE_ITEMS = 20000;
+  const MAX_PDF_PAGE_CHARACTERS = 2 * 1024 * 1024;
+  const MAX_PDF_GEOMETRY_RULES = 10000;
+  const MAX_PDF_GEOMETRY_WORK = 2000000;
   const MAX_SELECTION_RANGES = 64;
   const MAX_LATEX_PARSE_DEPTH = 128;
   const MAX_LATEX_PARSE_STEPS = 25000;
@@ -96,7 +115,9 @@
   const FAITHFUL_TEXT_CLOSE = '\ue10f';
   const LATEX_BUDGET_ERROR = 'CLEAN_MATH_COPY_LATEX_BUDGET';
   const POSITIONED_OVER_BUDGET = Symbol('clean-math-copy-positioned-over-budget');
+  const PDF_VIEWER_INCOMPLETE = Symbol('clean-math-copy-pdf-viewer-incomplete');
   const TRUSTED_RICH_STYLE_NODES = new WeakSet();
+  const TRUSTED_PDF_VIEWER_ROOTS = new WeakSet();
   const TRUSTED_TEXT_PLACEHOLDERS = new WeakMap();
   const MATH_ROOT_SELECTOR = [
     '.katex-display',
@@ -9761,6 +9782,743 @@
     };
   }
 
+  // PDF.js exposes the source PDF's text geometry and original embedded-font
+  // names. The browser's built-in PDF viewer exposes neither to userscripts,
+  // which is why a flattened native copy can turn an integral into "Z" and
+  // discard the scope of a radical. Keep this analyzer data-only so it is
+  // usable both by the trusted viewer and by deterministic tests.
+  function analyzePdfPageText(itemsInput, stylesInput, fontsInput, radicalSegmentsInput) {
+    const sourceItems = Array.isArray(itemsInput) ? itemsInput : [];
+    const styles = stylesInput && typeof stylesInput === 'object' ? stylesInput : {};
+    const fonts = fontsInput && typeof fontsInput === 'object' ? fontsInput : {};
+    const radicalSegments = Array.isArray(radicalSegmentsInput) ? radicalSegmentsInput : [];
+    if (sourceItems.length > MAX_PDF_PAGE_ITEMS || radicalSegments.length > MAX_PDF_GEOMETRY_RULES ||
+        sourceItems.length * Math.max(1, radicalSegments.length) > MAX_PDF_GEOMETRY_WORK) {
+      return { items: [], lines: [], normalLineGap: 0, overBudget: true };
+    }
+    let sourceCharacters = 0;
+    for (const item of sourceItems) {
+      sourceCharacters += String(item && item.str || '').length;
+      if (sourceCharacters > MAX_PDF_PAGE_CHARACTERS) {
+        return { items: [], lines: [], normalLineGap: 0, overBudget: true };
+      }
+    }
+    const number = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+    const cleanFontName = (value) => String(value || '').replace(/^[A-Z]{6}\+/, '');
+    const items = sourceItems.map((source, index) => {
+      const transform = Array.isArray(source && source.transform) || ArrayBuffer.isView(source && source.transform)
+        ? Array.from(source.transform)
+        : [];
+      const fontName = String(source && source.fontName || '');
+      const font = fonts[fontName] || {};
+      const style = styles[fontName] || {};
+      const size = Math.max(0.01, Math.hypot(number(transform[0], 0), number(transform[1], 0)) ||
+        number(source && source.height, 0) || 1);
+      const text = String(source && source.str || '');
+      const x = number(transform[4], 0);
+      const y = number(transform[5], 0);
+      const width = Math.max(0, Math.abs(number(source && source.width, 0)));
+      const originalFont = cleanFontName(font.name || font.loadedName || style.fontFamily || fontName);
+      let semantic = '';
+      // In TeX's CMEX encoding, character 0x5a is the display integral. PDF
+      // text extraction commonly maps that byte to the literal letter Z.
+      if (text === 'Z' && /^CMEX(?:7|8|9|10|12)$/i.test(originalFont)) semantic = 'integral';
+      return {
+        index,
+        text,
+        x,
+        y,
+        width,
+        height: Math.max(0, Math.abs(number(source && source.height, size))),
+        size,
+        fontName,
+        originalFont,
+        hasEOL: Boolean(source && source.hasEOL),
+        semantic,
+        accent: '',
+        accentBase: -1,
+        script: '',
+        scriptBase: -1,
+        effectiveY: y,
+        line: -1,
+        math: false,
+        mathGroup: '',
+        displayMath: false,
+        radical: '',
+        radicalEndX: NaN,
+        fraction: '',
+        fractionRole: '',
+        fractionX1: NaN,
+        fractionX2: NaN
+      };
+    });
+
+    const visible = items.filter((item) => item.text && !/^\s+$/u.test(item.text));
+    const accentKind = (text) => {
+      const value = String(text || '').trim();
+      if (/^(?:⃗|→|⇀|↼)$/u.test(value)) return 'vector';
+      if (/^(?:\^|ˆ|̂)$/u.test(value)) return 'hat';
+      if (/^(?:¯|‾|̅)$/u.test(value)) return 'bar';
+      if (/^(?:˜|~|̃)$/u.test(value)) return 'tilde';
+      if (/^(?:˙|̇)$/u.test(value)) return 'dot';
+      return '';
+    };
+    const accentItems = visible.map((item) => ({ item, kind: accentKind(item.text) }))
+      .filter((entry) => entry.kind);
+    if (accentItems.length * Math.max(1, visible.length) > MAX_PDF_GEOMETRY_WORK) {
+      return { items: [], lines: [], normalLineGap: 0, overBudget: true };
+    }
+    for (const { item: accent, kind } of accentItems) {
+      const candidates = visible.filter((candidate) => candidate !== accent && !accentKind(candidate.text) &&
+        candidate.y < accent.y && accent.y - candidate.y <= Math.max(accent.size, candidate.size) * 0.95 &&
+        candidate.x < accent.x + Math.max(accent.width, accent.size * 0.45) &&
+        candidate.x + Math.max(candidate.width, candidate.size * 0.3) > accent.x - accent.size * 0.25);
+      candidates.sort((left, right) => {
+        const leftCenter = Math.abs((left.x + left.width / 2) - (accent.x + accent.width / 2));
+        const rightCenter = Math.abs((right.x + right.width / 2) - (accent.x + accent.width / 2));
+        return leftCenter - rightCenter || (accent.y - left.y) - (accent.y - right.y);
+      });
+      const base = candidates[0];
+      if (!base) continue;
+      accent.accent = kind;
+      accent.accentBase = base.index;
+      accent.effectiveY = base.y;
+    }
+    for (let visibleIndex = 0; visibleIndex < visible.length; visibleIndex += 1) {
+      const item = visible[visibleIndex];
+      if (item.accent) continue;
+      for (let back = visibleIndex - 1; back >= 0 && visibleIndex - back <= 12; back -= 1) {
+        const base = visible[back];
+        const ratio = item.size / base.size;
+        if (ratio < 0.5 || ratio > 0.82) continue;
+        const gap = item.x - (base.x + base.width);
+        if (gap < -0.2 * base.size || gap > 0.75 * base.size) continue;
+        const rise = (item.y - base.y) / base.size;
+        if (rise > 0.14 && rise < 0.85) item.script = 'sup';
+        else if (rise < -0.10 && rise > -0.85) item.script = 'sub';
+        else continue;
+        item.scriptBase = base.index;
+        item.effectiveY = base.effectiveY;
+        break;
+      }
+    }
+
+    const horizontalRules = radicalSegments.map((segment) => ({
+      x1: Math.min(number(segment && segment.x1, NaN), number(segment && segment.x2, NaN)),
+      x2: Math.max(number(segment && segment.x1, NaN), number(segment && segment.x2, NaN)),
+      y: number(segment && segment.y, NaN)
+    })).filter((segment) => [segment.x1, segment.x2, segment.y].every(Number.isFinite) &&
+      segment.x2 - segment.x1 > 0.5);
+
+    const usedRules = new Set();
+    for (const root of visible) {
+      if (root.text !== '√') continue;
+      let best = null;
+      let bestScore = Infinity;
+      for (const rule of horizontalRules) {
+        const dx = Math.abs(rule.x1 - (root.x + root.width));
+        const dy = Math.abs(rule.y - root.y);
+        if (dx > root.size * 0.65 || dy > root.size * 0.45) continue;
+        const score = dx + dy;
+        if (score < bestScore) { best = rule; bestScore = score; }
+      }
+      if (!best) continue;
+      usedRules.add(best);
+      root.semantic = 'root';
+      root.radical = 'root-' + root.index;
+      root.radicalEndX = best.x2;
+      const baselineCandidate = visible.find((candidate) =>
+        candidate.index > root.index && candidate.x >= best.x1 - root.size * 0.2 &&
+        candidate.x < best.x2 + root.size * 0.2 && !candidate.script);
+      if (baselineCandidate) root.effectiveY = baselineCandidate.y;
+    }
+
+    for (const item of visible) {
+      if (item.semantic !== 'integral') continue;
+      const neighbor = visible.find((candidate) => candidate.index > item.index &&
+        candidate.x >= item.x && !candidate.script && candidate.semantic !== 'integral') ||
+        [...visible].reverse().find((candidate) => candidate.index < item.index && !candidate.script);
+      if (neighbor) item.effectiveY = neighbor.effectiveY;
+    }
+
+    let fractionSerial = 0;
+    for (const rule of horizontalRules) {
+      if (usedRules.has(rule)) continue;
+      const overlapping = visible.filter((item) => {
+        const center = item.x + item.width / 2;
+        return center >= rule.x1 - item.size * 0.12 && center <= rule.x2 + item.size * 0.12 &&
+          Math.abs(item.y - rule.y) <= item.size * 1.8;
+      });
+      const numerators = overlapping.filter((item) => item.y > rule.y + Math.max(0.5, item.size * 0.12));
+      const denominators = overlapping.filter((item) => item.y < rule.y - Math.max(0.5, item.size * 0.12));
+      if (!numerators.length || !denominators.length) continue;
+      const numeratorY = numerators.reduce((sum, item) => sum + item.y, 0) / numerators.length;
+      const denominatorY = denominators.reduce((sum, item) => sum + item.y, 0) / denominators.length;
+      const midpointY = (numeratorY + denominatorY) / 2;
+      const baseline = visible.filter((item) => !overlapping.includes(item) &&
+        item.x + item.width <= rule.x1 + item.size * 0.25 &&
+        item.x + item.width >= rule.x1 - item.size * 3.2 &&
+        item.y > denominatorY - item.size * 0.25 && item.y < numeratorY + item.size * 0.25)
+        .sort((left, right) => {
+          const leftScore = Math.abs(left.x + left.width - rule.x1) + Math.abs(left.y - midpointY);
+          const rightScore = Math.abs(right.x + right.width - rule.x1) + Math.abs(right.y - midpointY);
+          return leftScore - rightScore;
+        })[0];
+      const baselineY = baseline ? baseline.y : midpointY;
+      const id = 'fraction-' + (++fractionSerial);
+      for (const item of numerators) {
+        item.fraction = id; item.fractionRole = 'numerator';
+        item.fractionX1 = rule.x1; item.fractionX2 = rule.x2; item.effectiveY = baselineY;
+      }
+      for (const item of denominators) {
+        item.fraction = id; item.fractionRole = 'denominator';
+        item.fractionX1 = rule.x1; item.fractionX2 = rule.x2; item.effectiveY = baselineY;
+      }
+    }
+
+    const lines = [];
+    let previousVisible = null;
+    for (const item of visible) {
+      if (item.scriptBase >= 0 || item.accentBase >= 0) {
+        const base = items[item.scriptBase >= 0 ? item.scriptBase : item.accentBase];
+        if (base && base.line >= 0) item.line = base.line;
+      }
+      if (item.line < 0) {
+        let line = lines.length ? lines[lines.length - 1] : null;
+        const sameBaseline = line && Math.abs(item.effectiveY - line.y) <= Math.max(1, item.size * 0.34);
+        const severeReset = sameBaseline && previousVisible && item.x < previousVisible.x - 2.5 * item.size;
+        if (!sameBaseline || severeReset) {
+          line = { id: lines.length, y: item.effectiveY, items: [], math: false };
+          lines.push(line);
+        }
+        item.line = line.id;
+      }
+      const line = lines[item.line];
+      if (line) {
+        line.items.push(item.index);
+        if (!item.script) line.y = (line.y * (line.items.length - 1) + item.effectiveY) / line.items.length;
+      }
+      previousVisible = item;
+    }
+
+    const radicalRoots = visible.filter((item) => item.radical && Number.isFinite(item.radicalEndX));
+    if (radicalRoots.length * Math.max(1, visible.length) > MAX_PDF_GEOMETRY_WORK) {
+      return { items: [], lines: [], normalLineGap: 0, overBudget: true };
+    }
+    for (const root of radicalRoots) {
+      for (const item of visible) {
+        if (item.index <= root.index || item.line !== root.line) continue;
+        if (item.x >= root.radicalEndX + root.size * 0.12) continue;
+        if (item.x + item.width <= root.x + root.width - root.size * 0.15) continue;
+        item.radical = root.radical;
+        item.radicalEndX = root.radicalEndX;
+      }
+    }
+
+    let mathGroupSerial = 0;
+    const mathFont = (item) => /^(?:CMMI|CMSY|CMEX|MSAM|MSBM|STIX.*Math)/i.test(item.originalFont);
+    const mathCandidate = (item) => Boolean(item.semantic || item.accent || item.radical || item.fraction || item.script ||
+      mathFont(item) || /^[\s\d.,;:()[\]{}|=+−\-*/<>≤≥≠≈∝±∓×÷√∫∑∏⇒⇔ΦΔΩμνρ]+$/u.test(item.text) ||
+      /^[\p{L}\p{M}]{1,4}$/u.test(item.text.trim()) ||
+      /^\s*(?:det|dim|sin|cos|tan|log|ln|exp|max|min|lim)\b/u.test(item.text));
+    for (const line of lines) {
+      const lineItems = line.items.map((index) => items[index]);
+      const seeds = [];
+      for (let position = 0; position < lineItems.length; position += 1) {
+        const item = lineItems[position];
+        const base = item.scriptBase >= 0 ? items[item.scriptBase] : null;
+        if (item.semantic || item.accent || item.radical || item.fraction ||
+            /[=≠≈≤≥<>∝±∓×÷√∫∑∏⇒⇔]/u.test(item.text) ||
+            (item.script && base && mathFont(base))) seeds.push(position);
+      }
+      if (seeds.length * Math.max(1, lineItems.length) > MAX_PDF_GEOMETRY_WORK) {
+        return { items: [], lines: [], normalLineGap: 0, overBudget: true };
+      }
+      const intervals = [];
+      for (const seed of seeds) {
+        let start = seed;
+        let end = seed;
+        while (start > 0) {
+          const previous = lineItems[start - 1];
+          const current = lineItems[start];
+          const gap = current.x - (previous.x + previous.width);
+          if (!mathCandidate(previous) || gap > Math.max(previous.size, current.size) * 0.72) break;
+          start -= 1;
+        }
+        while (end + 1 < lineItems.length) {
+          const current = lineItems[end];
+          const next = lineItems[end + 1];
+          const gap = next.x - (current.x + current.width);
+          if (!mathCandidate(next) || gap > Math.max(current.size, next.size) * 0.72) break;
+          end += 1;
+        }
+        intervals.push({ start, end });
+      }
+      intervals.sort((left, right) => left.start - right.start);
+      const merged = [];
+      for (const interval of intervals) {
+        const previous = merged[merged.length - 1];
+        if (previous && interval.start <= previous.end + 1) previous.end = Math.max(previous.end, interval.end);
+        else merged.push({ ...interval });
+      }
+      for (const interval of merged) {
+        const id = 'math-' + (++mathGroupSerial);
+        for (let position = interval.start; position <= interval.end; position += 1) {
+          lineItems[position].mathGroup = id;
+          lineItems[position].math = true;
+        }
+      }
+      line.math = merged.length > 0;
+      const outside = lineItems.filter((item) => !item.mathGroup);
+      line.displayMath = line.math && outside.every((item) => /^\s*[([]?\d+(?:\.\d+)*[)\]]?[,.;]?\s*$/u.test(item.text));
+      for (const item of lineItems) item.displayMath = line.displayMath;
+    }
+
+    const lineGaps = [];
+    for (let index = 1; index < lines.length; index += 1) {
+      const gap = Math.abs(lines[index - 1].y - lines[index].y);
+      if (gap > 0.5) lineGaps.push(gap);
+    }
+    lineGaps.sort((left, right) => left - right);
+    const normalLineGap = lineGaps.length
+      ? lineGaps[Math.floor((lineGaps.length - 1) / 2)]
+      : 0;
+    return { items, lines, normalLineGap, overBudget: false };
+  }
+
+  function selectedPdfTokenSlice(range, element, documentObject) {
+    if (!rangeIntersects(range, element)) return null;
+    const value = element.textContent || '';
+    if (!value) return null;
+    let start = 0;
+    let end = value.length;
+    try {
+      if (nodeInside(element, range.startContainer)) {
+        const prefix = documentObject.createRange();
+        prefix.selectNodeContents(element);
+        prefix.setEnd(range.startContainer, range.startOffset);
+        start = prefix.toString().length;
+      }
+      if (nodeInside(element, range.endContainer)) {
+        const prefix = documentObject.createRange();
+        prefix.selectNodeContents(element);
+        prefix.setEnd(range.endContainer, range.endOffset);
+        end = prefix.toString().length;
+      }
+    } catch (_error) {
+      start = 0;
+      end = value.length;
+    }
+    start = Math.max(0, Math.min(value.length, start));
+    end = Math.max(start, Math.min(value.length, end));
+    return end > start ? { start, end, text: value.slice(start, end), fullText: value } : null;
+  }
+
+  function trustedPdfRootForNode(node) {
+    for (let current = node && node.nodeType === 1 ? node : node && node.parentElement;
+      current; current = current.parentElement) {
+      if (TRUSTED_PDF_VIEWER_ROOTS.has(current)) return current;
+    }
+    return null;
+  }
+
+  function registerTrustedPdfViewerRoot(root) {
+    if (root && root.nodeType === 1) TRUSTED_PDF_VIEWER_ROOTS.add(root);
+    return root;
+  }
+
+  const PDF_LATEX_CHARACTERS = Object.freeze({
+    '−': '-', '×': '\\times ', '÷': '\\div ', '·': '\\cdot ', '±': '\\pm ', '∓': '\\mp ',
+    '∫': '\\int ', '∑': '\\sum ', '∏': '\\prod ', '∞': '\\infty ', '≈': '\\approx ',
+    '≠': '\\ne ', '≤': '\\le ', '≥': '\\ge ', '∝': '\\propto ', 'μ': '\\mu ',
+    'α': '\\alpha ', 'β': '\\beta ', 'γ': '\\gamma ', 'δ': '\\delta ', 'ε': '\\epsilon ',
+    'ϵ': '\\varepsilon ', 'ζ': '\\zeta ', 'η': '\\eta ', 'θ': '\\theta ', 'ϑ': '\\vartheta ',
+    'ι': '\\iota ', 'κ': '\\kappa ', 'λ': '\\lambda ', 'ν': '\\nu ', 'ξ': '\\xi ',
+    'π': '\\pi ', 'ϖ': '\\varpi ', 'ρ': '\\rho ', 'ϱ': '\\varrho ', 'σ': '\\sigma ',
+    'τ': '\\tau ', 'υ': '\\upsilon ', 'φ': '\\phi ', 'ϕ': '\\varphi ', 'χ': '\\chi ',
+    'ψ': '\\psi ', 'ω': '\\omega ', 'Γ': '\\Gamma ', 'Δ': '\\Delta ', 'Θ': '\\Theta ',
+    'Λ': '\\Lambda ', 'Ξ': '\\Xi ', 'Π': '\\Pi ', 'Σ': '\\Sigma ', 'Φ': '\\Phi ',
+    'Ψ': '\\Psi ', 'Ω': '\\Omega ', '∂': '\\partial ', '∇': '\\nabla ', '∼': '\\sim ',
+    '⇒': '\\Rightarrow ', '⇔': '\\Leftrightarrow ', '→': '\\to ', '←': '\\leftarrow ',
+    '↦': '\\mapsto ', '∈': '\\in ', '∉': '\\notin ', '⊂': '\\subset ', '⊆': '\\subseteq ',
+    '⊃': '\\supset ', '⊇': '\\supseteq ', '∪': '\\cup ', '∩': '\\cap ', '∅': '\\varnothing ',
+    '∀': '\\forall ', '∃': '\\exists ', '¬': '\\neg ', '∧': '\\land ', '∨': '\\lor ',
+    '⊥': '\\perp ', '∥': '\\parallel ', 'ℏ': '\\hbar ', 'ℓ': '\\ell ',
+    'ℝ': '\\mathbb{R}', 'ℂ': '\\mathbb{C}', 'ℤ': '\\mathbb{Z}', 'ℕ': '\\mathbb{N}',
+    '⟨': '\\langle ', '⟩': '\\rangle '
+  });
+
+  function pdfTextToLatex(input) {
+    let output = '';
+    for (const character of String(input || '')) {
+      if (PDF_LATEX_CHARACTERS[character]) output += PDF_LATEX_CHARACTERS[character];
+      else if (character === '\\') output += '\\backslash ';
+      else if ('{}#$%&_'.includes(character)) output += '\\' + character;
+      else if (character === '^') output += '\\hat{}';
+      else output += character;
+    }
+    return output.trimEnd().replace(/\b(det|dim|sin|cos|tan|log|ln|exp|max|min|lim)\b/g, '\\$1 ');
+  }
+
+  function pdfUnitSpacing(previous, current, mathLine) {
+    if (!previous || !current) return '';
+    const left = previous.faithful;
+    const right = current.faithful;
+    if (!left || !right || /\s$/u.test(left) || /^\s/u.test(right)) return '';
+    if (/^[,.;:!?\)\]\}]/u.test(right) || /[\(\[\{]$/u.test(left)) return '';
+    if (mathLine) {
+      if (previous.kind === 'root' && /^[\p{L}\p{N}]/u.test(right)) return ' ';
+      if (/^[=≠≈≤≥<>∝±∓×÷+]/u.test(right) || /[=≠≈≤≥<>∝±∓×÷+]$/u.test(left)) return ' ';
+      if ((right === '−' || right === '-') && (!left || /[=([{,]/u.test(left))) return '';
+      if ((left === '−' || left === '-') && /^[\p{L}\p{N}√(]/u.test(right)) return '';
+      if (previous.kind === 'integral') return ' ';
+      if (/^d(?:[⁰-⁹¹²³⁺⁻⁼⁽⁾ⁿⁱ]|\^\([^)]*\))*$/u.test(left) && /^[\p{L}]/u.test(right)) return '';
+    }
+    const gap = current.x - previous.endX;
+    const threshold = Math.max(0.7, Math.min(previous.size, current.size) * (mathLine ? 0.18 : 0.08));
+    return gap > threshold ? ' ' : '';
+  }
+
+  function joinPdfUnits(units, field, mathLine) {
+    let output = '';
+    let previous = null;
+    for (const unit of units) {
+      const value = unit[field];
+      if (!value) continue;
+      const spacing = pdfUnitSpacing(previous, unit, mathLine);
+      output += spacing + value;
+      previous = unit;
+    }
+    return output.replace(/[ \t]{2,}/g, ' ').trim();
+  }
+
+  function pdfLineUnits(selectedItems, outputMode) {
+    const segments = [];
+    for (const selected of selectedItems) {
+      const originalLength = Math.max(1, selected.fullText.length);
+      const makeSegment = (start, end, radical) => {
+        if (end <= start) return;
+        const relativeStart = start / originalLength;
+        const relativeEnd = end / originalLength;
+        segments.push({
+          ...selected,
+          start,
+          end,
+          text: selected.fullText.slice(start, end),
+          x: selected.x + selected.width * relativeStart,
+          endX: selected.x + selected.width * relativeEnd,
+          radical
+        });
+      };
+      const scope = Math.max(0, Math.min(originalLength, selected.radicalChars));
+      if (selected.radical && selected.semantic !== 'root' && scope > 0) {
+        makeSegment(selected.start, Math.min(selected.end, scope), selected.radical);
+        makeSegment(Math.max(selected.start, scope), selected.end, '');
+      } else makeSegment(selected.start, selected.end, selected.semantic === 'root' ? selected.radical : '');
+    }
+    segments.sort((left, right) => left.index - right.index || left.start - right.start);
+    const byBase = new Map();
+    const accentsByBase = new Map();
+    for (const segment of segments) {
+      if (segment.accent && segment.accentBase >= 0) {
+        const accents = accentsByBase.get(segment.accentBase) || [];
+        accents.push(segment);
+        accentsByBase.set(segment.accentBase, accents);
+      }
+      if (!segment.script || segment.scriptBase < 0) continue;
+      const list = byBase.get(segment.scriptBase) || [];
+      list.push(segment);
+      byBase.set(segment.scriptBase, list);
+    }
+    const consumed = new Set();
+    const selectedSegmentIndices = new Set(segments.map((segment) => segment.index));
+    const makeOrdinaryUnit = (segment) => {
+      let faithful = normalizeOfficeGlyphs(segment.text).replace(/\s+/gu, ' ').trim();
+      let kind = '';
+      if (segment.semantic === 'integral' && segment.start === 0 && segment.end === segment.fullText.length) {
+        faithful = '∫';
+        kind = 'integral';
+      }
+      let latex = pdfTextToLatex(faithful);
+      let endX = segment.endX;
+      const combiningAccents = {
+        vector: '\u20d7', hat: '\u0302', bar: '\u0305', tilde: '\u0303', dot: '\u0307'
+      };
+      const latexAccents = {
+        vector: '\\vec', hat: '\\hat', bar: '\\bar', tilde: '\\tilde', dot: '\\dot'
+      };
+      for (const accent of accentsByBase.get(segment.index) || []) {
+        consumed.add(accent);
+        const compactBase = Array.from(faithful.normalize('NFC')).length === 1;
+        faithful = compactBase && combiningAccents[accent.accent]
+          ? faithful + combiningAccents[accent.accent]
+          : accent.accent + '(' + faithful + ')';
+        if (latexAccents[accent.accent]) latex = latexAccents[accent.accent] + '{' + latex + '}';
+        endX = Math.max(endX, accent.endX);
+      }
+      const scripts = byBase.get(segment.index) || [];
+      for (const script of scripts) {
+        if (script.radical !== segment.radical) continue;
+        consumed.add(script);
+        const scriptText = normalizeOfficeGlyphs(script.text).trim();
+        faithful += officeScriptText(scriptText, script.script, outputMode === 'faithful' ? 'faithful' : outputMode);
+        latex += script.script === 'sub'
+          ? '_{' + pdfTextToLatex(scriptText) + '}'
+          : '^{' + pdfTextToLatex(scriptText) + '}';
+        endX = Math.max(endX, script.endX);
+      }
+      return { faithful, latex, x: segment.x, endX, size: segment.size, kind,
+        mathGroup: segment.mathGroup || '', radical: segment.radical || '' };
+    };
+
+    const fractionStructures = [];
+    const fractionSegmentsById = new Map();
+    for (const segment of segments) {
+      if (!segment.fraction) continue;
+      const grouped = fractionSegmentsById.get(segment.fraction) || [];
+      grouped.push(segment);
+      fractionSegmentsById.set(segment.fraction, grouped);
+    }
+    for (const [fractionId, fractionSegments] of fractionSegmentsById) {
+      const numeratorSegments = fractionSegments.filter((segment) => segment.fractionRole === 'numerator');
+      const denominatorSegments = fractionSegments.filter((segment) => segment.fractionRole === 'denominator');
+      if (!numeratorSegments.length || !denominatorSegments.length) continue;
+      const unitsForFractionPart = (partSegments) => {
+        const part = [];
+        const partIndices = new Set(partSegments.map((segment) => segment.index));
+        for (const segment of partSegments.slice().sort((left, right) => left.index - right.index)) {
+          if (consumed.has(segment)) continue;
+          if (segment.accent && segment.accentBase >= 0 && partIndices.has(segment.accentBase)) continue;
+          if (segment.script && segment.scriptBase >= 0 && partIndices.has(segment.scriptBase)) continue;
+          part.push(makeOrdinaryUnit(segment));
+        }
+        return part.sort((left, right) => left.x - right.x);
+      };
+      const numeratorUnits = unitsForFractionPart(numeratorSegments);
+      const denominatorUnits = unitsForFractionPart(denominatorSegments);
+      const numerator = joinPdfUnits(numeratorUnits, 'faithful', true);
+      const denominator = joinPdfUnits(denominatorUnits, 'faithful', true);
+      const numeratorLatex = joinPdfUnits(numeratorUnits, 'latex', true);
+      const denominatorLatex = joinPdfUnits(denominatorUnits, 'latex', true);
+      if (!numerator || !denominator) continue;
+      const atomic = (value) => /^[\p{L}\p{N}\p{M}⁰-⁹¹²³₀-₉_]+$/u.test(value);
+      const faithful = (atomic(numerator) ? numerator : '(' + numerator + ')') + '/' +
+        (atomic(denominator) ? denominator : '(' + denominator + ')');
+      const first = fractionSegments.slice().sort((left, right) => left.index - right.index)[0];
+      const radicals = new Set(fractionSegments.map((segment) => segment.radical).filter(Boolean));
+      fractionStructures.push({
+        id: fractionId,
+        segments: fractionSegments,
+        leader: first,
+        radical: radicals.size === 1 ? radicals.values().next().value : '',
+        emitted: false,
+        consumedByRoot: false,
+        unit: {
+          faithful,
+          latex: '\\frac{' + numeratorLatex + '}{' + denominatorLatex + '}',
+          x: Number.isFinite(first.fractionX1) ? first.fractionX1 : Math.min(...fractionSegments.map((segment) => segment.x)),
+          endX: Number.isFinite(first.fractionX2) ? first.fractionX2 : Math.max(...fractionSegments.map((segment) => segment.endX)),
+          size: Math.max(...fractionSegments.map((segment) => segment.size)),
+          kind: 'fraction',
+          mathGroup: first.mathGroup || '',
+          radical: radicals.size === 1 ? radicals.values().next().value : ''
+        }
+      });
+      for (const segment of fractionSegments) consumed.add(segment);
+    }
+    const fractionByLeader = new Map(fractionStructures.map((fraction) => [fraction.leader, fraction]));
+
+    const rootSegments = segments.filter((segment) => segment.semantic === 'root');
+    const rootUnits = new Map();
+    for (const root of rootSegments) {
+      const innerSegments = segments.filter((segment) => segment.radical === root.radical && segment !== root &&
+        !consumed.has(segment));
+      const innerUnits = [];
+      for (const segment of innerSegments) {
+        if (consumed.has(segment)) continue;
+        consumed.add(segment);
+        innerUnits.push(makeOrdinaryUnit(segment));
+      }
+      for (const fraction of fractionStructures) {
+        if (fraction.radical !== root.radical) continue;
+        fraction.consumedByRoot = true;
+        innerUnits.push(fraction.unit);
+      }
+      innerUnits.sort((left, right) => left.x - right.x);
+      const innerFaithful = joinPdfUnits(innerUnits, 'faithful', true);
+      const innerLatex = joinPdfUnits(innerUnits, 'latex', true);
+      const faithful = innerFaithful ? '√(' + innerFaithful + ')' : '√';
+      const latex = innerLatex ? '\\sqrt{' + innerLatex + '}' : '\\sqrt{}';
+      rootUnits.set(root, {
+        faithful,
+        latex,
+        x: root.x,
+        endX: Number.isFinite(root.radicalEndX) ? root.radicalEndX : root.endX,
+        size: root.size,
+        kind: 'root',
+        mathGroup: root.mathGroup || '',
+        radical: root.radical || ''
+      });
+    }
+
+    const units = [];
+    for (const segment of segments) {
+      const fraction = fractionByLeader.get(segment);
+      if (fraction && !fraction.emitted && !fraction.consumedByRoot) {
+        units.push(fraction.unit);
+        fraction.emitted = true;
+        continue;
+      }
+      if (consumed.has(segment)) continue;
+      if (segment.accent && segment.accentBase >= 0 && selectedSegmentIndices.has(segment.accentBase)) continue;
+      if (rootUnits.has(segment)) {
+        units.push(rootUnits.get(segment));
+        consumed.add(segment);
+        continue;
+      }
+      if (segment.script && segment.scriptBase >= 0 && selectedSegmentIndices.has(segment.scriptBase)) {
+        continue;
+      }
+      units.push(makeOrdinaryUnit(segment));
+      consumed.add(segment);
+    }
+    units.sort((left, right) => left.x - right.x);
+    return units;
+  }
+
+  function trustedPdfViewerPayload(ranges, settings, documentObject) {
+    if (!ranges.length || ranges.length > MAX_SELECTION_RANGES) return null;
+    let trustedRoot = null;
+    for (const range of ranges) {
+      const startRoot = trustedPdfRootForNode(range.startContainer);
+      const endRoot = trustedPdfRootForNode(range.endContainer);
+      if (!startRoot || startRoot !== endRoot || (trustedRoot && trustedRoot !== startRoot)) return null;
+      trustedRoot = startRoot;
+    }
+    if (!trustedRoot || !trustedRoot.querySelectorAll) return null;
+    const pages = [];
+    for (const page of trustedRoot.querySelectorAll('[data-cmc-pdf-page]')) {
+      if (!ranges.some((range) => rangeIntersects(range, page))) continue;
+      pages.push(page);
+      if (pages.length > MAX_PDF_SELECTED_PAGES) return PDF_VIEWER_INCOMPLETE;
+    }
+    if (!pages.length) return null;
+
+    const selected = [];
+    for (const page of pages) {
+      // A DOM Range can cross lazily-rendered placeholder pages. Rewriting
+      // only the pages whose text layers happen to be ready would silently
+      // delete part of the selection, so leave that copy to the browser.
+      if (page.getAttribute('data-cmc-pdf-text-ready') !== '1') return PDF_VIEWER_INCOMPLETE;
+      const pageNumber = Number(page.getAttribute('data-cmc-pdf-page')) || 0;
+      const normalLineGap = Number(page.getAttribute('data-cmc-pdf-line-gap')) || 0;
+      const tokens = page.querySelectorAll('[data-cmc-pdf-item]');
+      if (selected.length + tokens.length > MAX_PDF_SELECTED_ITEMS) return PDF_VIEWER_INCOMPLETE;
+      for (const token of tokens) {
+        for (const range of ranges) {
+          const slice = selectedPdfTokenSlice(range, token, documentObject);
+          if (!slice) continue;
+          selected.push({
+            ...slice,
+            page: pageNumber,
+            normalLineGap,
+            index: Number(token.getAttribute('data-cmc-pdf-item')) || 0,
+            line: Number(token.getAttribute('data-cmc-pdf-line')) || 0,
+            lineY: Number(token.getAttribute('data-cmc-pdf-line-y')) || 0,
+            x: Number(token.getAttribute('data-cmc-pdf-x')) || 0,
+            width: Number(token.getAttribute('data-cmc-pdf-width')) || 0,
+            size: Number(token.getAttribute('data-cmc-pdf-size')) || 1,
+            math: token.getAttribute('data-cmc-pdf-math') === '1',
+            mathGroup: token.getAttribute('data-cmc-pdf-math-group') ||
+              (token.getAttribute('data-cmc-pdf-math') === '1' ? 'line-math' : ''),
+            displayMath: token.getAttribute('data-cmc-pdf-display-math') === '1',
+            semantic: token.getAttribute('data-cmc-pdf-semantic') || '',
+            accent: token.getAttribute('data-cmc-pdf-accent') || '',
+            accentBase: Number(token.getAttribute('data-cmc-pdf-accent-base')),
+            script: token.getAttribute('data-cmc-pdf-script') || '',
+            scriptBase: Number(token.getAttribute('data-cmc-pdf-script-base')),
+            radical: token.getAttribute('data-cmc-pdf-radical') || '',
+            radicalChars: Number(token.getAttribute('data-cmc-pdf-radical-chars')) || 0,
+            radicalEndX: Number(token.getAttribute('data-cmc-pdf-radical-end')),
+            fraction: token.getAttribute('data-cmc-pdf-fraction') || '',
+            fractionRole: token.getAttribute('data-cmc-pdf-fraction-role') || '',
+            fractionX1: Number(token.getAttribute('data-cmc-pdf-fraction-x1')),
+            fractionX2: Number(token.getAttribute('data-cmc-pdf-fraction-x2'))
+          });
+          break;
+        }
+      }
+    }
+    if (!selected.length) return PDF_VIEWER_INCOMPLETE;
+    selected.sort((left, right) => left.page - right.page || left.index - right.index || left.start - right.start);
+    const lineGroups = [];
+    for (const item of selected) {
+      let group = lineGroups[lineGroups.length - 1];
+      if (!group || group.page !== item.page || group.line !== item.line) {
+        group = { page: item.page, line: item.line, y: item.lineY, gap: item.normalLineGap,
+          math: item.math, displayMath: item.displayMath, items: [] };
+        lineGroups.push(group);
+      }
+      group.items.push(item);
+      group.math = group.math || item.math;
+      group.displayMath = group.displayMath || item.displayMath;
+    }
+
+    const lines = lineGroups.map((group) => {
+      const units = pdfLineUnits(group.items, settings.outputMode);
+      const runs = [];
+      for (const unit of units) {
+        const mathGroup = unit.mathGroup || '';
+        let run = runs[runs.length - 1];
+        if (!run || run.mathGroup !== mathGroup) {
+          run = { mathGroup, units: [] };
+          runs.push(run);
+        }
+        run.units.push(unit);
+      }
+      let text = '';
+      let previousLast = null;
+      for (const run of runs) {
+        const isMath = Boolean(run.mathGroup);
+        const faithful = joinPdfUnits(run.units, 'faithful', isMath);
+        let value = faithful;
+        if (isMath && settings.outputMode === 'calculator') value = unicodeToCalculator(faithful);
+        else if (isMath && settings.outputMode === 'latex') {
+          const latex = joinPdfUnits(run.units, 'latex', true)
+            .replace(/\\([A-Za-z]+)\s+(?=[}\]^_])/g, '\\$1');
+          value = latex ? '$' + latex + '$' : '';
+        }
+        if (!value) continue;
+        const first = run.units[0];
+        if (previousLast) text += pdfUnitSpacing(previousLast, first, isMath || Boolean(previousLast.mathGroup));
+        text += value;
+        previousLast = run.units[run.units.length - 1];
+      }
+      return { ...group, text: finalizeRewrittenText(text) };
+    }).filter((line) => line.text);
+    if (!lines.length) return PDF_VIEWER_INCOMPLETE;
+
+    let text = lines[0].text;
+    for (let index = 1; index < lines.length; index += 1) {
+      const previous = lines[index - 1];
+      const current = lines[index];
+      const visualGap = Math.abs(previous.y - current.y);
+      const paragraphBreak = previous.displayMath !== current.displayMath ||
+        (current.gap > 0 && visualGap > current.gap * 1.42);
+      text += paragraphBreak ? '\n\n' : ' ';
+      text += current.text;
+    }
+    text = finalizeRewrittenText(text);
+    if (!text) return null;
+    return {
+      text,
+      html: semanticTextClipboardHTML(text, settings.outputMode),
+      mathML: '',
+      reason: 'trusted-pdf-text-layer',
+      mathRanges: lines.filter((line) => line.math).length
+    };
+  }
+
   function isTextControl(target) {
     if (!target || target.nodeType !== 1) return false;
     const tag = (target.localName || '').toLowerCase();
@@ -9838,7 +10596,7 @@
     return false;
   }
 
-  function getCopyPayload(documentObject, selection, settingsInput, pageWindow, target) {
+  function getCopyPayload(documentObject, selection, settingsInput, pageWindow, target, allowDeferredPdf) {
     const settings = normalizeSettings(settingsInput);
     // Native mode is a hard opt-out. Do not even inspect the selection: sites
     // can expose stateful ranges or clipboard projections, and the contract of
@@ -9849,6 +10607,13 @@
     if (rangeCount <= 0) return null;
     const ranges = selectionRanges(documentObject, selection, rangeCount);
     if (!ranges.length) return null;
+    const pdfViewer = trustedPdfViewerPayload(ranges, settings, documentObject);
+    if (pdfViewer === PDF_VIEWER_INCOMPLETE) {
+      if (!allowDeferredPdf) return null;
+      const root = trustedPdfRootForNode(ranges[0].startContainer);
+      return root ? { deferredPdf: true, root, ranges: ranges.map((range) => range.cloneRange()) } : null;
+    }
+    if (pdfViewer) return pdfViewer;
     const positioned = positionedOfficePayload(ranges, settings, documentObject, true);
     if (positioned === POSITIONED_OVER_BUDGET) return null;
     if (positioned) return positioned;
@@ -9911,6 +10676,869 @@
     const ordinary = ordinarySelectionPayload(documentObject, selection, pageWindow, target, ranges);
     if (ordinary) return ordinary;
     return null;
+  }
+
+  function readUserscriptResourceText(name) {
+    try {
+      if (typeof GM_getResourceText === 'function') {
+        return Promise.resolve(GM_getResourceText(name)).then((value) => String(value || ''));
+      }
+    } catch (_error) {
+      // Try the modern API below.
+    }
+    try {
+      if (global.GM && typeof global.GM.getResourceText === 'function') {
+        return Promise.resolve(global.GM.getResourceText(name)).then((value) => String(value || ''));
+      }
+    } catch (_error) {
+      // Report a single useful bootstrap error below.
+    }
+    return Promise.reject(new Error('This userscript manager did not provide its bundled PDF resources.'));
+  }
+
+  function readUserscriptResourceUrl(name) {
+    try {
+      if (typeof GM_getResourceURL === 'function') {
+        return Promise.resolve(GM_getResourceURL(name)).then((value) => String(value || ''));
+      }
+    } catch (_error) {
+      // Try the modern API below.
+    }
+    try {
+      if (global.GM && typeof global.GM.getResourceUrl === 'function') {
+        return Promise.resolve(global.GM.getResourceUrl(name)).then((value) => String(value || ''));
+      }
+    } catch (_error) {
+      // A text-to-Blob fallback is used below.
+    }
+    return Promise.resolve('');
+  }
+
+  function userscriptModuleResource(name) {
+    return readUserscriptResourceUrl(name).then((url) => {
+      if (url) return { url, owned: false };
+      return readUserscriptResourceText(name).then((source) => {
+        if (!source) throw new Error('A bundled PDF resource is empty.');
+        return {
+          url: URL.createObjectURL(new Blob([source], { type: 'text/javascript' })),
+          owned: true
+        };
+      });
+    });
+  }
+
+  function isDirectPdfDocument(documentObject, pageWindow) {
+    // Content scripts are injected separately into PDF subframes. Treat each
+    // actual application/pdf document as its own viewer so embedded handouts
+    // work without forcing the user to open a new tab first.
+    return Boolean(documentObject &&
+      String(documentObject.contentType || '').toLowerCase() === 'application/pdf' &&
+      (pageWindow || documentObject.defaultView));
+  }
+
+  // The direct-PDF controller passes only bundled, integrity-pinned PDF.js and
+  // a root already authenticated by the controller's WeakSet. The renderer's
+  // DOM Range and copy handling therefore share the document being selected
+  // without weakening the trust boundary used by ordinary web pages.
+  function cleanMathCopyPdfViewerMain(rootId, pdfjs, workerUrl, analyzePage, bypassKey, loadPdfBytes, assetBaseUrl) {
+    'use strict';
+    const root = document.getElementById(rootId);
+    if (!root || !pdfjs || typeof pdfjs.getDocument !== 'function') return;
+    const sourceUrl = location.href.split('#')[0];
+    const packageBase = assetBaseUrl || 'https://cdn.jsdelivr.net/npm/pdfjs-dist@6.1.200/';
+    const localAssetBundle = /^(?:chrome|moz)-extension:/i.test(packageBase);
+    const MAX_PDF_PAGES = 5000;
+    const MAX_CANVAS_PIXELS = 8000000;
+    const MAX_CANVAS_DIMENSION = 16384;
+    const MAX_VIEWPORT_DIMENSION = 50000;
+    const MAX_OPERATOR_STEPS = 250000;
+    const MAX_SEARCH_CACHE_CHARACTERS = 32 * 1024 * 1024;
+    const CANVAS_CACHE_RADIUS = 4;
+    const MAX_TEXT_LAYER_PAGES = 96;
+    const create = (tag, className, text) => {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      if (text != null) element.textContent = text;
+      return element;
+    };
+    const button = (label, title, handler) => {
+      const element = create('button', 'cmc-pdf-button', label);
+      element.type = 'button';
+      element.title = title;
+      element.addEventListener('click', handler);
+      return element;
+    };
+    const openBrowserViewer = () => {
+      try { sessionStorage.setItem(bypassKey, sourceUrl); } catch (_error) { /* ignore */ }
+      location.reload();
+    };
+    const fail = (error) => {
+      root.hidden = false;
+      root.replaceChildren();
+      const panel = create('main', 'cmc-pdf-error');
+      panel.appendChild(create('h1', '', 'Clean Math Copy could not open this PDF'));
+      panel.appendChild(create('p', '', String(error && error.message || error || 'Unknown PDF error')));
+      panel.appendChild(button('Open browser viewer', 'Return to the built-in PDF viewer', openBrowserViewer));
+      root.appendChild(panel);
+    };
+
+    try {
+      const style = create('style');
+      style.textContent = `
+        :root { color-scheme: light dark; }
+        html, body { width:100%; height:100%; margin:0; overflow:hidden; }
+        body { background:#4a4d50; font:14px/1.35 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+        .cmc-pdf-viewer-root { width:100%; height:100%; color:#f5f5f5; background:#4a4d50; }
+        .cmc-pdf-toolbar { height:48px; box-sizing:border-box; display:flex; align-items:center; gap:7px;
+          padding:6px 10px; background:#252627; border-bottom:1px solid #111; box-shadow:0 1px 5px #0008;
+          position:relative; z-index:20; white-space:nowrap; }
+        .cmc-pdf-title { min-width:90px; max-width:28vw; overflow:hidden; text-overflow:ellipsis; font-weight:600; margin-right:auto; }
+        .cmc-pdf-button, .cmc-pdf-input { color:#f5f5f5; background:#3a3c3e; border:1px solid #626568;
+          border-radius:5px; min-height:30px; box-sizing:border-box; font:inherit; }
+        .cmc-pdf-button { padding:4px 9px; cursor:pointer; }
+        .cmc-pdf-button:hover, .cmc-pdf-button:focus-visible { background:#505356; border-color:#9ba0a4; }
+        .cmc-pdf-input { width:55px; padding:3px 5px; text-align:center; }
+        .cmc-pdf-search { width:min(230px,20vw); text-align:left; }
+        .cmc-pdf-status { min-width:74px; color:#d9dcdf; font-variant-numeric:tabular-nums; }
+        .cmc-pdf-pages { height:calc(100% - 48px); overflow:auto; padding:22px 20px 70vh; box-sizing:border-box;
+          overflow-anchor:none; }
+        .cmc-pdf-page { position:relative; margin:0 auto 22px; background:white; box-shadow:0 2px 12px #000a;
+          overflow:hidden; user-select:text; }
+        .cmc-pdf-page canvas { position:absolute; inset:0; display:block; user-select:none; }
+        .cmc-pdf-text-layer { position:absolute; inset:0; overflow:clip; opacity:1; line-height:1;
+          text-size-adjust:none; forced-color-adjust:none; transform-origin:0 0; caret-color:CanvasText; z-index:2; }
+        .cmc-pdf-text-layer :is(span,br) { color:transparent; position:absolute; white-space:pre; cursor:text;
+          transform-origin:0 0; margin:0; padding:0; }
+        .cmc-pdf-text-layer > :not(.markedContent), .cmc-pdf-text-layer .markedContent span:not(.markedContent) {
+          z-index:1; font-size:calc(var(--text-scale-factor) * var(--font-height));
+          transform:rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv)); }
+        .cmc-pdf-text-layer { --text-scale-factor:calc(var(--total-scale-factor) * var(--min-font-size));
+          --min-font-size-inv:calc(1 / var(--min-font-size)); }
+        .cmc-pdf-text-layer span::selection { color:transparent; background:rgba(0,98,255,.34); }
+        .cmc-pdf-text-layer br::selection { background:transparent; }
+        .cmc-pdf-page-number { position:absolute; right:7px; bottom:5px; z-index:3; color:#555; background:#fffB;
+          border-radius:3px; padding:1px 4px; font-size:11px; user-select:none; pointer-events:none; }
+        .cmc-pdf-loading { position:fixed; inset:48px 0 0; display:grid; place-items:center; z-index:30;
+          color:#fff; background:#4a4d50; font-size:16px; }
+        .cmc-pdf-loading[hidden] { display:none; }
+        .cmc-pdf-error { max-width:620px; margin:14vh auto; padding:28px; color:#222; background:#fff;
+          border-radius:10px; box-shadow:0 4px 24px #0008; }
+        @media (max-width:760px) { .cmc-pdf-title, .cmc-pdf-search-controls { display:none; }
+          .cmc-pdf-toolbar { gap:4px; padding-inline:5px; } .cmc-pdf-button { padding-inline:7px; }
+          .cmc-pdf-pages { padding-inline:6px; } }
+        @media print { html,body,.cmc-pdf-viewer-root,.cmc-pdf-pages { height:auto; overflow:visible; background:white; }
+          .cmc-pdf-toolbar,.cmc-pdf-page-number,.cmc-pdf-loading { display:none!important; }
+          .cmc-pdf-pages { padding:0; } .cmc-pdf-page { box-shadow:none; margin:0; break-after:page; } }
+      `;
+      (document.head || document.documentElement).appendChild(style);
+      if (!document.body) document.documentElement.appendChild(document.createElement('body'));
+      for (const child of Array.from(document.body.children)) if (child !== root) child.remove();
+      root.className = 'cmc-pdf-viewer-root';
+      root.hidden = false;
+      root.replaceChildren();
+
+      const toolbar = create('header', 'cmc-pdf-toolbar');
+      const filename = (() => {
+        try { return decodeURIComponent(new URL(sourceUrl).pathname.split('/').pop() || 'PDF'); }
+        catch (_error) { return 'PDF'; }
+      })();
+      toolbar.appendChild(create('div', 'cmc-pdf-title', filename));
+      const previousPage = button('‹', 'Previous page', () => goToPage(currentPage - 1));
+      const pageInput = create('input', 'cmc-pdf-input');
+      pageInput.type = 'number'; pageInput.min = '1'; pageInput.value = '1'; pageInput.setAttribute('aria-label', 'Page number');
+      const pageTotal = create('span', 'cmc-pdf-status', '/ …');
+      const nextPage = button('›', 'Next page', () => goToPage(currentPage + 1));
+      toolbar.append(previousPage, pageInput, pageTotal, nextPage);
+      toolbar.appendChild(button('−', 'Zoom out', () => setScale(scale / 1.15)));
+      const zoomLabel = create('span', 'cmc-pdf-status', '100%');
+      toolbar.appendChild(zoomLabel);
+      toolbar.appendChild(button('+', 'Zoom in', () => setScale(scale * 1.15)));
+      toolbar.appendChild(button('Fit', 'Fit page width', () => fitWidth()));
+      const searchControls = create('span', 'cmc-pdf-search-controls');
+      const searchInput = create('input', 'cmc-pdf-input cmc-pdf-search');
+      searchInput.type = 'search'; searchInput.placeholder = 'Find in document'; searchInput.setAttribute('aria-label', 'Find in PDF');
+      const searchStatus = create('span', 'cmc-pdf-status', '');
+      searchControls.append(searchInput,
+        button('↑', 'Previous search result', () => moveSearch(-1)),
+        button('↓', 'Next search result', () => moveSearch(1)), searchStatus);
+      toolbar.appendChild(searchControls);
+      const download = create('a', 'cmc-pdf-button', 'Download');
+      download.href = sourceUrl; download.download = filename; download.title = 'Download original PDF';
+      toolbar.appendChild(download);
+      toolbar.appendChild(button('Browser viewer', 'Use the browser\'s original PDF viewer once', openBrowserViewer));
+      const pagesHost = create('main', 'cmc-pdf-pages');
+      pagesHost.setAttribute('aria-label', 'PDF document');
+      const loading = create('div', 'cmc-pdf-loading', 'Opening PDF…');
+      root.append(toolbar, pagesHost, loading);
+
+      pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+      const loadingOptions = {
+        cMapUrl: packageBase + 'cmaps/',
+        cMapPacked: true,
+        standardFontDataUrl: packageBase + 'standard_fonts/',
+        iccUrl: packageBase + 'iccs/',
+        useWasm: localAssetBundle,
+        enableScripting: false,
+        isEvalSupported: false,
+        fontExtraProperties: true
+      };
+      if (localAssetBundle) loadingOptions.wasmUrl = packageBase + 'wasm/';
+      let loadingTask = null;
+      const createLoadingTask = (source) => {
+        const task = pdfjs.getDocument({ ...loadingOptions, ...source });
+        task.onProgress = (progress) => {
+          if (!progress || !progress.total) return;
+          loading.textContent = 'Opening PDF… ' + Math.min(100, Math.round(progress.loaded * 100 / progress.total)) + '%';
+        };
+        task.onPassword = (updatePassword, reason) => {
+          const value = prompt(reason === pdfjs.PasswordResponses.INCORRECT_PASSWORD
+            ? 'Incorrect password. Enter the PDF password:'
+            : 'Enter the PDF password:');
+          if (value == null) task.destroy();
+          else updatePassword(value);
+        };
+        return task;
+      };
+      loadingTask = createLoadingTask({ url: sourceUrl });
+
+      let pdfDocument = null;
+      let scale = 1;
+      let baseWidth = 612;
+      let baseHeight = 792;
+      let currentPage = 1;
+      let renderGeneration = 0;
+      let observer = null;
+      let renderUseSerial = 0;
+      const states = [];
+      const searchTexts = [];
+      let searchMatches = [];
+      let searchIndex = -1;
+
+      const matrixMultiply = (left, right) => [
+        left[0] * right[0] + left[2] * right[1],
+        left[1] * right[0] + left[3] * right[1],
+        left[0] * right[2] + left[2] * right[3],
+        left[1] * right[2] + left[3] * right[3],
+        left[0] * right[4] + left[2] * right[5] + left[4],
+        left[1] * right[4] + left[3] * right[5] + left[5]
+      ];
+      const transformPoint = (matrix, x, y) => ({
+        x: matrix[0] * x + matrix[2] * y + matrix[4],
+        y: matrix[1] * x + matrix[3] * y + matrix[5]
+      });
+      const radicalRulesFromOperatorList = (operatorList) => {
+        const rules = [];
+        let matrix = [1, 0, 0, 1, 0, 0];
+        const stack = [];
+        const fnArray = operatorList && operatorList.fnArray || [];
+        const argsArray = operatorList && operatorList.argsArray || [];
+        if (fnArray.length > MAX_OPERATOR_STEPS || argsArray.length > MAX_OPERATOR_STEPS) {
+          throw new Error('This PDF page has too much drawing geometry to analyze safely.');
+        }
+        let pathSteps = 0;
+        for (let index = 0; index < fnArray.length; index += 1) {
+          const fn = fnArray[index];
+          const args = argsArray[index] || [];
+          if (fn === pdfjs.OPS.save) { stack.push(matrix.slice()); continue; }
+          if (fn === pdfjs.OPS.restore) { if (stack.length) matrix = stack.pop(); continue; }
+          if (fn === pdfjs.OPS.transform) { matrix = matrixMultiply(matrix, Array.from(args)); continue; }
+          if (fn !== pdfjs.OPS.constructPath || args[0] !== pdfjs.OPS.stroke) continue;
+          const encodedPath = args[1];
+          const pathSource = Array.isArray(encodedPath) && encodedPath.length === 1 &&
+            ArrayBuffer.isView(encodedPath[0]) ? encodedPath[0] : (encodedPath || []);
+          if (!pathSource || Number(pathSource.length) + pathSteps > MAX_OPERATOR_STEPS) {
+            throw new Error('This PDF page has too much path geometry to analyze safely.');
+          }
+          const path = Array.from(pathSource);
+          let cursor = 0;
+          let point = null;
+          while (cursor < path.length) {
+            pathSteps += 1;
+            if (pathSteps > MAX_OPERATOR_STEPS) {
+              throw new Error('This PDF page has too much path geometry to analyze safely.');
+            }
+            const operation = path[cursor++];
+            if (operation === 0 || operation === 1) {
+              if (cursor + 1 >= path.length) break;
+              const next = transformPoint(matrix, Number(path[cursor++]), Number(path[cursor++]));
+              if (operation === 1 && point && Math.abs(next.y - point.y) < 0.08 && Math.abs(next.x - point.x) > 0.5) {
+                rules.push({ x1: point.x, x2: next.x, y: (point.y + next.y) / 2 });
+                if (rules.length > MAX_PDF_GEOMETRY_RULES) {
+                  throw new Error('This PDF page has too many layout rules to analyze safely.');
+                }
+              }
+              point = next;
+            } else if (operation === 2) cursor += 6;
+            else if (operation === 3) cursor += 4;
+            else if (operation !== 4) break;
+          }
+        }
+        return rules;
+      };
+
+      const setPageDimensions = (state, viewport) => {
+        if (!viewport || !Number.isFinite(viewport.width) || !Number.isFinite(viewport.height) ||
+            !Number.isFinite(viewport.scale) || viewport.width <= 0 || viewport.height <= 0 ||
+            viewport.width > MAX_VIEWPORT_DIMENSION || viewport.height > MAX_VIEWPORT_DIMENSION) {
+          throw new Error('This PDF page has invalid or unsupported dimensions.');
+        }
+        state.element.style.width = viewport.width + 'px';
+        state.element.style.height = viewport.height + 'px';
+        state.element.style.setProperty('--scale-factor', String(viewport.scale));
+        state.element.style.setProperty('--user-unit', '1');
+        state.element.style.setProperty('--total-scale-factor', String(viewport.scale));
+        state.element.style.setProperty('--scale-round-x', '1px');
+        state.element.style.setProperty('--scale-round-y', '1px');
+      };
+      const radicalCharacterCount = (span, item, viewport, state) => {
+        if (!item.radical || item.semantic === 'root' || !Number.isFinite(item.radicalEndX)) return 0;
+        if (item.x >= item.radicalEndX - item.size * 0.04) return 0;
+        if (item.x + item.width <= item.radicalEndX + item.size * 0.06) return item.text.length;
+        const textNode = span.firstChild;
+        if (textNode && textNode.nodeType === 3 && document.createRange) {
+          try {
+            const pageRect = state.element.getBoundingClientRect();
+            const viewportEnd = viewport.convertToViewportPoint(item.radicalEndX, item.y)[0];
+            const target = pageRect.left + viewportEnd;
+            const range = document.createRange();
+            let count = 0;
+            let boundaries = [];
+            try {
+              if (typeof Intl.Segmenter === 'function') {
+                const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+                boundaries = Array.from(segmenter.segment(textNode.data), (entry) => entry.index + entry.segment.length);
+              }
+            } catch (_error) { boundaries = []; }
+            if (!boundaries.length) {
+              let offset = 0;
+              for (const character of Array.from(textNode.data)) {
+                offset += character.length;
+                if (offset === textNode.length || !/^[\p{M}\u200d\ufe0e\ufe0f]/u.test(textNode.data.slice(offset))) {
+                  boundaries.push(offset);
+                }
+              }
+            }
+            for (const offset of boundaries) {
+              range.setStart(textNode, 0); range.setEnd(textNode, offset);
+              const rect = range.getBoundingClientRect();
+              if (rect.right <= target + Math.max(0.8, viewport.scale * 0.35)) count = offset;
+              else break;
+            }
+            if (count) return count;
+          } catch (_error) { /* use geometric fallback */ }
+        }
+        const fraction = Math.max(0, Math.min(1, (item.radicalEndX - item.x) / Math.max(item.width, 0.01)));
+        return Math.max(0, Math.min(item.text.length, Math.ceil(fraction * item.text.length - 0.12)));
+      };
+
+      const releaseCanvas = (state) => {
+        if (!state || !state.canvasReady || state.rendering) return;
+        state.canvas.width = 1;
+        state.canvas.height = 1;
+        state.canvasReady = false;
+      };
+      const evictDistantCanvases = (centerPage) => {
+        for (const state of states) {
+          if (Math.abs(state.number - centerPage) > CANVAS_CACHE_RADIUS) releaseCanvas(state);
+        }
+      };
+      const evictOldTextLayers = () => {
+        const ready = states.filter((state) => state.textReady);
+        if (ready.length <= MAX_TEXT_LAYER_PAGES) return;
+        const removable = ready.filter((state) => !state.selectionPinned && !state.rendering)
+          .sort((left, right) => left.lastUsed - right.lastUsed);
+        let excess = ready.length - MAX_TEXT_LAYER_PAGES;
+        for (const state of removable) {
+          if (excess <= 0) break;
+          state.textReady = false;
+          state.textLayer.replaceChildren();
+          state.element.removeAttribute('data-cmc-pdf-text-ready');
+          state.element.removeAttribute('data-cmc-pdf-line-gap');
+          excess -= 1;
+        }
+      };
+
+      const renderPage = (pageNumber, force, textOnly) => {
+        const state = states[pageNumber - 1];
+        if (!state) return Promise.resolve();
+        if (state.rendering) {
+          if (state.renderPromise) {
+            const requestedGeneration = renderGeneration;
+            return state.renderPromise.then(
+              () => requestedGeneration === renderGeneration ? renderPage(pageNumber, force, textOnly) : undefined,
+              () => requestedGeneration === renderGeneration ? renderPage(pageNumber, force, textOnly) : undefined
+            );
+          }
+          return Promise.resolve();
+        }
+        if (!force && state.textReady && (textOnly || state.canvasReady)) return Promise.resolve();
+        state.rendering = true;
+        const generation = renderGeneration;
+        const invocation = {};
+        state.renderInvocation = invocation;
+        const operation = (async () => {
+          try {
+          const page = await pdfDocument.getPage(pageNumber);
+          const viewport = page.getViewport({ scale });
+          setPageDimensions(state, viewport);
+          if (!textOnly && (force || !state.canvasReady)) {
+            const pagePixels = Math.max(1, viewport.width * viewport.height);
+            const deviceRatio = Math.max(Number.EPSILON, Number(devicePixelRatio) || 1);
+            const pixelRatio = Math.min(
+              2,
+              deviceRatio,
+              Math.sqrt(MAX_CANVAS_PIXELS / pagePixels),
+              MAX_CANVAS_DIMENSION / Math.max(1, viewport.width),
+              MAX_CANVAS_DIMENSION / Math.max(1, viewport.height)
+            );
+            if (!Number.isFinite(pixelRatio) || pixelRatio <= 0) {
+              throw new Error('This PDF page cannot be rasterized safely.');
+            }
+            const canvasWidth = Math.max(1, Math.floor(viewport.width * pixelRatio));
+            const canvasHeight = Math.max(1, Math.floor(viewport.height * pixelRatio));
+            if (canvasWidth > MAX_CANVAS_DIMENSION || canvasHeight > MAX_CANVAS_DIMENSION ||
+                canvasWidth * canvasHeight > MAX_CANVAS_PIXELS) {
+              throw new Error('This PDF page is too large to rasterize safely.');
+            }
+            state.canvas.width = canvasWidth;
+            state.canvas.height = canvasHeight;
+            state.canvas.style.width = viewport.width + 'px';
+            state.canvas.style.height = viewport.height + 'px';
+            const context = state.canvas.getContext('2d', { alpha: false });
+            const renderTask = page.render({
+              canvasContext: context,
+              viewport,
+              transform: Math.abs(pixelRatio - 1) < 0.001 ? null : [pixelRatio, 0, 0, pixelRatio, 0, 0]
+            });
+            state.renderTask = renderTask;
+            await renderTask.promise;
+            if (generation !== renderGeneration) return;
+            state.canvasReady = true;
+          }
+          if (force || !state.textReady) {
+            const [textContent, operatorList] = await Promise.all([
+              page.getTextContent({ includeMarkedContent: false }), page.getOperatorList()
+            ]);
+            if (generation !== renderGeneration) return;
+            if (!textContent || !Array.isArray(textContent.items) ||
+                textContent.items.length > MAX_PDF_PAGE_ITEMS) {
+              throw new Error('This PDF page has too many text items to analyze safely.');
+            }
+            let textCharacters = 0;
+            for (const item of textContent.items) {
+              textCharacters += String(item && item.str || '').length;
+              if (textCharacters > MAX_PDF_PAGE_CHARACTERS) {
+                throw new Error('This PDF page contains too much text to analyze safely.');
+              }
+            }
+            searchTexts[pageNumber - 1] = textContent.items.map((item) => item.str || '').join(' ');
+            const fontRecords = Object.create(null);
+            for (const item of textContent.items) {
+              if (!item.fontName || Object.prototype.hasOwnProperty.call(fontRecords, item.fontName)) continue;
+              try {
+                const font = page.commonObjs.get(item.fontName);
+                fontRecords[item.fontName] = {
+                  name: font && font.name || '', loadedName: font && font.loadedName || ''
+                };
+              } catch (_error) { fontRecords[item.fontName] = {}; }
+            }
+            const analysis = analyzePage(
+              textContent.items, textContent.styles, fontRecords, radicalRulesFromOperatorList(operatorList)
+            );
+            if (!analysis || analysis.overBudget) {
+              throw new Error('This PDF page is too complex to analyze safely.');
+            }
+            state.textLayer.replaceChildren();
+            const textLayer = new pdfjs.TextLayer({
+              textContentSource: textContent,
+              container: state.textLayer,
+              viewport
+            });
+            state.textLayerTask = textLayer;
+            await textLayer.render();
+            if (generation !== renderGeneration) return;
+            state.element.setAttribute('data-cmc-pdf-line-gap', String(analysis.normalLineGap || 0));
+            const linesById = new Map(analysis.lines.map((line) => [line.id, line]));
+            for (let index = 0; index < analysis.items.length; index += 1) {
+              const item = analysis.items[index];
+              const span = textLayer.textDivs[index];
+              if (!span || !span.isConnected || !item.text || /^\s+$/u.test(item.text)) continue;
+              const line = linesById.get(item.line);
+              span.setAttribute('data-cmc-pdf-item', String(item.index));
+              span.setAttribute('data-cmc-pdf-line', String(item.line));
+              span.setAttribute('data-cmc-pdf-line-y', String(line ? line.y : item.effectiveY));
+              span.setAttribute('data-cmc-pdf-x', String(item.x));
+              span.setAttribute('data-cmc-pdf-width', String(item.width));
+              span.setAttribute('data-cmc-pdf-size', String(item.size));
+              if (item.math) span.setAttribute('data-cmc-pdf-math', '1');
+              if (item.mathGroup) span.setAttribute('data-cmc-pdf-math-group', item.mathGroup);
+              if (item.displayMath) span.setAttribute('data-cmc-pdf-display-math', '1');
+              if (item.semantic) span.setAttribute('data-cmc-pdf-semantic', item.semantic);
+              if (item.accent) {
+                span.setAttribute('data-cmc-pdf-accent', item.accent);
+                span.setAttribute('data-cmc-pdf-accent-base', String(item.accentBase));
+              }
+              if (item.script) {
+                span.setAttribute('data-cmc-pdf-script', item.script);
+                span.setAttribute('data-cmc-pdf-script-base', String(item.scriptBase));
+              }
+              if (item.radical) {
+                span.setAttribute('data-cmc-pdf-radical', item.radical);
+                span.setAttribute('data-cmc-pdf-radical-end', String(item.radicalEndX));
+                span.setAttribute('data-cmc-pdf-radical-chars', String(radicalCharacterCount(span, item, viewport, state)));
+              }
+              if (item.fraction) {
+                span.setAttribute('data-cmc-pdf-fraction', item.fraction);
+                span.setAttribute('data-cmc-pdf-fraction-role', item.fractionRole);
+                span.setAttribute('data-cmc-pdf-fraction-x1', String(item.fractionX1));
+                span.setAttribute('data-cmc-pdf-fraction-x2', String(item.fractionX2));
+              }
+            }
+            state.textReady = true;
+            state.lastUsed = ++renderUseSerial;
+            state.element.setAttribute('data-cmc-pdf-text-ready', '1');
+          }
+          evictDistantCanvases(currentPage);
+          evictOldTextLayers();
+          } catch (error) {
+            if (!error || error.name !== 'RenderingCancelledException') {
+              state.element.setAttribute('data-cmc-pdf-render-error', '1');
+            }
+          } finally {
+            if (state.renderInvocation === invocation) {
+              state.rendering = false;
+              state.renderTask = null;
+              state.textLayerTask = null;
+              state.renderPromise = null;
+            }
+          }
+        })();
+        state.renderPromise = operation;
+        return operation;
+      };
+
+      const goToPage = (pageNumber) => {
+        if (!pdfDocument) return;
+        const normalized = Math.max(1, Math.min(pdfDocument.numPages, Number(pageNumber) || 1));
+        currentPage = normalized;
+        pageInput.value = String(normalized);
+        renderPage(normalized);
+        states[normalized - 1].element.scrollIntoView({ block: 'start', behavior: 'auto' });
+      };
+      const setScale = (nextScale) => {
+        if (!pdfDocument) return;
+        const normalized = Math.max(0.35, Math.min(3, Number(nextScale) || 1));
+        if (Math.abs(normalized - scale) < 0.001) return;
+        scale = normalized;
+        zoomLabel.textContent = Math.round(scale * 100) + '%';
+        renderGeneration += 1;
+        const scaleGeneration = renderGeneration;
+        for (const state of states) {
+          if (state.renderTask && typeof state.renderTask.cancel === 'function') {
+            try { state.renderTask.cancel(); } catch (_error) { /* ignore */ }
+          }
+          if (state.textLayerTask && typeof state.textLayerTask.cancel === 'function') {
+            try { state.textLayerTask.cancel(); } catch (_error) { /* ignore */ }
+          }
+          state.canvasReady = false;
+          state.textReady = false;
+          state.element.removeAttribute('data-cmc-pdf-text-ready');
+          const resetAtNewScale = () => {
+            if (scaleGeneration !== renderGeneration) return;
+            state.canvas.width = 1;
+            state.canvas.height = 1;
+            state.textLayer.replaceChildren();
+            setPageDimensions(state, { width: baseWidth * scale, height: baseHeight * scale, scale });
+            if (Math.abs(state.number - currentPage) <= 2) renderPage(state.number, true);
+          };
+          if (state.renderPromise) {
+            Promise.resolve(state.renderPromise).then(resetAtNewScale, resetAtNewScale);
+          } else resetAtNewScale();
+        }
+      };
+      const fitWidth = () => setScale(Math.max(0.35, (pagesHost.clientWidth - 32) / baseWidth));
+      const updateCurrentPage = () => {
+        const hostRect = pagesHost.getBoundingClientRect();
+        const hit = document.elementFromPoint(hostRect.left + Math.min(24, hostRect.width / 2), hostRect.top + 12);
+        const pageElement = hit && hit.closest ? hit.closest('[data-cmc-pdf-page]') : null;
+        const estimated = Math.round(pagesHost.scrollTop / Math.max(1, baseHeight * scale + 22)) + 1;
+        const best = pageElement
+          ? Number(pageElement.getAttribute('data-cmc-pdf-page')) || currentPage
+          : Math.max(1, Math.min(pdfDocument.numPages, estimated));
+        if (best !== currentPage) {
+          currentPage = best; pageInput.value = String(best);
+          evictDistantCanvases(currentPage);
+          try { history.replaceState(null, '', sourceUrl + '#page=' + best); } catch (_error) { /* ignore */ }
+        }
+      };
+      const searchDocument = async () => {
+        if (!pdfDocument) return;
+        const query = searchInput.value.trim().toLocaleLowerCase();
+        searchMatches = []; searchIndex = -1;
+        if (!query) { searchStatus.textContent = ''; return; }
+        searchStatus.textContent = 'Searching…';
+        let searchLimited = false;
+        let cachedCharacters = searchTexts.reduce((total, value) => total + String(value || '').length, 0);
+        for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
+          if (!searchTexts[pageNumber - 1]) {
+            const page = await pdfDocument.getPage(pageNumber);
+            const content = await page.getTextContent({ includeMarkedContent: false });
+            if (!content || !Array.isArray(content.items) || content.items.length > MAX_PDF_PAGE_ITEMS) {
+              searchLimited = true; break;
+            }
+            const pageText = content.items.map((item) => item.str || '').join(' ');
+            if (pageText.length > MAX_PDF_PAGE_CHARACTERS ||
+                cachedCharacters + pageText.length > MAX_SEARCH_CACHE_CHARACTERS) {
+              searchLimited = true; break;
+            }
+            searchTexts[pageNumber - 1] = pageText;
+            cachedCharacters += pageText.length;
+          }
+          const haystack = searchTexts[pageNumber - 1].toLocaleLowerCase();
+          let offset = 0;
+          while ((offset = haystack.indexOf(query, offset)) >= 0) {
+            searchMatches.push(pageNumber); offset += Math.max(1, query.length);
+            if (searchMatches.length >= 10000) break;
+          }
+          if (searchMatches.length >= 10000) break;
+        }
+        if (searchLimited) searchStatus.textContent = 'Search limit reached';
+        else if (!searchMatches.length) searchStatus.textContent = '0 results';
+        else { searchIndex = 0; searchStatus.textContent = '1 / ' + searchMatches.length; goToPage(searchMatches[0]); }
+      };
+      const moveSearch = (delta) => {
+        if (!searchMatches.length) { searchDocument(); return; }
+        searchIndex = (searchIndex + delta + searchMatches.length) % searchMatches.length;
+        searchStatus.textContent = (searchIndex + 1) + ' / ' + searchMatches.length;
+        goToPage(searchMatches[searchIndex]);
+      };
+      let selectionRenderPending = null;
+      const renderSelectedTextLayers = () => {
+        if (selectionRenderPending) return selectionRenderPending;
+        selectionRenderPending = (async () => {
+          const selection = document.getSelection ? document.getSelection() : null;
+          const ranges = [];
+          if (selection && !selection.isCollapsed) {
+            const count = Math.min(64, Number(selection.rangeCount) || 0);
+            for (let index = 0; index < count; index += 1) {
+              try { ranges.push(selection.getRangeAt(index)); } catch (_error) { break; }
+            }
+          }
+          const requested = states.filter((state) => ranges.some((range) => {
+            try { return range.intersectsNode(state.element); } catch (_error) { return false; }
+          }));
+          if (requested.length > 64) return;
+          for (const state of requested) state.selectionPinned = true;
+          const previousStatus = searchStatus.textContent;
+          try {
+            for (let index = 0; index < requested.length; index += 1) {
+              searchStatus.textContent = 'Preparing copy ' + (index + 1) + ' / ' + requested.length;
+              await renderPage(requested[index].number, false, true);
+            }
+          } finally {
+            searchStatus.textContent = previousStatus;
+          }
+        })().finally(() => {
+          selectionRenderPending = null;
+          try { root.dispatchEvent(new Event(PDF_SELECTION_READY_EVENT)); } catch (_error) { /* ignore */ }
+          for (const state of states) state.selectionPinned = false;
+          evictOldTextLayers();
+        });
+        return selectionRenderPending;
+      };
+      root.addEventListener(PDF_RENDER_SELECTION_EVENT, renderSelectedTextLayers, false);
+      pageInput.addEventListener('change', () => goToPage(pageInput.value));
+      searchInput.addEventListener('keydown', (event) => { if (event.key === 'Enter') searchDocument(); });
+      pagesHost.addEventListener('scroll', () => requestAnimationFrame(updateCurrentPage), { passive: true });
+      addEventListener('keydown', (event) => {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
+          event.preventDefault(); searchInput.focus(); searchInput.select();
+        } else if ((event.ctrlKey || event.metaKey) && ['+', '='].includes(event.key)) {
+          event.preventDefault(); setScale(scale * 1.15);
+        } else if ((event.ctrlKey || event.metaKey) && event.key === '-') {
+          event.preventDefault(); setScale(scale / 1.15);
+        } else if ((event.ctrlKey || event.metaKey) && event.key === '0') {
+          event.preventDefault(); fitWidth();
+        }
+      });
+
+      const openPdf = async () => {
+        try {
+          return await loadingTask.promise;
+        } catch (initialError) {
+          if (typeof loadPdfBytes !== 'function') throw initialError;
+          loading.textContent = 'Opening protected PDF…';
+          const bytes = await loadPdfBytes();
+          if (!bytes || !bytes.byteLength) throw initialError;
+          loadingTask = createLoadingTask({ data: new Uint8Array(bytes) });
+          return loadingTask.promise;
+        }
+      };
+      openPdf().then(async (loadedPdf) => {
+        pdfDocument = loadedPdf;
+        if (!Number.isSafeInteger(pdfDocument.numPages) || pdfDocument.numPages < 1 ||
+            pdfDocument.numPages > MAX_PDF_PAGES) {
+          throw new Error('This PDF has too many pages for the selectable viewer. Use the browser viewer instead.');
+        }
+        const firstPage = await pdfDocument.getPage(1);
+        const baseViewport = firstPage.getViewport({ scale: 1 });
+        baseWidth = baseViewport.width; baseHeight = baseViewport.height;
+        scale = Math.max(0.55, Math.min(1.75, (pagesHost.clientWidth - 34) / baseWidth));
+        zoomLabel.textContent = Math.round(scale * 100) + '%';
+        pageTotal.textContent = '/ ' + pdfDocument.numPages;
+        pageInput.max = String(pdfDocument.numPages);
+        for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
+          const element = create('section', 'cmc-pdf-page');
+          element.setAttribute('data-cmc-pdf-page', String(pageNumber));
+          element.setAttribute('aria-label', 'Page ' + pageNumber);
+          const canvas = create('canvas');
+          canvas.width = 1; canvas.height = 1;
+          const textLayer = create('div', 'cmc-pdf-text-layer');
+          const label = create('span', 'cmc-pdf-page-number', String(pageNumber));
+          element.append(canvas, textLayer, label);
+          const state = { number: pageNumber, element, canvas, textLayer, canvasReady: false, textReady: false, rendering: false,
+            renderTask: null, textLayerTask: null, renderPromise: null, renderInvocation: null,
+            lastUsed: 0, selectionPinned: false };
+          states.push(state); pagesHost.appendChild(element);
+          setPageDimensions(state, { width: baseWidth * scale, height: baseHeight * scale, scale });
+        }
+        if (typeof IntersectionObserver === 'function') {
+          observer = new IntersectionObserver((entries) => {
+            for (const entry of entries) if (entry.isIntersecting) {
+              const pageNumber = Number(entry.target.getAttribute('data-cmc-pdf-page')) || 1;
+              for (let near = Math.max(1, pageNumber - 1); near <= Math.min(pdfDocument.numPages, pageNumber + 1); near += 1) {
+                renderPage(near);
+              }
+            }
+          }, { root: pagesHost, rootMargin: '120% 0px', threshold: 0.01 });
+          for (const state of states) observer.observe(state.element);
+        }
+        const hashMatch = location.hash.match(/(?:^#|[&#])page=(\d+)/i);
+        currentPage = Math.max(1, Math.min(pdfDocument.numPages, hashMatch ? Number(hashMatch[1]) : 1));
+        pageInput.value = String(currentPage);
+        loading.hidden = true;
+        await Promise.all([
+          renderPage(currentPage),
+          currentPage > 1 ? renderPage(currentPage - 1) : Promise.resolve(),
+          currentPage < pdfDocument.numPages ? renderPage(currentPage + 1) : Promise.resolve()
+        ]);
+        states[currentPage - 1].element.scrollIntoView({ block: 'start' });
+      }).catch(fail);
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  function showPdfViewerBootstrapError(root, error) {
+    if (!root || !root.ownerDocument) return;
+    const documentObject = root.ownerDocument;
+    root.hidden = false;
+    root.textContent = '';
+    const panel = documentObject.createElement('main');
+    panel.style.cssText = 'max-width:640px;margin:12vh auto;padding:28px;background:white;color:#222;border-radius:10px;font:16px/1.45 system-ui';
+    const heading = documentObject.createElement('h1');
+    heading.textContent = 'Clean Math Copy could not open this PDF';
+    const detail = documentObject.createElement('p');
+    detail.textContent = String(error && error.message || error || 'Unknown PDF error');
+    panel.append(heading, detail);
+    root.appendChild(panel);
+  }
+
+  function startDirectPdfViewer(documentObject, pageWindow) {
+    if (!isDirectPdfDocument(documentObject, pageWindow)) return Promise.resolve(false);
+    if (documentObject.__cleanMathCopyPdfViewerRoot && documentObject.__cleanMathCopyPdfViewerRoot.isConnected) {
+      return Promise.resolve(true);
+    }
+    const sourceUrl = (() => {
+      try { return String(pageWindow.location.href || '').split('#')[0]; } catch (_error) { return ''; }
+    })();
+    try {
+      if (pageWindow.sessionStorage && pageWindow.sessionStorage.getItem(PDF_VIEWER_BYPASS_KEY) === sourceUrl) {
+        pageWindow.sessionStorage.removeItem(PDF_VIEWER_BYPASS_KEY);
+        documentObject.__cleanMathCopyPdfViewerBypassed = true;
+        return Promise.resolve(false);
+      }
+    } catch (_error) {
+      // Session storage is optional; the custom viewer still works without it.
+    }
+    let body = documentObject.body;
+    if (!body) {
+      body = documentObject.createElement('body');
+      documentObject.documentElement.appendChild(body);
+    }
+    const random = new Uint32Array(4);
+    try { (pageWindow.crypto || global.crypto).getRandomValues(random); }
+    catch (_error) { for (let index = 0; index < random.length; index += 1) random[index] = Math.random() * 0xffffffff; }
+    const root = documentObject.createElement('div');
+    root.id = 'clean-math-copy-pdf-' + Array.from(random, (value) => Math.floor(value).toString(36)).join('-');
+    root.hidden = true;
+    body.appendChild(root);
+    registerTrustedPdfViewerRoot(root);
+    try {
+      Object.defineProperty(documentObject, '__cleanMathCopyPdfViewerRoot', { value: root, configurable: true });
+    } catch (_error) {
+      documentObject.__cleanMathCopyPdfViewerRoot = root;
+    }
+
+    return Promise.all([
+      userscriptModuleResource(PDFJS_RESOURCE),
+      userscriptModuleResource(PDFJS_WORKER_RESOURCE)
+    ]).then(async ([apiResource, workerResource]) => {
+      const revokeOwnedResources = () => {
+        for (const resource of [apiResource, workerResource]) {
+          if (resource.owned) {
+            try { URL.revokeObjectURL(resource.url); } catch (_error) { /* ignore */ }
+          }
+        }
+      };
+      try { pageWindow.addEventListener('pagehide', revokeOwnedResources, { once: true }); }
+      catch (_error) { /* resources live until this document is discarded */ }
+      const apiImportUrl = (() => {
+        try {
+          const value = new URL(apiResource.url);
+          // Extension module caches can outlive a PDF document navigation.
+          // A per-document key prevents PDF.js state from the discarded
+          // viewer being reused when switching Native → Faithful.
+          value.searchParams.set('cleanMathCopyDocument', root.id);
+          return value.href;
+        } catch (_error) {
+          return apiResource.url + '#clean-math-copy-' + root.id;
+        }
+      })();
+      const pdfjs = await import(apiImportUrl);
+      if (!pdfjs || pdfjs.version !== '6.1.200' || typeof pdfjs.getDocument !== 'function') {
+        revokeOwnedResources();
+        throw new Error('The bundled PDF engine has an unexpected version.');
+      }
+      const loadPdfBytes = () => {
+        const fetchFunction = pageWindow && pageWindow.fetch;
+        if (typeof fetchFunction !== 'function') return Promise.reject(new Error('PDF bytes are unavailable.'));
+        return Promise.resolve(Reflect.apply(fetchFunction, pageWindow, [sourceUrl, { credentials: 'include' }]))
+          .then((response) => {
+            if (!response || !response.ok) throw new Error('The PDF server returned an error.');
+            return response.arrayBuffer();
+          });
+      };
+      const bundledAssetBase = (() => {
+        try {
+          const resourceUrl = new URL(workerResource.url);
+          if (/^(?:chrome|moz)-extension:$/.test(resourceUrl.protocol)) {
+            return new URL('./', resourceUrl).href;
+          }
+        } catch (_error) {
+          // Userscript-manager resource URLs use the pinned CDN fallback.
+        }
+        return '';
+      })();
+      cleanMathCopyPdfViewerMain(
+        root.id, pdfjs, workerResource.url, analyzePdfPageText, PDF_VIEWER_BYPASS_KEY, loadPdfBytes,
+        bundledAssetBase
+      );
+      return true;
+    }).catch((error) => {
+      showPdfViewerBootstrapError(root, error);
+      return false;
+    });
   }
 
   function loadInitialSettings() {
@@ -11495,7 +13123,17 @@
     let injected = null;
     const injectionParent = documentObject.head || documentObject.documentElement;
     try {
-      if (typeof GM_addElement === 'function') {
+      const extensionRelayBridge = userscriptGlobal &&
+        typeof userscriptGlobal.GM_cleanMathCopyInstallPageRelay === 'function'
+        ? userscriptGlobal.GM_cleanMathCopyInstallPageRelay
+        : (typeof global.GM_cleanMathCopyInstallPageRelay === 'function'
+          ? global.GM_cleanMathCopyInstallPageRelay
+          : null);
+      if (extensionRelayBridge && extensionRelayBridge(carrierId, eventName, Boolean(googleDocs))) {
+        // A Manifest V3 MAIN-world content script installed the relay without
+        // relying on inline script execution, which strict page CSP can block.
+        injected = { remove() {} };
+      } else if (typeof GM_addElement === 'function') {
         injected = GM_addElement(injectionParent, 'script', { textContent: source });
       } else if (global.GM && typeof global.GM.addElement === 'function') {
         injected = global.GM.addElement(injectionParent, 'script', { textContent: source });
@@ -11659,11 +13297,18 @@
       activeOfficeState = null;
     };
 
+    // The top-level menu controller is installed later, after the copy
+    // listeners. Keeping this hook live now lets asynchronous settings reads
+    // and cross-tab value changes update its active-mode marker once ready.
+    let requestModeMenuRefresh = () => {};
+    let applyDirectPdfMode = () => {};
     const applyStoredSettings = (stored, countAsChange) => {
       const next = observeSettings(stored);
       if (countAsChange) settingsGeneration += 1;
       settings = next;
       if (next.outputMode === 'native') invalidatePendingRewrites();
+      requestModeMenuRefresh(next.outputMode);
+      applyDirectPdfMode(next.outputMode);
     };
 
     const pageRelayInstallation = { carrier: null, controllerReady: false };
@@ -11724,6 +13369,7 @@
       }
     }
 
+    let settingsInitializationReady = null;
     if (!inheritedSettingsProvider && initialSettings.pendingRead) {
       const readStoredSettings = () => {
         const loadGeneration = settingsGeneration;
@@ -11731,16 +13377,41 @@
         try {
           stored = initialSettings.pendingRead();
         } catch (_error) {
-          return;
+          return Promise.resolve();
         }
-        Promise.resolve(stored).then((value) => {
+        return Promise.resolve(stored).then((value) => {
           // A menu command or subscribed storage change can run while this
           // read is pending. Never let its older snapshot win afterward.
           if (settingsGeneration === loadGeneration) applyStoredSettings(value, false);
         }, () => {});
       };
-      if (listenerReady) listenerReady.then(readStoredSettings, readStoredSettings);
-      else readStoredSettings();
+      settingsInitializationReady = listenerReady
+        ? listenerReady.then(readStoredSettings, readStoredSettings)
+        : readStoredSettings();
+    }
+
+    if (isDirectPdfDocument(documentObject, pageWindow)) {
+      let viewerStartPending = null;
+      applyDirectPdfMode = () => {
+        // Keep one stable selectable PDF surface in every mode. “Original
+        // copy/paste” bypasses all rewriting inside this viewer; tearing the
+        // viewer down and reviving Chromium's privileged PDF document in the
+        // same tab leaves PDF.js workers permanently stalled in Chromium.
+        // The toolbar's explicit browser-viewer escape lasts for this native
+        // document. A normal reload starts a fresh document and restores the
+        // custom viewer; a popup mode change must not replace the browser's
+        // privileged viewer in place, which can strand PDF.js in Chromium.
+        if (documentObject.__cleanMathCopyPdfViewerBypassed) return;
+        if (!viewerStartPending) {
+          viewerStartPending = startDirectPdfViewer(documentObject, pageWindow).finally(() => {
+            viewerStartPending = null;
+          });
+        }
+      };
+      const startForResolvedMode = () => applyDirectPdfMode(currentSettings().outputMode);
+      if (settingsInitializationReady) {
+        Promise.resolve(settingsInitializationReady).then(startForResolvedMode, startForResolvedMode);
+      } else startForResolvedMode();
     }
 
     const armNativeReplaySnapshot = (event, fallbackText) => {
@@ -11958,7 +13629,49 @@
       // inside the editor where the DOM is a flattened accessibility view.
       const payload = isGoogleDocsEditorPage(documentObject, pageWindow)
         ? null
-        : getCopyPayload(documentObject, selection, eventSettings, pageWindow, event.target);
+        : getCopyPayload(documentObject, selection, eventSettings, pageWindow, event.target, true);
+      if (payload && payload.deferredPdf && payload.root && payload.root.isConnected) {
+        const deferredRoot = payload.root;
+        const deferredRanges = payload.ranges;
+        const deferredGeneration = eventGeneration;
+        const deferredModeGeneration = eventModeGeneration;
+        let timeoutId = null;
+        const finishDeferredPdf = () => {
+          deferredRoot.removeEventListener(PDF_SELECTION_READY_EVENT, finishDeferredPdf, false);
+          if (timeoutId != null && pageWindow && typeof pageWindow.clearTimeout === 'function') {
+            pageWindow.clearTimeout(timeoutId);
+          }
+          if (clipboardIntentGeneration !== deferredGeneration || modeGeneration !== deferredModeGeneration ||
+              currentSettings().outputMode === 'native') return;
+          const resolved = trustedPdfViewerPayload(deferredRanges, currentSettings(), documentObject);
+          if (!resolved || resolved === PDF_VIEWER_INCOMPLETE) return;
+          writeClipboardPayload(
+            resolved,
+            pageWindow,
+            () => clipboardIntentGeneration === deferredGeneration &&
+              modeGeneration === deferredModeGeneration && currentSettings().outputMode !== 'native'
+          );
+        };
+        deferredRoot.addEventListener(PDF_SELECTION_READY_EVENT, finishDeferredPdf, false);
+        if (pageWindow && typeof pageWindow.setTimeout === 'function') {
+          timeoutId = pageWindow.setTimeout(() => {
+            deferredRoot.removeEventListener(PDF_SELECTION_READY_EVENT, finishDeferredPdf, false);
+          }, 45000);
+        }
+        try {
+          const EventConstructor = pageWindow && pageWindow.Event || global.Event;
+          deferredRoot.dispatchEvent(new EventConstructor(PDF_RENDER_SELECTION_EVENT));
+        } catch (_error) {
+          deferredRoot.removeEventListener(PDF_SELECTION_READY_EVENT, finishDeferredPdf, false);
+          if (timeoutId != null && pageWindow && typeof pageWindow.clearTimeout === 'function') {
+            pageWindow.clearTimeout(timeoutId);
+          }
+          return;
+        }
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
       if (!officeState && !payload && !(googleDocsPage && pageRelayReady())) {
         siteState = createSiteCopyState();
         siteState.settings = eventSettings;
@@ -12051,33 +13764,15 @@
     const legacyRegisterMenuCommand = typeof GM_registerMenuCommand === 'function'
       ? GM_registerMenuCommand
       : null;
+    const legacyUnregisterMenuCommand = typeof GM_unregisterMenuCommand === 'function'
+      ? GM_unregisterMenuCommand
+      : null;
     const modernRegisterMenuCommand = global.GM && typeof global.GM.registerMenuCommand === 'function'
       ? global.GM.registerMenuCommand.bind(global.GM)
       : null;
-    const registerMenuCommand = (caption, callback) => {
-      let result;
-      let resultFromLegacy = false;
-      if (legacyRegisterMenuCommand) {
-        try {
-          result = legacyRegisterMenuCommand(caption, callback);
-          resultFromLegacy = true;
-        } catch (_error) {
-          if (!modernRegisterMenuCommand) throw _error;
-          result = modernRegisterMenuCommand(caption, callback);
-        }
-      } else if (modernRegisterMenuCommand) {
-        result = modernRegisterMenuCommand(caption, callback);
-      } else {
-        return;
-      }
-      if (result && typeof result.then === 'function') {
-        let settled = Promise.resolve(result);
-        if (resultFromLegacy && modernRegisterMenuCommand) {
-          settled = settled.catch(() => modernRegisterMenuCommand(caption, callback));
-        }
-        settled.catch(() => {});
-      }
-    };
+    const modernUnregisterMenuCommand = global.GM && typeof global.GM.unregisterMenuCommand === 'function'
+      ? global.GM.unregisterMenuCommand.bind(global.GM)
+      : null;
     const menuWindow = documentObject.defaultView || pageWindow;
     let topLevelMenu = true;
     try {
@@ -12091,6 +13786,8 @@
         settingsGeneration += 1;
         settings = observeSettings(saveSettings(nextSettings));
         if (settings.outputMode === 'native') invalidatePendingRewrites();
+        requestModeMenuRefresh(settings.outputMode);
+        applyDirectPdfMode(settings.outputMode);
       };
       const setMode = (mode) => {
         updateSettings({ outputMode: mode });
@@ -12101,15 +13798,180 @@
         { mode: 'latex', label: 'Original LaTeX' },
         { mode: 'native', label: 'Original copy/paste' }
       ];
-      for (const item of modeMenus) {
-        try {
-          // Register once. Re-registering merely to move a checkmark creates
-          // duplicates in managers that do not support in-place menu IDs.
-          registerMenuCommand(item.label, () => setMode(item.mode));
-        } catch (_error) {
-          // Clipboard behavior must remain available if a manager rejects its
-          // optional popup-menu API.
+      const menuCaption = (item, activeMode) =>
+        (item.mode === activeMode ? '✓ ' : '') + item.label;
+      const usableMenuToken = (token) => token !== undefined && token !== null;
+      const candidates = [];
+      const addCandidate = (name, register, unregister) => {
+        if (!register || candidates.some((candidate) => candidate.register === register)) return;
+        candidates.push({ name, register, unregister });
+      };
+
+      // Prefer a completely paired API family. Mixing legacy registration
+      // with modern removal (or vice versa) is not portable across managers.
+      if (legacyRegisterMenuCommand && legacyUnregisterMenuCommand) {
+        addCandidate('legacy', legacyRegisterMenuCommand, legacyUnregisterMenuCommand);
+      }
+      if (modernRegisterMenuCommand && modernUnregisterMenuCommand) {
+        addCandidate('modern', modernRegisterMenuCommand, modernUnregisterMenuCommand);
+      }
+      if (legacyRegisterMenuCommand && !legacyUnregisterMenuCommand) {
+        addCandidate('legacy-static', legacyRegisterMenuCommand, null);
+      }
+      if (modernRegisterMenuCommand && !modernUnregisterMenuCommand) {
+        addCandidate('modern-static', modernRegisterMenuCommand, null);
+      }
+
+      let desiredMode = settings.outputMode;
+      let renderedMode = null;
+      let activeMenuApi = null;
+      let menuTokens = [];
+      let menusInitialized = false;
+      let dynamicMenus = false;
+      let menuControllerDisabled = false;
+      let refreshRequested = false;
+      let refreshScheduled = false;
+      let refreshRunning = false;
+
+      const registerMenuBatch = (api, mode) => {
+        const settlements = [];
+        let threw = false;
+        for (const item of modeMenus) {
+          try {
+            const result = api.register(menuCaption(item, mode), () => setMode(item.mode));
+            // Attach the rejection handler immediately: Promise-based manager
+            // APIs must never produce an unhandled rejection in the page.
+            settlements.push(Promise.resolve(result).then(
+              (token) => ({ ok: true, token }),
+              () => ({ ok: false, token: null })
+            ));
+          } catch (_error) {
+            threw = true;
+            break;
+          }
         }
+        return Promise.all(settlements).then((entries) => ({
+          complete: !threw && entries.length === modeMenus.length &&
+            entries.every((entry) => entry.ok),
+          entries
+        }));
+      };
+
+      const unregisterMenuBatch = (api, tokens) => {
+        if (!api || !api.unregister || tokens.some((token) => !usableMenuToken(token))) {
+          return Promise.resolve(false);
+        }
+        const settlements = tokens.map((token) => {
+          try {
+            return Promise.resolve(api.unregister(token)).then(() => true, () => false);
+          } catch (_error) {
+            return Promise.resolve(false);
+          }
+        });
+        return Promise.all(settlements).then((results) => results.every(Boolean));
+      };
+
+      const activateMenuBatch = (api, mode, outcome) => {
+        activeMenuApi = api;
+        menuTokens = outcome.entries.map((entry) => entry.token);
+        renderedMode = mode;
+        menusInitialized = true;
+        dynamicMenus = Boolean(api.unregister && menuTokens.every(usableMenuToken));
+        if (dynamicMenus && desiredMode !== renderedMode) refreshRequested = true;
+      };
+
+      const cleanFailedMenuBatch = (api, outcome) => {
+        const successfulTokens = outcome.entries
+          .filter((entry) => entry.ok)
+          .map((entry) => entry.token);
+        if (!successfulTokens.length) return Promise.resolve(true);
+        return unregisterMenuBatch(api, successfulTokens);
+      };
+
+      const scheduleMenuRefresh = () => {
+        if (refreshScheduled || refreshRunning || menuControllerDisabled ||
+            !menusInitialized || !dynamicMenus) return;
+        refreshScheduled = true;
+        Promise.resolve().then(() => {
+          refreshScheduled = false;
+          return runMenuRefresh();
+        }).catch(() => {
+          menuControllerDisabled = true;
+          dynamicMenus = false;
+        });
+      };
+
+      const runMenuRefresh = async () => {
+        if (refreshRunning || menuControllerDisabled || !dynamicMenus) return;
+        refreshRunning = true;
+        try {
+          while (refreshRequested && !menuControllerDisabled && dynamicMenus) {
+            refreshRequested = false;
+            if (desiredMode === renderedMode) continue;
+            const api = activeMenuApi;
+            const removed = await unregisterMenuBatch(api, menuTokens);
+            if (!removed) {
+              // Partial removal cannot be repaired without risking duplicate
+              // commands. Keep clipboard behavior working and stop menu churn.
+              menuControllerDisabled = true;
+              dynamicMenus = false;
+              break;
+            }
+            menuTokens = [];
+            const mode = desiredMode;
+            const outcome = await registerMenuBatch(api, mode);
+            if (!outcome.complete) {
+              await cleanFailedMenuBatch(api, outcome);
+              menuControllerDisabled = true;
+              dynamicMenus = false;
+              break;
+            }
+            activateMenuBatch(api, mode, outcome);
+          }
+        } finally {
+          refreshRunning = false;
+          if (refreshRequested && !menuControllerDisabled && dynamicMenus) scheduleMenuRefresh();
+        }
+      };
+
+      requestModeMenuRefresh = (mode) => {
+        desiredMode = normalizeSettings({ outputMode: mode }).outputMode;
+        if (!menusInitialized || !dynamicMenus || menuControllerDisabled ||
+            desiredMode === renderedMode) return;
+        refreshRequested = true;
+        scheduleMenuRefresh();
+      };
+
+      const tryMenuCandidate = (candidateIndex) => {
+        if (candidateIndex >= candidates.length || menuControllerDisabled) return;
+        const api = candidates[candidateIndex];
+        const mode = desiredMode;
+        registerMenuBatch(api, mode).then((outcome) => {
+          if (outcome.complete) {
+            activateMenuBatch(api, mode, outcome);
+            if (refreshRequested) scheduleMenuRefresh();
+            return;
+          }
+          cleanFailedMenuBatch(api, outcome).then((cleaned) => {
+            if (cleaned) tryMenuCandidate(candidateIndex + 1);
+            else menuControllerDisabled = true;
+          }, () => {
+            menuControllerDisabled = true;
+          });
+        }, () => {
+          menuControllerDisabled = true;
+        });
+      };
+
+      const startModeMenus = () => tryMenuCandidate(0);
+      const hasDynamicCandidate = candidates.some((candidate) => candidate.unregister);
+      if (!hasDynamicCandidate && settingsInitializationReady) {
+        // Greasemonkey returns no command IDs and has no removal API. Wait for
+        // its asynchronous stored setting so the one safe, static registration
+        // still marks the correct initial mode without ever creating duplicates.
+        Promise.resolve(settingsInitializationReady).then(startModeMenus, startModeMenus);
+      } else {
+        startModeMenus();
       }
     }
 
@@ -12119,6 +13981,7 @@
   return Object.freeze({
     DEFAULT_SETTINGS,
     MATH_ROOT_SELECTOR,
+    analyzePdfPageText,
     cleanClipboardText,
     repairFlattenedRendererText,
     cleanMathCopyPageRelayMain,
@@ -12141,6 +14004,7 @@
     ordinarySelectionPayload,
     ommlToMathML,
     positionedOfficePayload,
+    registerTrustedPdfViewerRoot,
     richScriptClipboardPayloadFromMarkup,
     rootsForRange,
     serializeDomFragment,

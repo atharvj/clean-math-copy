@@ -5003,16 +5003,20 @@ test('a newer Word copy cancels an older staging recovery before it can overwrit
   }
 });
 
-test('mode menu registers exactly four static choices and rejects a stale settings read', async () => {
+test('paired modern menus mark only the active mode and reject a stale settings read', async () => {
   const instance = dom('<p>settings race</p>');
   const commands = new Map();
+  const registrations = [];
+  const removals = [];
   const saved = [];
   let nextCommandId = 0;
   let resolveInitialRead;
   const previousGM = global.GM;
   const previousRegister = global.GM_registerMenuCommand;
+  const previousUnregister = global.GM_unregisterMenuCommand;
   try {
     delete global.GM_registerMenuCommand;
+    delete global.GM_unregisterMenuCommand;
     global.GM = {
       getValue() {
         return new Promise((resolve) => { resolveInitialRead = resolve; });
@@ -5024,14 +5028,17 @@ test('mode menu registers exactly four static choices and rejects a stale settin
       registerMenuCommand(caption, callback) {
         const id = 'returned-menu-' + (++nextCommandId);
         commands.set(id, { caption, callback, argumentCount: arguments.length });
-        return id;
+        registrations.push({ id, caption, argumentCount: arguments.length });
+        return Promise.resolve(id);
+      },
+      unregisterMenuCommand(id) {
+        removals.push(id);
+        return Promise.resolve().then(() => commands.delete(id));
       }
     };
     const installed = cleanCopy.install(instance.window.document, instance.window);
-    const expectedIds = ['returned-menu-1', 'returned-menu-2', 'returned-menu-3', 'returned-menu-4'];
-    assert.deepEqual(Array.from(commands.keys()).sort(), expectedIds);
     assert.deepEqual(Array.from(commands.values(), (command) => command.caption), [
-      'Faithful readable (recommended)',
+      '✓ Faithful readable (recommended)',
       'Calculator-safe',
       'Original LaTeX',
       'Original copy/paste'
@@ -5042,10 +5049,28 @@ test('mode menu registers exactly four static choices and rejects a stale settin
       /ASCII|toggle|copy current|show current/i
     );
 
-    commands.get('returned-menu-2').callback();
+    Array.from(commands.values()).find((command) => command.caption === 'Calculator-safe').callback();
     assert.deepEqual(installed.settings, { outputMode: 'calculator' });
     assert.deepEqual(saved.at(-1), { outputMode: 'calculator' });
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(commands.size, 4);
+    assert.deepEqual(Array.from(commands.values(), (command) => command.caption), [
+      'Faithful readable (recommended)',
+      '✓ Calculator-safe',
+      'Original LaTeX',
+      'Original copy/paste'
+    ]);
+    assert.deepEqual(removals, [
+      'returned-menu-1', 'returned-menu-2', 'returned-menu-3', 'returned-menu-4'
+    ]);
+    assert.equal(registrations.every((command) => command.argumentCount === 2), true);
+
+    const registrationCount = registrations.length;
+    const removalCount = removals.length;
+    Array.from(commands.values()).find((command) => command.caption === '✓ Calculator-safe').callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(registrations.length, registrationCount, 'selecting the active mode does not churn menus');
+    assert.equal(removals.length, removalCount);
 
     resolveInitialRead({
       outputMode: 'latex',
@@ -5055,22 +5080,30 @@ test('mode menu registers exactly four static choices and rejects a stale settin
     await Promise.resolve();
     await Promise.resolve();
     assert.deepEqual(installed.settings, { outputMode: 'calculator' });
+    assert.equal(Array.from(commands.values()).filter((command) => command.caption.startsWith('✓ ')).length, 1);
+    assert.ok(Array.from(commands.values()).some((command) => command.caption === '✓ Calculator-safe'));
 
-    commands.get('returned-menu-3').callback();
+    Array.from(commands.values()).find((command) => command.caption === 'Original LaTeX').callback();
+    await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(installed.settings, { outputMode: 'latex' });
-    commands.get('returned-menu-4').callback();
+    assert.ok(Array.from(commands.values()).some((command) => command.caption === '✓ Original LaTeX'));
+    Array.from(commands.values()).find((command) => command.caption === 'Original copy/paste').callback();
+    await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(installed.settings, { outputMode: 'native' });
     assert.deepEqual(saved.at(-1), { outputMode: 'native' });
     assert.equal(commands.size, 4);
+    assert.ok(Array.from(commands.values()).some((command) => command.caption === '✓ Original copy/paste'));
   } finally {
     if (previousGM === undefined) delete global.GM;
     else global.GM = previousGM;
     if (previousRegister === undefined) delete global.GM_registerMenuCommand;
     else global.GM_registerMenuCommand = previousRegister;
+    if (previousUnregister === undefined) delete global.GM_unregisterMenuCommand;
+    else global.GM_unregisterMenuCommand = previousUnregister;
   }
 });
 
-test('rejected Promise menu registrations stay handled and never re-register static choices', async () => {
+test('rejected ID-less Promise menu registrations stay handled and never duplicate static choices', async () => {
   const instance = dom('<p>stored settings</p>');
   const commands = new Map();
   let nextCommandId = 0;
@@ -5101,7 +5134,7 @@ test('rejected Promise menu registrations stay handled and never re-register sta
     assert.deepEqual(Array.from(commands.values(), (command) => command.caption), [
       'Faithful readable (recommended)',
       'Calculator-safe',
-      'Original LaTeX',
+      '✓ Original LaTeX',
       'Original copy/paste'
     ]);
     commands.get('returned-menu-2').callback();
@@ -5116,12 +5149,18 @@ test('rejected Promise menu registrations stay handled and never re-register sta
   }
 });
 
-test('ID-less legacy menu APIs still receive only the four mode choices', () => {
+test('ID-less legacy menu APIs receive four two-argument choices without duplicate refreshes', () => {
   const instance = dom('<p>legacy menu</p>');
   const commands = [];
+  const previousGM = global.GM;
+  const previousGetValue = global.GM_getValue;
   const previousRegister = global.GM_registerMenuCommand;
+  const previousUnregister = global.GM_unregisterMenuCommand;
   const previousSetValue = global.GM_setValue;
   try {
+    delete global.GM;
+    global.GM_getValue = () => ({ outputMode: 'faithful' });
+    delete global.GM_unregisterMenuCommand;
     global.GM_registerMenuCommand = function strictLegacyRegister(caption, callback, accessKey) {
       if (arguments.length > 2 || (accessKey != null && typeof accessKey !== 'string')) {
         throw new TypeError('legacy API accepts only an optional access-key string');
@@ -5132,7 +5171,7 @@ test('ID-less legacy menu APIs still receive only the four mode choices', () => 
     global.GM_setValue = () => undefined;
     const installed = cleanCopy.install(instance.window.document, instance.window);
     assert.deepEqual(commands.map((command) => command.caption), [
-      'Faithful readable (recommended)',
+      '✓ Faithful readable (recommended)',
       'Calculator-safe',
       'Original LaTeX',
       'Original copy/paste'
@@ -5141,30 +5180,47 @@ test('ID-less legacy menu APIs still receive only the four mode choices', () => 
     for (const command of commands) command.callback();
     assert.equal(commands.length, 4);
     assert.deepEqual(installed.settings, { outputMode: 'native' });
+    assert.equal(commands.filter((command) => command.caption.startsWith('✓ ')).length, 1);
   } finally {
+    if (previousGM === undefined) delete global.GM;
+    else global.GM = previousGM;
+    if (previousGetValue === undefined) delete global.GM_getValue;
+    else global.GM_getValue = previousGetValue;
     if (previousRegister === undefined) delete global.GM_registerMenuCommand;
     else global.GM_registerMenuCommand = previousRegister;
+    if (previousUnregister === undefined) delete global.GM_unregisterMenuCommand;
+    else global.GM_unregisterMenuCommand = previousUnregister;
     if (previousSetValue === undefined) delete global.GM_setValue;
     else global.GM_setValue = previousSetValue;
   }
 });
 
-test('menu registration falls back to the modern API when the legacy API throws', () => {
+test('menu registration falls back to the paired modern API when paired legacy registration throws', async () => {
   const instance = dom('<p>fallback menu</p>');
-  const commands = [];
+  const commands = new Map();
+  let nextCommandId = 0;
   const previousGM = global.GM;
+  const previousGetValue = global.GM_getValue;
   const previousRegister = global.GM_registerMenuCommand;
+  const previousUnregister = global.GM_unregisterMenuCommand;
   try {
+    global.GM_getValue = () => ({ outputMode: 'faithful' });
     global.GM_registerMenuCommand = () => { throw new Error('legacy unavailable'); };
+    global.GM_unregisterMenuCommand = () => undefined;
     global.GM = {
       registerMenuCommand(caption, callback) {
-        commands.push({ caption, callback });
-        return commands.length;
+        const id = ++nextCommandId;
+        commands.set(id, { caption, callback });
+        return id;
+      },
+      unregisterMenuCommand(id) {
+        commands.delete(id);
       }
     };
     cleanCopy.install(instance.window.document, instance.window);
-    assert.deepEqual(commands.map((command) => command.caption), [
-      'Faithful readable (recommended)',
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(Array.from(commands.values(), (command) => command.caption), [
+      '✓ Faithful readable (recommended)',
       'Calculator-safe',
       'Original LaTeX',
       'Original copy/paste'
@@ -5172,40 +5228,53 @@ test('menu registration falls back to the modern API when the legacy API throws'
   } finally {
     if (previousGM === undefined) delete global.GM;
     else global.GM = previousGM;
+    if (previousGetValue === undefined) delete global.GM_getValue;
+    else global.GM_getValue = previousGetValue;
     if (previousRegister === undefined) delete global.GM_registerMenuCommand;
     else global.GM_registerMenuCommand = previousRegister;
+    if (previousUnregister === undefined) delete global.GM_unregisterMenuCommand;
+    else global.GM_unregisterMenuCommand = previousUnregister;
   }
 });
 
-test('mode changes synchronize to open frames while only the top page registers menus', () => {
+test('mode changes synchronize to open frames while only the top page refreshes its four menus', async () => {
   const instance = dom('<iframe></iframe><p>top</p>');
   const frame = instance.window.document.querySelector('iframe');
   frame.contentDocument.body.innerHTML = '<p>child</p>';
   const listeners = [];
-  const commands = [];
+  const commands = new Map();
+  let nextCommandId = 0;
   const previousGetValue = global.GM_getValue;
   const previousAddValueChangeListener = global.GM_addValueChangeListener;
   const previousRegister = global.GM_registerMenuCommand;
+  const previousUnregister = global.GM_unregisterMenuCommand;
   try {
     global.GM_getValue = () => ({ outputMode: 'faithful' });
     global.GM_addValueChangeListener = (_key, callback) => {
       listeners.push(callback);
       return listeners.length;
     };
-    global.GM_registerMenuCommand = (caption) => {
-      commands.push(caption);
-      return commands.length;
+    global.GM_registerMenuCommand = (caption, callback) => {
+      const id = ++nextCommandId;
+      commands.set(id, { caption, callback });
+      return id;
     };
+    global.GM_unregisterMenuCommand = (id) => commands.delete(id);
     const child = cleanCopy.install(frame.contentDocument, frame.contentWindow);
     const top = cleanCopy.install(instance.window.document, instance.window);
-    assert.equal(commands.length, 4);
+    assert.equal(commands.size, 4);
+    assert.ok(Array.from(commands.values()).some((command) =>
+      command.caption === '✓ Faithful readable (recommended)'));
     assert.equal(listeners.length, 2);
     for (const listener of listeners) {
       listener('cleanMathCopy.settings.v3', { outputMode: 'faithful' }, { outputMode: 'native' }, true);
     }
     assert.deepEqual(child.settings, { outputMode: 'native' });
     assert.deepEqual(top.settings, { outputMode: 'native' });
-    assert.equal(commands.length, 4);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(commands.size, 4);
+    assert.equal(Array.from(commands.values()).filter((command) => command.caption.startsWith('✓ ')).length, 1);
+    assert.ok(Array.from(commands.values()).some((command) => command.caption === '✓ Original copy/paste'));
   } finally {
     if (previousGetValue === undefined) delete global.GM_getValue;
     else global.GM_getValue = previousGetValue;
@@ -5213,6 +5282,8 @@ test('mode changes synchronize to open frames while only the top page registers 
     else global.GM_addValueChangeListener = previousAddValueChangeListener;
     if (previousRegister === undefined) delete global.GM_registerMenuCommand;
     else global.GM_registerMenuCommand = previousRegister;
+    if (previousUnregister === undefined) delete global.GM_unregisterMenuCommand;
+    else global.GM_unregisterMenuCommand = previousUnregister;
   }
 });
 
@@ -6273,7 +6344,7 @@ test('deferred isolated relay cannot adopt a newer no-DataTransfer copy generati
     // must reject the controller generation instead of adopting it.
     const newerText = newerMode === 'faithful' ? 'faithful C' : 'native C';
     faithfulTarget.textContent = newerText;
-    if (newerMode === 'faithful') commands.get('Faithful readable (recommended)')();
+    if (newerMode === 'faithful') commands.get('✓ Faithful readable (recommended)')();
     selectContents(instance.window, faithfulTarget);
     const newerEvent = new instance.window.Event('copy', {
       bubbles: true, cancelable: true, composed: true

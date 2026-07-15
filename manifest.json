@@ -1,0 +1,66 @@
+{
+  "manifest_version": 3,
+  "name": "Clean Math Copy",
+  "version": "2.4.0",
+  "description": "Copy web and PDF math as faithful text, calculator-safe syntax, or LaTeX.",
+  "minimum_chrome_version": "140",
+  "permissions": [
+    "storage",
+    "clipboardWrite"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_title": "Clean Math Copy mode",
+    "default_popup": "extension/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
+      "js": [
+        "extension/page-relay.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
+      "js": [
+        "extension/shim.js",
+        "clean-math-copy.user.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true,
+      "world": "ISOLATED"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "extension/vendor/pdf.min.mjs",
+        "extension/vendor/pdf.worker.min.mjs",
+        "extension/vendor/cmaps/*",
+        "extension/vendor/standard_fonts/*",
+        "extension/vendor/wasm/*",
+        "extension/vendor/iccs/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}

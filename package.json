@@ -1,6 +1,6 @@
 {
   "name": "clean-math-copy-userscript",
-  "version": "2.3.1",
+  "version": "2.4.0",
   "private": true,
   "description": "Faithfully transcribe web math and clean messy copied text for readable plain-text paste.",
   "repository": {
@@ -14,11 +14,14 @@
     "test": "node --test tests/*.test.js",
     "syntax": "node --check clean-math-copy.user.js",
     "check": "npm run syntax && npm test",
-    "browser-smoke": "node tests/run-browser-smoke.js"
+    "browser-smoke": "node tests/run-browser-smoke.js",
+    "pdf-extension-smoke": "node tests/run-pdf-extension-smoke.js"
   },
   "devDependencies": {
     "jsdom": "^29.1.1",
-    "katex": "^0.17.0"
+    "katex": "^0.17.0",
+    "pdfjs-dist": "6.1.200",
+    "ws": "^8.18.3"
   },
   "engines": {
     "node": ">=20.19.0"
