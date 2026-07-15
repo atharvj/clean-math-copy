@@ -3631,6 +3631,72 @@ test('Google Docs owns an inherited child before its clipboard class is assigned
   );
 });
 
+test('Original copy/paste bypasses the isolated-world relay before it patches clipboard APIs', () => {
+  const instance = new JSDOM(
+    '<!doctype html><html><body><div id="target">x2</div></body></html>',
+    { url: 'https://example.test/', runScripts: 'dangerously' }
+  );
+  const previousInfo = Object.getOwnPropertyDescriptor(globalThis, 'GM_info');
+  const previousAddElement = Object.getOwnPropertyDescriptor(globalThis, 'GM_addElement');
+  Object.defineProperty(globalThis, 'GM_info', {
+    value: { injectInto: 'content' }, configurable: true, writable: true
+  });
+  Object.defineProperty(globalThis, 'GM_addElement', {
+    configurable: true,
+    writable: true,
+    value(parent, tagName, attributes) {
+      const element = parent.ownerDocument.createElement(tagName);
+      parent.appendChild(element);
+      if (attributes && attributes.textContent) {
+        parent.ownerDocument.defaultView.eval(String(attributes.textContent));
+      }
+      return element;
+    }
+  });
+
+  try {
+    cleanCopy.install(instance.window.document, instance.window, {
+      settingsProvider: () => ({ outputMode: 'native' }),
+      registerMenus: false
+    });
+    const carrier = instance.window.document.querySelector('[data-clean-math-copy-relay-ready="1"]');
+    assert.ok(carrier);
+
+    const values = new Map();
+    const clipboardData = {
+      get types() { return Array.from(values.keys()); },
+      clearData(type) { if (arguments.length) values.delete(type); else values.clear(); },
+      setData(type, value) { values.set(type, value); },
+      getData(type) { return values.get(type) || ''; }
+    };
+    const originalSetData = clipboardData.setData;
+    const originalClearData = clipboardData.clearData;
+    const target = instance.window.document.querySelector('#target');
+    target.addEventListener('copy', (event) => {
+      assert.equal(event.clipboardData.setData, originalSetData);
+      assert.equal(event.clipboardData.clearData, originalClearData);
+      event.clipboardData.setData('text/plain', 'x2\n\n');
+      event.clipboardData.setData('text/html', '<i>x<sup>2</sup></i>\n');
+      event.clipboardData.setData('application/x-native', 'keep-me');
+      event.stopImmediatePropagation();
+    });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+    Object.defineProperty(event, 'clipboardData', { value: clipboardData });
+    target.dispatchEvent(event);
+    assert.equal(event.defaultPrevented, false);
+    assert.equal(clipboardData.setData, originalSetData);
+    assert.equal(clipboardData.clearData, originalClearData);
+    assert.equal(values.get('text/plain'), 'x2\n\n');
+    assert.equal(values.get('text/html'), '<i>x<sup>2</sup></i>\n');
+    assert.equal(values.get('application/x-native'), 'keep-me');
+  } finally {
+    if (previousInfo) Object.defineProperty(globalThis, 'GM_info', previousInfo);
+    else delete globalThis.GM_info;
+    if (previousAddElement) Object.defineProperty(globalThis, 'GM_addElement', previousAddElement);
+    else delete globalThis.GM_addElement;
+  }
+});
+
 test('isolated relay harvests cached Google Docs writes from its about:blank clipboard iframe', () => {
   const flat = '|B|=√((27.187)2+(17.479)2+(-28.112)2) = 42.84 μT';
   const slice = reportedGoogleDocsEquationSlice();
@@ -4195,6 +4261,43 @@ test('page relay aborts cleanly when clearData cannot be observed', () => {
   assert.equal(values.get('text/html'), '<span>x<sup>2</sup></span>');
 });
 
+test('a disconnected page relay never patches page-owned clipboard methods', () => {
+  const instance = new JSDOM(
+    '<!doctype html><html><body><span id="carrier"></span><div id="target">native</div></body></html>',
+    { url: 'https://example.test/', runScripts: 'dangerously' }
+  );
+  instance.window.eval(
+    '(' + cleanCopy.cleanMathCopyPageRelayMain.toString() + ')(' +
+    JSON.stringify('carrier') + ',' + JSON.stringify('relay-request') + ');'
+  );
+  const carrier = instance.window.document.querySelector('#carrier');
+  assert.equal(carrier.getAttribute('data-clean-math-copy-relay-ready'), '1');
+  carrier.remove();
+
+  const values = new Map();
+  const clipboardPrototype = {
+    get types() { return Array.from(values.keys()); },
+    clearData(type) { if (type) values.delete(type); else values.clear(); },
+    setData(type, value) { values.set(type, value); },
+    getData(type) { return values.get(type) || ''; }
+  };
+  const clipboardData = Object.create(clipboardPrototype);
+  const target = instance.window.document.querySelector('#target');
+  target.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text/plain', 'native');
+    event.stopImmediatePropagation();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', { value: clipboardData });
+  target.dispatchEvent(event);
+
+  assert.equal(values.get('text/plain'), 'native');
+  assert.equal(Object.hasOwn(clipboardData, 'setData'), false);
+  assert.equal(Object.hasOwn(clipboardData, 'clearData'), false);
+  assert.equal(Object.hasOwn(event, 'stopPropagation'), false);
+  assert.equal(Object.hasOwn(event, 'stopImmediatePropagation'), false);
+});
+
 test('Google Docs published and preview pages keep ordinary DOM copy cleanup', () => {
   for (const suffix of ['preview', 'pub']) {
     const instance = dom(
@@ -4702,7 +4805,7 @@ test('a newer Word copy cancels an older staging recovery before it can overwrit
   }
 });
 
-test('mode menu exposes exactly three persistent choices and rejects a stale settings read', async () => {
+test('mode menu registers exactly four static choices and rejects a stale settings read', async () => {
   const instance = dom('<p>settings race</p>');
   const commands = new Map();
   const saved = [];
@@ -4720,18 +4823,22 @@ test('mode menu exposes exactly three persistent choices and rejects a stale set
         saved.push(value);
         return Promise.resolve();
       },
-      registerMenuCommand(caption, callback, options) {
-        const id = options.id == null ? 'returned-menu-' + (++nextCommandId) : options.id;
-        commands.set(id, { caption, callback, options });
+      registerMenuCommand(caption, callback) {
+        const id = 'returned-menu-' + (++nextCommandId);
+        commands.set(id, { caption, callback, argumentCount: arguments.length });
         return id;
       }
     };
     const installed = cleanCopy.install(instance.window.document, instance.window);
-    const expectedIds = ['returned-menu-1', 'returned-menu-2', 'returned-menu-3'];
-    const checked = () => Array.from(commands.values()).filter((command) => command.caption.startsWith('✓ '));
+    const expectedIds = ['returned-menu-1', 'returned-menu-2', 'returned-menu-3', 'returned-menu-4'];
     assert.deepEqual(Array.from(commands.keys()).sort(), expectedIds);
-    assert.deepEqual(checked().map((command) => command.caption), ['✓ Faithful readable (recommended)']);
-    assert.equal(Array.from(commands.values()).every((command) => command.options.autoClose === true), true);
+    assert.deepEqual(Array.from(commands.values(), (command) => command.caption), [
+      'Faithful readable (recommended)',
+      'Calculator-safe',
+      'Original LaTeX',
+      'Original copy/paste'
+    ]);
+    assert.equal(Array.from(commands.values()).every((command) => command.argumentCount === 2), true);
     assert.doesNotMatch(
       Array.from(commands.values(), (command) => command.caption).join('\n'),
       /ASCII|toggle|copy current|show current/i
@@ -4740,8 +4847,7 @@ test('mode menu exposes exactly three persistent choices and rejects a stale set
     commands.get('returned-menu-2').callback();
     assert.deepEqual(installed.settings, { outputMode: 'calculator' });
     assert.deepEqual(saved.at(-1), { outputMode: 'calculator' });
-    assert.deepEqual(checked().map((command) => command.caption), ['✓ Calculator-safe']);
-    assert.equal(commands.size, 3);
+    assert.equal(commands.size, 4);
 
     resolveInitialRead({
       outputMode: 'latex',
@@ -4751,12 +4857,13 @@ test('mode menu exposes exactly three persistent choices and rejects a stale set
     await Promise.resolve();
     await Promise.resolve();
     assert.deepEqual(installed.settings, { outputMode: 'calculator' });
-    assert.deepEqual(checked().map((command) => command.caption), ['✓ Calculator-safe']);
 
     commands.get('returned-menu-3').callback();
     assert.deepEqual(installed.settings, { outputMode: 'latex' });
-    assert.deepEqual(checked().map((command) => command.caption), ['✓ Original LaTeX']);
-    assert.equal(commands.size, 3);
+    commands.get('returned-menu-4').callback();
+    assert.deepEqual(installed.settings, { outputMode: 'native' });
+    assert.deepEqual(saved.at(-1), { outputMode: 'native' });
+    assert.equal(commands.size, 4);
   } finally {
     if (previousGM === undefined) delete global.GM;
     else global.GM = previousGM;
@@ -4765,7 +4872,7 @@ test('mode menu exposes exactly three persistent choices and rejects a stale set
   }
 });
 
-test('asynchronous menu IDs serialize a stored-mode checkmark refresh without duplicates', async () => {
+test('rejected Promise menu registrations stay handled and never re-register static choices', async () => {
   const instance = dom('<p>stored settings</p>');
   const commands = new Map();
   let nextCommandId = 0;
@@ -4782,36 +4889,222 @@ test('asynchronous menu IDs serialize a stored-mode checkmark refresh without du
         });
       },
       setValue() { return Promise.resolve(); },
-      registerMenuCommand(caption, callback, options) {
-        const id = options.id == null ? 'returned-menu-' + (++nextCommandId) : options.id;
+      registerMenuCommand(caption, callback) {
+        const id = 'returned-menu-' + (++nextCommandId);
         commands.set(id, { caption, callback });
-        return Promise.resolve(id);
+        return Promise.reject(new Error('manager rejected its optional result'));
       }
     };
     const installed = cleanCopy.install(instance.window.document, instance.window);
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(installed.settings, { outputMode: 'latex' });
-    assert.equal(commands.size, 3);
-    assert.deepEqual(
-      Array.from(commands.values()).filter((command) => command.caption.startsWith('✓ '))
-        .map((command) => command.caption),
-      ['✓ Original LaTeX']
-    );
+    assert.equal(commands.size, 4);
+    assert.deepEqual(Array.from(commands.values(), (command) => command.caption), [
+      'Faithful readable (recommended)',
+      'Calculator-safe',
+      'Original LaTeX',
+      'Original copy/paste'
+    ]);
     commands.get('returned-menu-2').callback();
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(installed.settings, { outputMode: 'calculator' });
-    assert.equal(commands.size, 3);
-    assert.deepEqual(
-      Array.from(commands.values()).filter((command) => command.caption.startsWith('✓ '))
-        .map((command) => command.caption),
-      ['✓ Calculator-safe']
-    );
+    assert.equal(commands.size, 4);
   } finally {
     if (previousGM === undefined) delete global.GM;
     else global.GM = previousGM;
     if (previousRegister === undefined) delete global.GM_registerMenuCommand;
     else global.GM_registerMenuCommand = previousRegister;
+  }
+});
+
+test('ID-less legacy menu APIs still receive only the four mode choices', () => {
+  const instance = dom('<p>legacy menu</p>');
+  const commands = [];
+  const previousRegister = global.GM_registerMenuCommand;
+  const previousSetValue = global.GM_setValue;
+  try {
+    global.GM_registerMenuCommand = function strictLegacyRegister(caption, callback, accessKey) {
+      if (arguments.length > 2 || (accessKey != null && typeof accessKey !== 'string')) {
+        throw new TypeError('legacy API accepts only an optional access-key string');
+      }
+      commands.push({ caption, callback, argumentCount: arguments.length });
+      return undefined;
+    };
+    global.GM_setValue = () => undefined;
+    const installed = cleanCopy.install(instance.window.document, instance.window);
+    assert.deepEqual(commands.map((command) => command.caption), [
+      'Faithful readable (recommended)',
+      'Calculator-safe',
+      'Original LaTeX',
+      'Original copy/paste'
+    ]);
+    assert.equal(commands.every((command) => command.argumentCount === 2), true);
+    for (const command of commands) command.callback();
+    assert.equal(commands.length, 4);
+    assert.deepEqual(installed.settings, { outputMode: 'native' });
+  } finally {
+    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
+    else global.GM_registerMenuCommand = previousRegister;
+    if (previousSetValue === undefined) delete global.GM_setValue;
+    else global.GM_setValue = previousSetValue;
+  }
+});
+
+test('menu registration falls back to the modern API when the legacy API throws', () => {
+  const instance = dom('<p>fallback menu</p>');
+  const commands = [];
+  const previousGM = global.GM;
+  const previousRegister = global.GM_registerMenuCommand;
+  try {
+    global.GM_registerMenuCommand = () => { throw new Error('legacy unavailable'); };
+    global.GM = {
+      registerMenuCommand(caption, callback) {
+        commands.push({ caption, callback });
+        return commands.length;
+      }
+    };
+    cleanCopy.install(instance.window.document, instance.window);
+    assert.deepEqual(commands.map((command) => command.caption), [
+      'Faithful readable (recommended)',
+      'Calculator-safe',
+      'Original LaTeX',
+      'Original copy/paste'
+    ]);
+  } finally {
+    if (previousGM === undefined) delete global.GM;
+    else global.GM = previousGM;
+    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
+    else global.GM_registerMenuCommand = previousRegister;
+  }
+});
+
+test('mode changes synchronize to open frames while only the top page registers menus', () => {
+  const instance = dom('<iframe></iframe><p>top</p>');
+  const frame = instance.window.document.querySelector('iframe');
+  frame.contentDocument.body.innerHTML = '<p>child</p>';
+  const listeners = [];
+  const commands = [];
+  const previousGetValue = global.GM_getValue;
+  const previousAddValueChangeListener = global.GM_addValueChangeListener;
+  const previousRegister = global.GM_registerMenuCommand;
+  try {
+    global.GM_getValue = () => ({ outputMode: 'faithful' });
+    global.GM_addValueChangeListener = (_key, callback) => {
+      listeners.push(callback);
+      return listeners.length;
+    };
+    global.GM_registerMenuCommand = (caption) => {
+      commands.push(caption);
+      return commands.length;
+    };
+    const child = cleanCopy.install(frame.contentDocument, frame.contentWindow);
+    const top = cleanCopy.install(instance.window.document, instance.window);
+    assert.equal(commands.length, 4);
+    assert.equal(listeners.length, 2);
+    for (const listener of listeners) {
+      listener('cleanMathCopy.settings.v3', { outputMode: 'faithful' }, { outputMode: 'native' }, true);
+    }
+    assert.deepEqual(child.settings, { outputMode: 'native' });
+    assert.deepEqual(top.settings, { outputMode: 'native' });
+    assert.equal(commands.length, 4);
+  } finally {
+    if (previousGetValue === undefined) delete global.GM_getValue;
+    else global.GM_getValue = previousGetValue;
+    if (previousAddValueChangeListener === undefined) delete global.GM_addValueChangeListener;
+    else global.GM_addValueChangeListener = previousAddValueChangeListener;
+    if (previousRegister === undefined) delete global.GM_registerMenuCommand;
+    else global.GM_registerMenuCommand = previousRegister;
+  }
+});
+
+test('modern settings subscribe before reading so a stale snapshot cannot win', async () => {
+  const instance = dom('<p>settings ordering</p>');
+  const previousGM = global.GM;
+  const previousGetValue = global.GM_getValue;
+  const previousAddValueChangeListener = global.GM_addValueChangeListener;
+  let settingsListener = null;
+  let finishSubscription = null;
+  let finishRead = null;
+  let readCalls = 0;
+  try {
+    delete global.GM_getValue;
+    delete global.GM_addValueChangeListener;
+    global.GM = {
+      addValueChangeListener(_key, callback) {
+        settingsListener = callback;
+        return new Promise((resolve) => { finishSubscription = resolve; });
+      },
+      getValue() {
+        readCalls += 1;
+        return new Promise((resolve) => { finishRead = resolve; });
+      }
+    };
+    const installed = cleanCopy.install(instance.window.document, instance.window, { registerMenus: false });
+    assert.equal(readCalls, 0);
+    finishSubscription(1);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(readCalls, 1);
+    settingsListener(
+      'cleanMathCopy.settings.v3',
+      { outputMode: 'faithful' },
+      { outputMode: 'native' },
+      true
+    );
+    finishRead({ outputMode: 'faithful' });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(installed.settings, { outputMode: 'native' });
+  } finally {
+    if (previousGM === undefined) delete global.GM;
+    else global.GM = previousGM;
+    if (previousGetValue === undefined) delete global.GM_getValue;
+    else global.GM_getValue = previousGetValue;
+    if (previousAddValueChangeListener === undefined) delete global.GM_addValueChangeListener;
+    else global.GM_addValueChangeListener = previousAddValueChangeListener;
+  }
+});
+
+test('an early Google Docs child synchronizes with modern-only settings APIs', async () => {
+  const instance = new JSDOM(
+    '<!doctype html><html><body><div class="kix-appview-editor"></div><iframe></iframe></body></html>',
+    { url: 'https://docs.google.com/document/d/test/edit' }
+  );
+  const frame = instance.window.document.querySelector('iframe');
+  frame.contentDocument.body.innerHTML = '<div contenteditable="true">x2</div>';
+  const previousGM = global.GM;
+  const previousGetValue = global.GM_getValue;
+  const previousAddValueChangeListener = global.GM_addValueChangeListener;
+  let settingsListener = null;
+  try {
+    delete global.GM_getValue;
+    delete global.GM_addValueChangeListener;
+    global.GM = {
+      getValue() { return Promise.resolve({ outputMode: 'native' }); },
+      addValueChangeListener(_key, callback) {
+        settingsListener = callback;
+        return 1;
+      }
+    };
+    const child = cleanCopy.install(frame.contentDocument, frame.contentWindow);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(child.settings, { outputMode: 'native' });
+    settingsListener(
+      'cleanMathCopy.settings.v3',
+      { outputMode: 'native' },
+      { outputMode: 'calculator' },
+      true
+    );
+    assert.deepEqual(child.settings, { outputMode: 'calculator' });
+  } finally {
+    if (previousGM === undefined) delete global.GM;
+    else global.GM = previousGM;
+    if (previousGetValue === undefined) delete global.GM_getValue;
+    else global.GM_getValue = previousGetValue;
+    if (previousAddValueChangeListener === undefined) delete global.GM_addValueChangeListener;
+    else global.GM_addValueChangeListener = previousAddValueChangeListener;
   }
 });
 
@@ -4852,6 +5145,97 @@ test('installed handler leaves ordinary copy events and site behavior untouched'
   target.dispatchEvent(event);
   assert.equal(siteHandlerCalled, true);
   assert.equal(event.defaultPrevented, false);
+});
+
+test('Original copy/paste mode leaves rendered math and every site clipboard format native', () => {
+  const instance = dom(
+    '<div id="target" contenteditable="true">before\u200b ' +
+    katex('<mrow><msup><mi>x</mi><mn>2</mn></msup><mo>=</mo><mn>4</mn></mrow>', 'x^2=4') +
+    ' after</div>'
+  );
+  const target = instance.window.document.querySelector('#target');
+  selectContents(instance.window, target);
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    instance.window.getSelection(),
+    { outputMode: 'native' },
+    instance.window,
+    target
+  ), null);
+
+  const clipboard = new Map();
+  let clearCalls = 0;
+  let siteHandlerCalled = false;
+  const clipboardData = {
+    get types() { return Array.from(clipboard.keys()); },
+    clearData(type) {
+      clearCalls += 1;
+      if (arguments.length) clipboard.delete(type);
+      else clipboard.clear();
+    },
+    setData(type, value) { clipboard.set(type, value); },
+    getData(type) { return clipboard.get(type) || ''; }
+  };
+  const originalSetData = clipboardData.setData;
+  const originalClearData = clipboardData.clearData;
+  cleanCopy.install(instance.window.document, instance.window, {
+    settingsProvider: () => ({ outputMode: 'native' }),
+    registerMenus: false
+  });
+  target.addEventListener('copy', (event) => {
+    siteHandlerCalled = true;
+    assert.equal(event.clipboardData.setData, originalSetData);
+    assert.equal(event.clipboardData.clearData, originalClearData);
+    event.clipboardData.setData('text/plain', '  x2\n\nsite spacing  ');
+    event.clipboardData.setData('text/html', '<b>  x<sup>2</sup><br><br>site spacing  </b>');
+    event.clipboardData.setData('application/x-site-native', 'opaque\u0000payload');
+    event.stopImmediatePropagation();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(event, 'clipboardData', { value: clipboardData });
+  target.dispatchEvent(event);
+
+  assert.equal(siteHandlerCalled, true);
+  assert.equal(event.defaultPrevented, false);
+  assert.equal(clearCalls, 0);
+  assert.equal(clipboardData.setData, originalSetData);
+  assert.equal(clipboardData.clearData, originalClearData);
+  assert.equal(clipboard.get('text/plain'), '  x2\n\nsite spacing  ');
+  assert.equal(clipboard.get('text/html'), '<b>  x<sup>2</sup><br><br>site spacing  </b>');
+  assert.equal(clipboard.get('application/x-site-native'), 'opaque\u0000payload');
+});
+
+test('Original copy/paste mode never arms Microsoft Word staging recovery', async () => {
+  const instance = dom([
+    '<div id="WACViewPanel_EditingElement" contenteditable="true">native selection</div>',
+    '<div id="WACViewPanel_ClipboardElement"></div>'
+  ].join(''), 'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx');
+  const target = instance.window.document.querySelector('#WACViewPanel_EditingElement');
+  const staging = instance.window.document.querySelector('#WACViewPanel_ClipboardElement');
+  selectContents(instance.window, target);
+  let userscriptWrites = 0;
+  const previousSetClipboard = global.GM_setClipboard;
+  global.GM_setClipboard = () => { userscriptWrites += 1; };
+  try {
+    cleanCopy.install(instance.window.document, instance.window, {
+      settingsProvider: () => ({ outputMode: 'native' }),
+      registerMenus: false
+    });
+    target.addEventListener('copy', () => {
+      staging.innerHTML = '<math xmlns="http://www.w3.org/1998/Math/MathML"><msup><mi>x</mi><mn>2</mn></msup></math>';
+    });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+    Object.defineProperty(event, 'clipboardData', {
+      value: { get types() { return []; }, clearData() {}, setData() {}, getData() { return ''; } }
+    });
+    target.dispatchEvent(event);
+    await new Promise((resolve) => instance.window.setTimeout(resolve, 25));
+    assert.equal(event.defaultPrevented, false);
+    assert.equal(userscriptWrites, 0);
+  } finally {
+    if (previousSetClipboard === undefined) delete global.GM_setClipboard;
+    else global.GM_setClipboard = previousSetClipboard;
+  }
 });
 
 test('Word staging recovery preserves plain, rich HTML, and MathML clipboard representations', async () => {
@@ -5012,6 +5396,716 @@ test('a newer keyboard copy replays after an in-flight Word staging write', asyn
   assert.equal(attempts.length, 2);
   assert.equal(finalClipboard, 'new native text');
   assert.equal(await attempts[1].representations['text/plain'].text(), 'new native text');
+});
+
+test('Original copy/paste replays a newer native copy after an uncancellable older Word write', async () => {
+  const instance = dom([
+    '<div id="WACViewPanel_EditingElement" contenteditable="true">&nbsp;</div>',
+    '<div id="WACViewPanel_ClipboardElement"></div>',
+    '<p id="native">  newer native text\n\n  </p>'
+  ].join(''), 'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx');
+  const officeTarget = instance.window.document.querySelector('#WACViewPanel_EditingElement');
+  const staging = instance.window.document.querySelector('#WACViewPanel_ClipboardElement');
+  const nativeTarget = instance.window.document.querySelector('#native');
+  let mode = 'faithful';
+  let completeOlder = null;
+  let finalClipboard = '';
+  const attempts = [];
+  class FakeClipboardItem {
+    constructor(representations) { this.representations = representations; }
+  }
+  Object.defineProperty(instance.window, 'Blob', { configurable: true, value: Blob });
+  Object.defineProperty(instance.window, 'ClipboardItem', { configurable: true, value: FakeClipboardItem });
+  Object.defineProperty(instance.window.navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      write(items) {
+        const item = items[0];
+        attempts.push(item);
+        if (attempts.length === 1) {
+          return new Promise((resolve) => {
+            completeOlder = async () => {
+              finalClipboard = await item.representations['text/plain'].text();
+              resolve();
+            };
+          });
+        }
+        return item.representations['text/plain'].text().then((text) => { finalClipboard = text; });
+      }
+    }
+  });
+
+  selectContents(instance.window, officeTarget);
+  cleanCopy.install(instance.window.document, instance.window, {
+    settingsProvider: () => ({ outputMode: mode }),
+    registerMenus: false
+  });
+  officeTarget.addEventListener('copy', () => {
+    staging.innerHTML = '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>';
+  });
+  const olderEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(olderEvent, 'clipboardData', {
+    value: { get types() { return []; }, clearData() {}, setData() {}, getData() { return ''; } }
+  });
+  officeTarget.dispatchEvent(olderEvent);
+  await new Promise((resolve) => instance.window.setTimeout(resolve, 10));
+  assert.equal(typeof completeOlder, 'function');
+
+  mode = 'native';
+  selectContents(instance.window, nativeTarget);
+  const nativeValues = new Map();
+  let nativeTransferActive = true;
+  const oversizedNativeValue = 'Z'.repeat((1024 * 1024) + 1);
+  const nativeBudgetPadding = 'P'.repeat((1024 * 1024) - 512);
+  nativeTarget.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text/plain', 'stale first listener');
+    event.clipboardData.setData('application/x-native-oversized', 'stale-oversized');
+    event.clipboardData.setData('application/x-native-oversized', oversizedNativeValue);
+    event.clipboardData.setData('application/x-native-padding', nativeBudgetPadding);
+    event.clipboardData.setData('application/x-native-over-budget', 'stale-over-budget');
+    event.clipboardData.setData('application/x-native-over-budget', 'B'.repeat(600));
+    event.stopPropagation();
+  });
+  nativeTarget.addEventListener('copy', (event) => {
+    // stopImmediatePropagation() does not end the current listener; writes
+    // after it must remain part of the final native snapshot.
+    event.stopImmediatePropagation();
+    event.clipboardData.setData('text/plain', '  newer native text\n\n  ');
+    event.clipboardData.setData('text/html', '<p>  newer native text<br><br>  </p>');
+    event.clipboardData.setData('application/x-native-test', 'opaque-native-format');
+  });
+  const nativeEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+  Object.defineProperty(nativeEvent, 'clipboardData', {
+    value: {
+      get types() {
+        if (!nativeTransferActive) throw new Error('DataTransfer expired');
+        return Array.from(nativeValues.keys());
+      },
+      clearData(type) { if (arguments.length) nativeValues.delete(type); else nativeValues.clear(); },
+      setData(type, value) { nativeValues.set(type, value); },
+      getData(type) {
+        if (!nativeTransferActive) throw new Error('DataTransfer expired');
+        return nativeValues.get(type) || '';
+      }
+    }
+  });
+  nativeTarget.dispatchEvent(nativeEvent);
+  nativeTransferActive = false;
+  assert.equal(nativeEvent.defaultPrevented, false);
+  finalClipboard = nativeValues.get('text/plain');
+
+  await completeOlder();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(attempts.length, 2);
+  assert.equal(finalClipboard, '  newer native text\n\n  ');
+  assert.equal(await attempts[1].representations['text/plain'].text(), '  newer native text\n\n  ');
+  assert.equal(
+    await attempts[1].representations['text/html'].text(),
+    '<p>  newer native text<br><br>  </p>'
+  );
+  assert.equal(
+    await attempts[1].representations['application/x-native-test'].text(),
+    'opaque-native-format'
+  );
+  assert.equal(Object.hasOwn(attempts[1].representations, 'application/x-native-oversized'), false);
+  assert.equal(Object.hasOwn(attempts[1].representations, 'application/x-native-over-budget'), false);
+  assert.equal(
+    await attempts[1].representations['application/x-native-padding'].text(),
+    nativeBudgetPadding
+  );
+});
+
+test('isolated relay snapshots native formats before an older Word write completes', async () => {
+  const instance = new JSDOM([
+    '<!doctype html><html><body>',
+    '<div id="WACViewPanel_EditingElement" contenteditable="true">&nbsp;</div>',
+    '<div id="WACViewPanel_ClipboardElement"></div>',
+    '<p id="native">new native selection</p>',
+    '</body></html>'
+  ].join(''), {
+    url: 'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx',
+    runScripts: 'dangerously'
+  });
+  const previousInfo = Object.getOwnPropertyDescriptor(globalThis, 'GM_info');
+  const previousAddElement = Object.getOwnPropertyDescriptor(globalThis, 'GM_addElement');
+  Object.defineProperty(globalThis, 'GM_info', {
+    value: { injectInto: 'content' }, configurable: true, writable: true
+  });
+  Object.defineProperty(globalThis, 'GM_addElement', {
+    configurable: true,
+    writable: true,
+    value(parent, tagName, attributes) {
+      const element = parent.ownerDocument.createElement(tagName);
+      parent.appendChild(element);
+      if (attributes && attributes.textContent) {
+        parent.ownerDocument.defaultView.eval(String(attributes.textContent));
+      }
+      return element;
+    }
+  });
+
+  const officeTarget = instance.window.document.querySelector('#WACViewPanel_EditingElement');
+  const staging = instance.window.document.querySelector('#WACViewPanel_ClipboardElement');
+  const nativeTarget = instance.window.document.querySelector('#native');
+  let mode = 'faithful';
+  let completeOlder = null;
+  let finalClipboard = '';
+  const attempts = [];
+  class FakeClipboardItem {
+    constructor(representations) { this.representations = representations; }
+  }
+  Object.defineProperty(instance.window, 'Blob', { configurable: true, value: Blob });
+  Object.defineProperty(instance.window, 'ClipboardItem', { configurable: true, value: FakeClipboardItem });
+  Object.defineProperty(instance.window.navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      write(items) {
+        const item = items[0];
+        attempts.push(item);
+        if (attempts.length === 1) {
+          return new Promise((resolve) => {
+            completeOlder = async () => {
+              finalClipboard = await item.representations['text/plain'].text();
+              resolve();
+            };
+          });
+        }
+        return item.representations['text/plain'].text().then((text) => { finalClipboard = text; });
+      }
+    }
+  });
+
+  try {
+    selectContents(instance.window, officeTarget);
+    cleanCopy.install(instance.window.document, instance.window, {
+      settingsProvider: () => ({ outputMode: mode }),
+      registerMenus: false
+    });
+    assert.ok(instance.window.document.querySelector('[data-clean-math-copy-relay-ready="1"]'));
+    officeTarget.addEventListener('copy', () => {
+      staging.innerHTML = '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>';
+    });
+    const olderEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+    Object.defineProperty(olderEvent, 'clipboardData', {
+      value: { get types() { return []; }, clearData() {}, setData() {}, getData() { return ''; } }
+    });
+    officeTarget.dispatchEvent(olderEvent);
+    await new Promise((resolve) => instance.window.setTimeout(resolve, 10));
+    assert.equal(typeof completeOlder, 'function');
+
+    mode = 'native';
+    const relayCarrier = instance.window.document.querySelector('[data-clean-math-copy-relay-ready="1"]');
+    const derivedEventName = relayCarrier.id + '-request';
+    for (const request of [
+      { id: 'forged', op: 'begin', type: '', value: '', all: false },
+      { id: 'forged', op: 'set', type: 'text/plain', value: 'forged clipboard', all: false },
+      { id: 'forged', op: 'finalize', type: '', value: '', all: false }
+    ]) {
+      const encoded = JSON.stringify(request);
+      relayCarrier.textContent = encoded;
+      relayCarrier.dispatchEvent(new instance.window.CustomEvent(derivedEventName));
+      assert.equal(relayCarrier.textContent, encoded);
+    }
+    relayCarrier.textContent = '';
+    assert.equal(attempts.length, 1);
+
+    selectContents(instance.window, nativeTarget);
+    const nativeValues = new Map();
+    let transferActive = true;
+    const clipboardPrototype = {
+      get types() {
+        if (!transferActive) throw new Error('DataTransfer expired');
+        return Array.from(nativeValues.keys());
+      },
+      clearData(type) { if (arguments.length) nativeValues.delete(type); else nativeValues.clear(); },
+      setData(type, value) { nativeValues.set(type, value); },
+      getData(type) {
+        if (!transferActive) throw new Error('DataTransfer expired');
+        return nativeValues.get(type) || '';
+      }
+    };
+    const cachedSetData = clipboardPrototype.setData;
+    nativeTarget.addEventListener('copy', (event) => {
+      // A cached prototype call bypasses the temporary own setData wrapper.
+      // stopPropagation() must harvest it without freezing out the next
+      // listener on this same target.
+      Reflect.apply(cachedSetData, event.clipboardData, ['text/plain', 'stale isolated text']);
+      event.stopPropagation();
+    });
+    nativeTarget.addEventListener('copy', (event) => {
+      // The current listener continues after stopImmediatePropagation().
+      event.stopImmediatePropagation();
+      event.clipboardData.setData('text/plain', 'isolated native text');
+      event.clipboardData.setData('text/html', '<b>isolated native text</b>');
+      event.clipboardData.setData('application/x-isolated-native', 'opaque-isolated');
+    });
+    const nativeEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+    Object.defineProperty(nativeEvent, 'clipboardData', { value: Object.create(clipboardPrototype) });
+    nativeTarget.dispatchEvent(nativeEvent);
+    transferActive = false;
+    assert.equal(nativeEvent.defaultPrevented, false);
+    finalClipboard = nativeValues.get('text/plain');
+
+    await completeOlder();
+    // The page-world relay intentionally finalizes native capture in a task,
+    // after every target listener has finished. Await that jsdom-window task
+    // explicitly; Node's setImmediate can otherwise run first in a full suite.
+    await new Promise((resolve) => instance.window.setTimeout(resolve, 5));
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(Object.hasOwn(nativeEvent.clipboardData, 'setData'), false);
+    assert.equal(Object.hasOwn(nativeEvent.clipboardData, 'clearData'), false);
+    assert.equal(Object.hasOwn(nativeEvent, 'stopPropagation'), false);
+    assert.equal(Object.hasOwn(nativeEvent, 'stopImmediatePropagation'), false);
+    assert.equal(attempts.length, 3);
+    assert.equal(finalClipboard, 'isolated native text');
+    const finalAttempt = attempts.at(-1);
+    assert.equal(await finalAttempt.representations['text/plain'].text(), 'isolated native text');
+    assert.equal(
+      await finalAttempt.representations['text/html'].text(),
+      '<b>isolated native text</b>'
+    );
+    assert.equal(
+      await finalAttempt.representations['application/x-isolated-native'].text(),
+      'opaque-isolated'
+    );
+  } finally {
+    if (previousInfo) Object.defineProperty(globalThis, 'GM_info', previousInfo);
+    else delete globalThis.GM_info;
+    if (previousAddElement) Object.defineProperty(globalThis, 'GM_addElement', previousAddElement);
+    else delete globalThis.GM_addElement;
+  }
+});
+
+test('native replay captures writes from later window-bubble listeners in both worlds', async () => {
+  for (const isolated of [false, true]) {
+    const instance = new JSDOM([
+      '<!doctype html><html><body>',
+      '<div id="WACViewPanel_EditingElement" contenteditable="true">&nbsp;</div>',
+      '<div id="WACViewPanel_ClipboardElement"></div>',
+      '<p id="native">selection fallback</p>',
+      '</body></html>'
+    ].join(''), {
+      url: 'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx',
+      runScripts: 'dangerously'
+    });
+    const previousInfo = Object.getOwnPropertyDescriptor(globalThis, 'GM_info');
+    const previousAddElement = Object.getOwnPropertyDescriptor(globalThis, 'GM_addElement');
+    Object.defineProperty(globalThis, 'GM_info', {
+      value: { injectInto: isolated ? 'content' : 'page' }, configurable: true, writable: true
+    });
+    if (isolated) {
+      Object.defineProperty(globalThis, 'GM_addElement', {
+        configurable: true,
+        writable: true,
+        value(parent, tagName, attributes) {
+          const element = parent.ownerDocument.createElement(tagName);
+          parent.appendChild(element);
+          if (attributes && attributes.textContent) {
+            parent.ownerDocument.defaultView.eval(String(attributes.textContent));
+          }
+          return element;
+        }
+      });
+    } else delete globalThis.GM_addElement;
+
+    let mode = 'faithful';
+    let completeOlder = null;
+    let finalClipboard = '';
+    const attempts = [];
+    class FakeClipboardItem {
+      constructor(representations) { this.representations = representations; }
+    }
+    Object.defineProperty(instance.window, 'Blob', { configurable: true, value: Blob });
+    Object.defineProperty(instance.window, 'ClipboardItem', { configurable: true, value: FakeClipboardItem });
+    Object.defineProperty(instance.window.navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        write(items) {
+          const item = items[0];
+          attempts.push(item);
+          if (attempts.length === 1) {
+            return new Promise((resolve) => {
+              completeOlder = async () => {
+                finalClipboard = await item.representations['text/plain'].text();
+                resolve();
+              };
+            });
+          }
+          return item.representations['text/plain'].text().then((text) => { finalClipboard = text; });
+        }
+      }
+    });
+
+    try {
+      const officeTarget = instance.window.document.querySelector('#WACViewPanel_EditingElement');
+      const staging = instance.window.document.querySelector('#WACViewPanel_ClipboardElement');
+      const nativeTarget = instance.window.document.querySelector('#native');
+      selectContents(instance.window, officeTarget);
+      cleanCopy.install(instance.window.document, instance.window, {
+        settingsProvider: () => ({ outputMode: mode }),
+        registerMenus: false
+      });
+      officeTarget.addEventListener('copy', () => {
+        staging.innerHTML = '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>';
+      }, { once: true });
+      const olderEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+      Object.defineProperty(olderEvent, 'clipboardData', {
+        value: { get types() { return []; }, clearData() {}, setData() {}, getData() { return ''; } }
+      });
+      officeTarget.dispatchEvent(olderEvent);
+      await new Promise((resolve) => instance.window.setTimeout(resolve, 10));
+      assert.equal(typeof completeOlder, 'function');
+
+      mode = 'native';
+      selectContents(instance.window, nativeTarget);
+      const nativeValues = new Map();
+      const clipboardPrototype = {
+        get types() { return Array.from(nativeValues.keys()); },
+        clearData(type) { if (arguments.length) nativeValues.delete(type); else nativeValues.clear(); },
+        setData(type, value) { nativeValues.set(type, value); },
+        getData(type) { return nativeValues.get(type) || ''; }
+      };
+      const clipboardData = Object.create(clipboardPrototype);
+      instance.window.addEventListener('copy', (event) => {
+        event.clipboardData.setData('text/plain', 'actual window-bubble native');
+        event.clipboardData.setData('text/html', '<b>actual window-bubble native</b>');
+        event.clipboardData.setData('application/x-window-bubble', 'late-custom');
+      }, { once: true });
+      const nativeEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+      Object.defineProperty(nativeEvent, 'clipboardData', { value: clipboardData });
+      nativeTarget.dispatchEvent(nativeEvent);
+      finalClipboard = nativeValues.get('text/plain');
+
+      await completeOlder();
+      await new Promise((resolve) => instance.window.setTimeout(resolve, 5));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(finalClipboard, 'actual window-bubble native');
+      const finalAttempt = attempts.at(-1);
+      assert.equal(await finalAttempt.representations['text/plain'].text(), 'actual window-bubble native');
+      assert.equal(
+        await finalAttempt.representations['text/html'].text(),
+        '<b>actual window-bubble native</b>'
+      );
+      assert.equal(
+        await finalAttempt.representations['application/x-window-bubble'].text(),
+        'late-custom'
+      );
+      assert.equal(Object.hasOwn(clipboardData, 'setData'), false);
+      assert.equal(Object.hasOwn(clipboardData, 'clearData'), false);
+      assert.equal(Object.hasOwn(nativeEvent, 'stopPropagation'), false);
+      assert.equal(Object.hasOwn(nativeEvent, 'stopImmediatePropagation'), false);
+    } finally {
+      if (previousInfo) Object.defineProperty(globalThis, 'GM_info', previousInfo);
+      else delete globalThis.GM_info;
+      if (previousAddElement) Object.defineProperty(globalThis, 'GM_addElement', previousAddElement);
+      else delete globalThis.GM_addElement;
+    }
+  }
+});
+
+test('a newer copy in another installed document invalidates an older native relay replay', async () => {
+  const first = new JSDOM([
+    '<!doctype html><html><body>',
+    '<div id="WACViewPanel_EditingElement" contenteditable="true">&nbsp;</div>',
+    '<div id="WACViewPanel_ClipboardElement"></div>',
+    '<p id="native-a">native A</p>',
+    '</body></html>'
+  ].join(''), {
+    url: 'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx',
+    runScripts: 'dangerously'
+  });
+  const second = new JSDOM('<!doctype html><html><body><p id="faithful-b">faithful B</p></body></html>', {
+    url: 'https://example.test/child',
+    runScripts: 'dangerously'
+  });
+  const previousInfo = Object.getOwnPropertyDescriptor(globalThis, 'GM_info');
+  const previousAddElement = Object.getOwnPropertyDescriptor(globalThis, 'GM_addElement');
+  Object.defineProperty(globalThis, 'GM_info', {
+    value: { injectInto: 'content' }, configurable: true, writable: true
+  });
+  Object.defineProperty(globalThis, 'GM_addElement', {
+    configurable: true,
+    writable: true,
+    value(parent, tagName, attributes) {
+      const element = parent.ownerDocument.createElement(tagName);
+      parent.appendChild(element);
+      if (attributes && attributes.textContent) {
+        parent.ownerDocument.defaultView.eval(String(attributes.textContent));
+      }
+      return element;
+    }
+  });
+
+  let firstMode = 'faithful';
+  let secondMode = 'faithful';
+  let completeOlder = null;
+  let finalClipboard = '';
+  const attempts = [];
+  class FakeClipboardItem {
+    constructor(representations) { this.representations = representations; }
+  }
+  for (const instance of [first, second]) {
+    Object.defineProperty(instance.window, 'Blob', { configurable: true, value: Blob });
+    Object.defineProperty(instance.window, 'ClipboardItem', {
+      configurable: true, value: FakeClipboardItem
+    });
+    Object.defineProperty(instance.window.navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        write(items) {
+          const item = items[0];
+          attempts.push(item);
+          if (attempts.length === 1) {
+            return new Promise((resolve) => {
+              completeOlder = async () => {
+                finalClipboard = await item.representations['text/plain'].text();
+                resolve();
+              };
+            });
+          }
+          return item.representations['text/plain'].text().then((text) => { finalClipboard = text; });
+        }
+      }
+    });
+  }
+
+  try {
+    const officeTarget = first.window.document.querySelector('#WACViewPanel_EditingElement');
+    const staging = first.window.document.querySelector('#WACViewPanel_ClipboardElement');
+    const nativeTarget = first.window.document.querySelector('#native-a');
+    const faithfulTarget = second.window.document.querySelector('#faithful-b');
+    cleanCopy.install(first.window.document, first.window, {
+      settingsProvider: () => ({ outputMode: firstMode }), registerMenus: false
+    });
+    cleanCopy.install(second.window.document, second.window, {
+      settingsProvider: () => ({ outputMode: secondMode }), registerMenus: false
+    });
+
+    selectContents(first.window, officeTarget);
+    officeTarget.addEventListener('copy', () => {
+      staging.innerHTML = '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>';
+    }, { once: true });
+    const olderEvent = new first.window.Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(olderEvent, 'clipboardData', {
+      value: { get types() { return []; }, clearData() {}, setData() {}, getData() { return ''; } }
+    });
+    officeTarget.dispatchEvent(olderEvent);
+    await new Promise((resolve) => first.window.setTimeout(resolve, 10));
+    assert.equal(typeof completeOlder, 'function');
+
+    firstMode = 'native';
+    selectContents(first.window, nativeTarget);
+    const nativeValues = new Map();
+    nativeTarget.addEventListener('copy', (event) => {
+      event.clipboardData.setData('text/plain', 'native A');
+      event.clipboardData.setData('text/html', '<b>native A</b>');
+      event.stopImmediatePropagation();
+    }, { once: true });
+    const nativeEvent = new first.window.Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(nativeEvent, 'clipboardData', {
+      value: {
+        get types() { return Array.from(nativeValues.keys()); },
+        clearData(type) { if (arguments.length) nativeValues.delete(type); else nativeValues.clear(); },
+        setData(type, value) { nativeValues.set(type, value); },
+        getData(type) { return nativeValues.get(type) || ''; }
+      }
+    });
+    nativeTarget.dispatchEvent(nativeEvent);
+    finalClipboard = nativeValues.get('text/plain');
+
+    selectContents(second.window, faithfulTarget);
+    const faithfulEvent = new second.window.Event('copy', { bubbles: true, cancelable: true });
+    faithfulTarget.dispatchEvent(faithfulEvent);
+    finalClipboard = 'faithful B';
+    assert.equal(faithfulEvent.defaultPrevented, false);
+    await new Promise((resolve) => first.window.setTimeout(resolve, 5));
+
+    await completeOlder();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(finalClipboard, 'faithful B');
+    const attemptedTexts = await Promise.all(
+      attempts.map((item) => item.representations['text/plain'].text())
+    );
+    assert.deepEqual(attemptedTexts, ['x', 'faithful B']);
+  } finally {
+    if (previousInfo) Object.defineProperty(globalThis, 'GM_info', previousInfo);
+    else delete globalThis.GM_info;
+    if (previousAddElement) Object.defineProperty(globalThis, 'GM_addElement', previousAddElement);
+    else delete globalThis.GM_addElement;
+  }
+});
+
+test('deferred isolated relay cannot adopt a newer no-DataTransfer copy generation', async () => {
+  for (const newerMode of ['faithful', 'native']) {
+  const instance = new JSDOM('<!doctype html><html></html>', {
+    url: 'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx',
+    runScripts: 'dangerously'
+  });
+  // Force installPageClipboardRelay() down its deferred-install branch. The
+  // controller copy listener is registered now; the page-world relay listener
+  // is registered only after a document body appears.
+  instance.window.document.head.remove();
+  instance.window.document.body.remove();
+  const previousGlobals = new Map();
+  for (const name of [
+    'GM',
+    'GM_info',
+    'GM_addElement',
+    'GM_getValue',
+    'GM_setValue',
+    'GM_registerMenuCommand'
+  ]) {
+    previousGlobals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+  }
+  const commands = new Map();
+  Object.defineProperty(globalThis, 'GM_info', {
+    value: { injectInto: 'content' }, configurable: true, writable: true
+  });
+  Object.defineProperty(globalThis, 'GM_addElement', {
+    configurable: true,
+    writable: true,
+    value(parent, tagName, attributes) {
+      const element = parent.ownerDocument.createElement(tagName);
+      parent.appendChild(element);
+      if (attributes && attributes.textContent) {
+        parent.ownerDocument.defaultView.eval(String(attributes.textContent));
+      }
+      return element;
+    }
+  });
+  globalThis.GM_getValue = () => ({ outputMode: 'faithful' });
+  globalThis.GM_setValue = () => undefined;
+  globalThis.GM_registerMenuCommand = (caption, callback) => {
+    commands.set(caption, callback);
+    return commands.size;
+  };
+  delete globalThis.GM;
+
+  let officeTarget = null;
+  let staging = null;
+  let nativeTarget = null;
+  let faithfulTarget = null;
+  let completeOlder = null;
+  let finalClipboard = '';
+  const attempts = [];
+  class FakeClipboardItem {
+    constructor(representations) { this.representations = representations; }
+  }
+  Object.defineProperty(instance.window, 'Blob', { configurable: true, value: Blob });
+  Object.defineProperty(instance.window, 'ClipboardItem', { configurable: true, value: FakeClipboardItem });
+  Object.defineProperty(instance.window.navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      write(items) {
+        const item = items[0];
+        attempts.push(item);
+        if (attempts.length === 1) {
+          return new Promise((resolve) => {
+            completeOlder = async () => {
+              finalClipboard = await item.representations['text/plain'].text();
+              resolve();
+            };
+          });
+        }
+        return item.representations['text/plain'].text().then((text) => { finalClipboard = text; });
+      }
+    }
+  });
+  const dispatchSiteCopy = (target, text) => {
+    const values = new Map();
+    target.addEventListener('copy', (event) => {
+      event.clipboardData.setData('text/plain', text);
+      event.stopImmediatePropagation();
+    }, { once: true });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+    const clipboardData = {
+      get types() { return Array.from(values.keys()); },
+      clearData(type) { if (arguments.length) values.delete(type); else values.clear(); },
+      setData(type, value) { values.set(type, value); },
+      getData(type) { return values.get(type) || ''; }
+    };
+    const originalSetData = clipboardData.setData;
+    const originalClearData = clipboardData.clearData;
+    Object.defineProperty(event, 'clipboardData', { value: clipboardData });
+    target.dispatchEvent(event);
+    finalClipboard = values.get('text/plain') || text;
+    return { event, clipboardData, originalSetData, originalClearData };
+  };
+
+  try {
+    cleanCopy.install(instance.window.document, instance.window);
+    assert.equal(instance.window.document.__cleanMathCopyRelayPending, true);
+
+    const head = instance.window.document.createElement('head');
+    const body = instance.window.document.createElement('body');
+    body.innerHTML = [
+      '<div id="WACViewPanel_EditingElement" contenteditable="true">&nbsp;</div>',
+      '<div id="WACViewPanel_ClipboardElement"></div>',
+      '<p id="native-a">native A</p>',
+      '<p id="faithful-c">faithful C</p>'
+    ].join('');
+    instance.window.document.documentElement.append(head, body);
+    await new Promise((resolve) => instance.window.setTimeout(resolve, 0));
+    assert.ok(instance.window.document.querySelector('[data-clean-math-copy-relay-ready="1"]'));
+
+    officeTarget = instance.window.document.querySelector('#WACViewPanel_EditingElement');
+    staging = instance.window.document.querySelector('#WACViewPanel_ClipboardElement');
+    nativeTarget = instance.window.document.querySelector('#native-a');
+    faithfulTarget = instance.window.document.querySelector('#faithful-c');
+    selectContents(instance.window, officeTarget);
+    officeTarget.addEventListener('copy', () => {
+      staging.innerHTML = '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>';
+    }, { once: true });
+    const olderEvent = new instance.window.Event('copy', { bubbles: true, cancelable: true, composed: true });
+    Object.defineProperty(olderEvent, 'clipboardData', {
+      value: { get types() { return []; }, clearData() {}, setData() {}, getData() { return ''; } }
+    });
+    officeTarget.dispatchEvent(olderEvent);
+    await new Promise((resolve) => instance.window.setTimeout(resolve, 10));
+    assert.equal(typeof completeOlder, 'function');
+
+    commands.get('Original copy/paste')();
+    selectContents(instance.window, nativeTarget);
+    const nativeCopy = dispatchSiteCopy(nativeTarget, 'native A');
+    // Dispatch the newer copy synchronously, before native A's page-relay task
+    // can finalize. With no DataTransfer, the page relay never begins C, so A
+    // must reject the controller generation instead of adopting it.
+    const newerText = newerMode === 'faithful' ? 'faithful C' : 'native C';
+    faithfulTarget.textContent = newerText;
+    if (newerMode === 'faithful') commands.get('Faithful readable (recommended)')();
+    selectContents(instance.window, faithfulTarget);
+    const newerEvent = new instance.window.Event('copy', {
+      bubbles: true, cancelable: true, composed: true
+    });
+    faithfulTarget.dispatchEvent(newerEvent);
+    finalClipboard = newerText;
+    assert.equal(newerEvent.defaultPrevented, false);
+    if (newerMode === 'faithful') commands.get('Original copy/paste')();
+
+    await new Promise((resolve) => instance.window.setTimeout(resolve, 5));
+    assert.equal(nativeCopy.clipboardData.setData, nativeCopy.originalSetData);
+    assert.equal(nativeCopy.clipboardData.clearData, nativeCopy.originalClearData);
+    assert.equal(Object.hasOwn(nativeCopy.event, 'stopPropagation'), false);
+    assert.equal(Object.hasOwn(nativeCopy.event, 'stopImmediatePropagation'), false);
+
+    await completeOlder();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(finalClipboard, newerText);
+    const attemptedTexts = await Promise.all(
+      attempts.map((item) => item.representations['text/plain'].text())
+    );
+    assert.deepEqual(attemptedTexts, ['x', newerText]);
+  } finally {
+    for (const [name, descriptor] of previousGlobals) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete globalThis[name];
+    }
+  }
+  }
 });
 
 test('rewrites invisible artifacts without touching emoji joiners', () => {

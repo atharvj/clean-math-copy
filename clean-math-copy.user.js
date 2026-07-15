@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.2.0
+// @version      2.3.0
 // @description  Faithfully copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
@@ -17,12 +17,14 @@
 // @inject-into  auto
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        GM_setClipboard
 // @grant        GM_addElement
 // @grant        unsafeWindow
 // @grant        GM.getValue
 // @grant        GM.setValue
+// @grant        GM.addValueChangeListener
 // @grant        GM.registerMenuCommand
 // @grant        GM.setClipboard
 // @grant        GM.addElement
@@ -138,7 +140,7 @@
     '[data-testid*="formula"]'
   ].join(',');
 
-  const OUTPUT_MODES = Object.freeze(['faithful', 'calculator', 'latex']);
+  const OUTPUT_MODES = Object.freeze(['faithful', 'calculator', 'latex', 'native']);
   const DEFAULT_SETTINGS = Object.freeze({ outputMode: 'faithful' });
 
   const SYMBOLS = Object.freeze({
@@ -8464,6 +8466,30 @@
     }
   }
 
+  function nativeClipboardSnapshotPayload(values, fallbackText) {
+    const entries = values instanceof Map ? values : new Map();
+    const find = (types) => {
+      for (const type of types) {
+        const entry = entries.get(type);
+        if (entry && typeof entry.value === 'string') return entry;
+      }
+      return null;
+    };
+    const plain = find(['text/plain', 'text', 'unicode']);
+    const html = find(['text/html']);
+    const mathML = find(['application/mathml+xml', 'mathml', 'mathml presentation']);
+    const text = plain && plain.value || String(fallbackText || '');
+    if (!text || !text.trim()) return null;
+    return {
+      text,
+      html: html && html.value || '',
+      mathML: mathML && mathML.value || '',
+      formats: Array.from(entries.values(), (entry) => ({ type: entry.type, text: entry.value })),
+      reason: 'pending-native-copy-replay',
+      mathRanges: 0
+    };
+  }
+
   function officeSemanticPayloadFromClipboard(clipboardData, settings, documentObject) {
     const types = clipboardTypes(clipboardData);
     const mathTypes = ['application/mathml+xml', 'MathML', 'MathML Presentation'];
@@ -9772,6 +9798,10 @@
 
   function getCopyPayload(documentObject, selection, settingsInput, pageWindow, target) {
     const settings = normalizeSettings(settingsInput);
+    // Native mode is a hard opt-out. Do not even inspect the selection: sites
+    // can expose stateful ranges or clipboard projections, and the contract of
+    // this mode is exactly the browser/site's original copy operation.
+    if (settings.outputMode === 'native') return null;
     if (!selection || selection.isCollapsed || isTextControl(target)) return null;
     const rangeCount = boundedSelectionRangeCount(selection);
     if (rangeCount <= 0) return null;
@@ -9841,21 +9871,36 @@
     return null;
   }
 
-  function loadSettings() {
+  function loadInitialSettings() {
     try {
       if (typeof GM_getValue === 'function') {
-        const stored = GM_getValue(STORAGE_KEY, DEFAULT_SETTINGS);
-        if (stored && typeof stored.then === 'function') return normalizeSettings(DEFAULT_SETTINGS);
-        return normalizeSettings(stored);
+        const legacyGetValue = GM_getValue;
+        const stored = legacyGetValue(STORAGE_KEY, DEFAULT_SETTINGS);
+        if (stored && typeof stored.then === 'function') {
+          Promise.resolve(stored).catch(() => {});
+          return {
+            settings: normalizeSettings(DEFAULT_SETTINGS),
+            // Re-read only after the storage listener is ready. The first
+            // thenable was merely capability detection and may be stale.
+            pendingRead: () => legacyGetValue(STORAGE_KEY, DEFAULT_SETTINGS)
+          };
+        }
+        return { settings: normalizeSettings(stored), pendingRead: null };
       }
     } catch (_error) {
-      // Use localStorage or defaults below.
+      // Try the modern manager API after subscribing to storage changes.
     }
+    const modernRead = global.GM && typeof global.GM.getValue === 'function'
+      ? () => global.GM.getValue(STORAGE_KEY, DEFAULT_SETTINGS)
+      : null;
     try {
       const stored = global.localStorage && global.localStorage.getItem(STORAGE_KEY);
-      return normalizeSettings(stored ? JSON.parse(stored) : DEFAULT_SETTINGS);
+      return {
+        settings: normalizeSettings(stored ? JSON.parse(stored) : DEFAULT_SETTINGS),
+        pendingRead: modernRead
+      };
     } catch (_error) {
-      return normalizeSettings(DEFAULT_SETTINGS);
+      return { settings: normalizeSettings(DEFAULT_SETTINGS), pendingRead: modernRead };
     }
   }
 
@@ -9909,6 +9954,10 @@
 
   let clipboardWriteTail = Promise.resolve();
   let pendingClipboardWrites = 0;
+  // Clipboard writes are process-wide within this userscript realm, so the
+  // newest user copy intent must also be shared by every installed document
+  // and observed child frame.
+  let clipboardIntentGeneration = 0;
 
   function enqueueClipboardWrite(operation) {
     pendingClipboardWrites += 1;
@@ -9941,6 +9990,15 @@
         if (payload.html) baseRepresentations['text/html'] = new BlobConstructor([payload.html], { type: 'text/html' });
         const representations = { ...baseRepresentations };
         if (payload.mathML) representations['application/mathml+xml'] = new BlobConstructor([payload.mathML], { type: 'application/mathml+xml' });
+        for (const format of Array.isArray(payload.formats) ? payload.formats : []) {
+          if (!format || typeof format.type !== 'string' || typeof format.text !== 'string') continue;
+          const type = format.type.toLowerCase();
+          if (!/^[\w!#$&^_.+-]+\/[\w!#$&^_.+-]+$/i.test(type) || Object.hasOwn(representations, type)) continue;
+          representations[type] = new BlobConstructor([format.text], { type });
+        }
+        const hasEnhancedRepresentations = Object.keys(representations).some(
+          (type) => !Object.hasOwn(baseRepresentations, type)
+        );
         const write = (formats) => Promise.resolve().then(() => {
           if (!isCurrent()) return false;
           return Promise.resolve(clipboard.write([new ClipboardItemConstructor(formats)])).then(() => Boolean(isCurrent()));
@@ -9949,7 +10007,7 @@
           (written) => written,
           () => {
             if (!isCurrent()) return false;
-            return payload.mathML
+            return hasEnhancedRepresentations
               ? write(baseRepresentations).then(
                 (written) => written,
                 () => writePlainFallback()
@@ -10858,9 +10916,26 @@
         }
       };
 
-      request('begin', '', '', false);
+      const beginResponse = request('begin', '', '', false);
+      if (!beginResponse) {
+        // The private carrier can be removed by a document rewrite or become
+        // unavailable during teardown. Without a live controller there is
+        // nothing to relay, so never patch page-owned event/DataTransfer APIs.
+        active = false;
+        try { carrier.textContent = ''; } catch (_error) { /* ignore */ }
+        return;
+      }
+      if (beginResponse && beginResponse.action === 'bypass') {
+        // The userscript is in Original copy/paste mode. Leave DataTransfer,
+        // propagation methods, clipboard formats, and default handling wholly
+        // untouched for this event.
+        active = false;
+        carrier.textContent = '';
+        return;
+      }
+      const captureAllNativeFormats = Boolean(beginResponse && beginResponse.action === 'capture');
       const recordNativeSet = (actualType, actualValue) => {
-        if (!relayedType(actualType)) return;
+        if (!captureAllNativeFormats && !relayedType(actualType)) return;
         const key = normalizedType(actualType);
         nativeValues.set(key, { type: actualType, value: actualValue });
         injectedValues.delete(key);
@@ -10871,7 +10946,7 @@
           nativeValues.clear();
           injectedValues.clear();
           request('clear', actualType, '', true);
-        } else if (relayedType(actualType)) {
+        } else if (captureAllNativeFormats || relayedType(actualType)) {
           const key = normalizedType(actualType);
           nativeValues.delete(key);
           injectedValues.delete(key);
@@ -10930,7 +11005,7 @@
         const present = new Set();
         for (const rawType of rawTypes) {
           const actualType = String(rawType == null ? '' : rawType).slice(0, 256);
-          if (!relayedType(actualType)) continue;
+          if (!captureAllNativeFormats && !relayedType(actualType)) continue;
           if (snapshot.length >= 32) break;
           const key = normalizedType(actualType);
           present.add(key);
@@ -10971,12 +11046,20 @@
         : null;
       const wrappedStop = function cleanMathCopyRelayedStopPropagation() {
         harvestFinalClipboard();
-        request('finalize', '', '', false);
+        // stopPropagation() still permits later listeners on the same target.
+        // Native capture must keep observing those writes and finalize from the
+        // cleanup task after dispatch; semantic rewriting still has to finish
+        // synchronously while DataTransfer remains writable.
+        if (!captureAllNativeFormats) request('finalize', '', '', false);
         return reflectApply(nativeStop, event, []);
       };
       const wrappedStopImmediate = function cleanMathCopyRelayedStopImmediatePropagation() {
         harvestFinalClipboard();
-        request('finalize', '', '', false);
+        // The calling listener continues after stopImmediatePropagation() and
+        // may still write clipboard data. Native capture therefore remains
+        // active until the post-dispatch task; semantic rewriting must still
+        // finalize synchronously while DataTransfer is writable.
+        if (!captureAllNativeFormats) request('finalize', '', '', false);
         return reflectApply(nativeStopImmediate, event, []);
       };
       const stopRecord = nativeStop ? patchMethod(event, 'stopPropagation', wrappedStop) : null;
@@ -11001,19 +11084,23 @@
         request('finalize', '', '', false);
         cleanupCopy();
       };
-      pageCopyEvents.set(event, finishCopy);
+      // A page can still write from a later window-bubble listener. Native
+      // mode therefore keeps every wrapper live until the post-dispatch task;
+      // this bubble hook only harvests cached/prototype writes seen so far.
+      pageCopyEvents.set(event, captureAllNativeFormats ? harvestFinalClipboard : finishCopy);
       if (scheduleTask) {
         // A task runs after the full dispatch, unlike a microtask queued from
         // window capture (Chromium can checkpoint that before target
-        // listeners). It is cleanup-only because DataTransfer has expired by
-        // then; the page-world bubble listener performs the final harvest.
-        reflectApply(scheduleTask, window, [cleanupCopy, 0]);
+        // listeners). Normal semantic relay cleanup cannot write through an
+        // expired DataTransfer. Native capture, however, has already recorded
+        // each wrapped write and can safely queue that immutable snapshot now.
+        reflectApply(scheduleTask, window, [captureAllNativeFormats ? finishCopy : cleanupCopy, 0]);
       }
     };
 
     const onCopyBubble = (event) => {
-      const finishCopy = pageCopyEvents.get(event);
-      if (finishCopy) finishCopy();
+      const observeCopy = pageCopyEvents.get(event);
+      if (observeCopy) observeCopy();
     };
 
     reflectApply(addEventListener, window, ['copy', onCopy, true]);
@@ -11097,6 +11184,46 @@
   }
 
   function recordPageRelayOperation(state, request, settings, documentObject, googleDocs) {
+    if (state.nativeCapture) {
+      const capture = state.nativeCapture;
+      const normalizedType = String(request.type || '').toLowerCase();
+      capture.operations += 1;
+      if (capture.operations > MAX_PAGE_RELAY_OPERATIONS && request.op !== 'finalize') {
+        capture.values.clear();
+        capture.characters = 0;
+        return { action: '', prevent: false };
+      }
+      if (request.op === 'set') {
+        const previous = capture.values.get(normalizedType);
+        if (!previous && capture.values.size >= 64) return { action: '', prevent: false };
+        const previousLength = previous ? previous.value.length : 0;
+        const nextLength = request.overflow ? 0 : request.value.length;
+        if (request.overflow || capture.characters - previousLength + nextLength > MAX_CLIPBOARD_MARKUP_LENGTH) {
+          capture.values.delete(normalizedType);
+          capture.characters -= previousLength;
+        } else {
+          capture.values.set(normalizedType, { type: request.type, value: request.value });
+          capture.characters += nextLength - previousLength;
+        }
+      } else if (request.op === 'clear') {
+        if (request.all) {
+          capture.values.clear();
+          capture.characters = 0;
+        } else {
+          const previous = capture.values.get(normalizedType);
+          if (previous) capture.characters -= previous.value.length;
+          capture.values.delete(normalizedType);
+        }
+      } else if (request.op === 'finalize' && !capture.queued) {
+        capture.queued = true;
+        const payload = nativeClipboardSnapshotPayload(capture.values, capture.fallbackText);
+        if (payload) capture.queue(payload);
+      }
+      return { action: '', prevent: false };
+    }
+    if (normalizeSettings(settings).outputMode === 'native') {
+      return pageRelayRestoreResponse(state);
+    }
     if (state.relayDisabled) return { action: '', prevent: false };
     state.relayOperations = (state.relayOperations || 0) + 1;
     const disableAfterOperation = state.relayOperations > MAX_PAGE_RELAY_OPERATIONS;
@@ -11165,7 +11292,16 @@
       : pageRelayResponse(state, request.op === 'finalize'));
   }
 
-  function installPageClipboardRelay(documentObject, userscriptGlobal, pageWindow, settingsProvider, googleDocs) {
+  function installPageClipboardRelay(
+    documentObject,
+    userscriptGlobal,
+    pageWindow,
+    settingsProvider,
+    googleDocs,
+    copyGenerationProvider,
+    modeGenerationProvider,
+    relayInstallation
+  ) {
     if (!documentObject || !pageRelayExecutionIsIsolated(userscriptGlobal, pageWindow, documentObject)) return false;
     if (!documentObject.documentElement || (!documentObject.head && !documentObject.body)) {
       if (documentObject.__cleanMathCopyRelayPending) return false;
@@ -11176,7 +11312,16 @@
           if (!documentObject.documentElement || (!documentObject.head && !documentObject.body)) return;
           observer.disconnect();
           try { delete documentObject.__cleanMathCopyRelayPending; } catch (_error) { /* ignore */ }
-          installPageClipboardRelay(documentObject, userscriptGlobal, pageWindow, settingsProvider, googleDocs);
+          installPageClipboardRelay(
+            documentObject,
+            userscriptGlobal,
+            pageWindow,
+            settingsProvider,
+            googleDocs,
+            copyGenerationProvider,
+            modeGenerationProvider,
+            relayInstallation
+          );
         });
         observer.observe(documentObject, { childList: true, subtree: true });
       } catch (_error) {
@@ -11184,7 +11329,7 @@
       }
       return false;
     }
-    const random = new Uint32Array(4);
+    const random = new Uint32Array(8);
     try {
       const cryptoObject = (userscriptGlobal && userscriptGlobal.crypto) || global.crypto;
       if (cryptoObject && typeof cryptoObject.getRandomValues === 'function') cryptoObject.getRandomValues(random);
@@ -11192,15 +11337,21 @@
     } catch (_error) {
       for (let index = 0; index < random.length; index += 1) random[index] = Math.floor(Math.random() * 0xffffffff);
     }
-    const token = Array.from(random, (value) => value.toString(36)).join('-');
-    const carrierId = 'clean-math-copy-relay-' + token;
-    const eventName = carrierId + '-request';
+    const randomParts = Array.from(random, (value) => value.toString(36));
+    const carrierId = 'clean-math-copy-relay-' + randomParts.slice(0, 4).join('-');
+    // Do not derive the request capability from the DOM-visible carrier ID.
+    // Only the injected page closure and controller closure receive this
+    // independent random event name.
+    const eventName = 'clean-math-copy-request-' + randomParts.slice(4).join('-');
     const carrier = documentObject.createElement('span');
     carrier.id = carrierId;
     carrier.hidden = true;
     carrier.setAttribute('aria-hidden', 'true');
     documentObject.documentElement.appendChild(carrier);
+    if (relayInstallation) relayInstallation.carrier = carrier;
+    const expectedControllerCopyDelta = relayInstallation && relayInstallation.controllerReady ? 0 : 1;
     const active = new Map();
+    let relayCopySerial = 0;
     const onRequest = () => {
       let request;
       let response = { id: '' };
@@ -11220,6 +11371,61 @@
           request.overflow = true;
         }
         if (request.op === 'begin') {
+          const captureSerial = ++relayCopySerial;
+          const relaySettings = normalizeSettings(settingsProvider());
+          const beginCopyGeneration = typeof copyGenerationProvider === 'function'
+            ? copyGenerationProvider()
+            : null;
+          const beginModeGeneration = typeof modeGenerationProvider === 'function'
+            ? modeGenerationProvider()
+            : null;
+          if (relaySettings.outputMode === 'native') {
+            if (!hasPendingClipboardWrite()) {
+              response = { id: response.id, action: 'bypass', prevent: false };
+              return;
+            }
+            const selection = documentObject.getSelection ? documentObject.getSelection() : null;
+            const state = createSiteCopyState();
+            state.nativeCapture = {
+              values: new Map(),
+              fallbackText: selectedNativeClipboardText(selection, null),
+              queued: false,
+              operations: 0,
+              characters: 0,
+              queue: (payload) => {
+                // Finalization runs after both the page-world and controller
+                // capture handlers regardless of which one was registered
+                // first. Bind to the generations observed now, then require
+                // this to remain the newest relay event until the queued write.
+                if (relayCopySerial !== captureSerial) return Promise.resolve(false);
+                const captureGeneration = typeof copyGenerationProvider === 'function'
+                  ? copyGenerationProvider()
+                  : null;
+                const captureModeGeneration = typeof modeGenerationProvider === 'function'
+                  ? modeGenerationProvider()
+                  : null;
+                if (beginCopyGeneration != null &&
+                    captureGeneration !== beginCopyGeneration + expectedControllerCopyDelta) {
+                  return Promise.resolve(false);
+                }
+                if (beginModeGeneration != null && captureModeGeneration !== beginModeGeneration) {
+                  return Promise.resolve(false);
+                }
+                return enqueueClipboardPayload(
+                  payload,
+                  pageWindow,
+                  () => normalizeSettings(settingsProvider()).outputMode === 'native' &&
+                    relayCopySerial === captureSerial &&
+                    (captureGeneration == null || copyGenerationProvider() === captureGeneration) &&
+                    (captureModeGeneration == null || modeGenerationProvider() === captureModeGeneration)
+                );
+              }
+            };
+            while (active.size >= MAX_PAGE_RELAY_ACTIVE_EVENTS) active.delete(active.keys().next().value);
+            active.set(response.id, state);
+            response = { id: response.id, action: 'capture', prevent: false };
+            return;
+          }
           while (active.size >= MAX_PAGE_RELAY_ACTIVE_EVENTS) active.delete(active.keys().next().value);
           active.set(response.id, createSiteCopyState());
           return;
@@ -11263,6 +11469,7 @@
     if (carrier.getAttribute('data-clean-math-copy-relay-ready') === '1') return true;
     carrier.removeEventListener(eventName, onRequest, false);
     carrier.remove();
+    if (relayInstallation && relayInstallation.carrier === carrier) relayInstallation.carrier = null;
     return false;
   }
 
@@ -11334,6 +11541,30 @@
       ? null
       : googleDocsClipboardFrameHost(documentObject);
     if (inheritedGoogleDocsHost) {
+      let earlySettingsProvider = typeof options.settingsProvider === 'function'
+        ? options.settingsProvider
+        : null;
+      if (!earlySettingsProvider && typeof GM_getValue === 'function') {
+        try {
+          const legacyGetValue = GM_getValue;
+          let lastStored = legacyGetValue(STORAGE_KEY, DEFAULT_SETTINGS);
+          if (!lastStored || typeof lastStored.then !== 'function') {
+            earlySettingsProvider = () => {
+              try {
+                const stored = legacyGetValue(STORAGE_KEY, lastStored);
+                if (!stored || typeof stored.then !== 'function') lastStored = stored;
+              } catch (_error) {
+                // Keep the last synchronous value.
+              }
+              return normalizeSettings(lastStored);
+            };
+          } else {
+            Promise.resolve(lastStored).catch(() => {});
+          }
+        } catch (_error) {
+          // Promise-only/modern APIs use the normal controller below.
+        }
+      }
       // Managers can inject into inherited about:blank documents before Docs
       // assigns the texteventtarget class. Own that child immediately with the
       // parent editor context; a generic about:blank install would set the
@@ -11341,12 +11572,10 @@
       options = {
         ...options,
         pageWindow: inheritedGoogleDocsHost,
-        // A child can win the race before the top controller exists. Read the
-        // manager's shared setting at copy time so later menu changes still
-        // apply to that already-installed frame.
-        settingsProvider: typeof options.settingsProvider === 'function'
-          ? options.settingsProvider
-          : loadSettings,
+        // A child can win the race before the top controller exists. Without
+        // an inherited provider, let it create a normal synchronized settings
+        // controller so Promise-only manager APIs work there too.
+        settingsProvider: earlySettingsProvider || undefined,
         registerMenus: false,
         observeGoogleDocsFrames: false
       };
@@ -11357,12 +11586,23 @@
       ? options.settingsProvider
       : null;
     const pageWindow = options.pageWindow || getPageWindow(userscriptGlobal || global);
-    let settings = inheritedSettingsProvider
-      ? normalizeSettings(inheritedSettingsProvider())
-      : loadSettings();
-    const currentSettings = () => inheritedSettingsProvider
-      ? normalizeSettings(inheritedSettingsProvider())
-      : settings;
+    const initialSettings = inheritedSettingsProvider
+      ? { settings: normalizeSettings(inheritedSettingsProvider()), pendingRead: null }
+      : loadInitialSettings();
+    let settings = initialSettings.settings;
+    let modeGeneration = 0;
+    let observedOutputMode = settings.outputMode;
+    const observeSettings = (settingsInput) => {
+      const next = normalizeSettings(settingsInput);
+      if (next.outputMode !== observedOutputMode) {
+        observedOutputMode = next.outputMode;
+        modeGeneration += 1;
+      }
+      return next;
+    };
+    const currentSettings = () => observeSettings(inheritedSettingsProvider
+      ? inheritedSettingsProvider()
+      : settings);
     let settingsGeneration = 0;
     const handledEvents = new WeakSet();
     const officeCopyStates = new WeakMap();
@@ -11370,42 +11610,276 @@
     const googleDocsPage = isGoogleDocsPage(pageWindow);
     let activeOfficeState = null;
     let officeGeneration = 0;
-    let copyGeneration = 0;
-    let refreshModeMenus = () => {};
 
-    const pageRelayInstalled = installPageClipboardRelay(
+    const invalidatePendingRewrites = () => {
+      officeGeneration += 1;
+      if (activeOfficeState && activeOfficeState.recovery) activeOfficeState.recovery.stop();
+      activeOfficeState = null;
+    };
+
+    const applyStoredSettings = (stored, countAsChange) => {
+      const next = observeSettings(stored);
+      if (countAsChange) settingsGeneration += 1;
+      settings = next;
+      if (next.outputMode === 'native') invalidatePendingRewrites();
+    };
+
+    const pageRelayInstallation = { carrier: null, controllerReady: false };
+    installPageClipboardRelay(
       documentObject,
       userscriptGlobal || global,
       pageWindow,
       currentSettings,
-      googleDocsPage
+      googleDocsPage,
+      () => clipboardIntentGeneration,
+      () => modeGeneration,
+      pageRelayInstallation
     );
-
-    try {
-      if (!inheritedSettingsProvider && global.GM && typeof global.GM.getValue === 'function') {
-        const loadGeneration = settingsGeneration;
-        Promise.resolve(global.GM.getValue(STORAGE_KEY, DEFAULT_SETTINGS)).then((stored) => {
-          // A menu command can run while an asynchronous manager read is
-          // pending. Never let that stale startup value overwrite the newer
-          // in-memory choice the user has already made and persisted.
-          if (settingsGeneration === loadGeneration) {
-            settings = normalizeSettings(stored);
-            refreshModeMenus();
-          }
-        }, () => {});
+    const pageRelayReady = () => {
+      const carrier = pageRelayInstallation.carrier;
+      try {
+        return Boolean(carrier && carrier.isConnected &&
+          carrier.getAttribute('data-clean-math-copy-relay-ready') === '1');
+      } catch (_error) {
+        return false;
       }
-    } catch (_error) {
-      // Synchronous manager APIs or defaults remain active.
+    };
+
+    let listenerReady = null;
+    if (!inheritedSettingsProvider) {
+      const onSettingsChange = (_name, _oldValue, newValue) => {
+        applyStoredSettings(newValue, true);
+      };
+      const modernAddValueChangeListener = global.GM &&
+        typeof global.GM.addValueChangeListener === 'function'
+        ? global.GM.addValueChangeListener.bind(global.GM)
+        : null;
+      let listenerResult = null;
+      let legacyListenerFailed = false;
+      let listenerFromLegacy = false;
+      if (typeof GM_addValueChangeListener === 'function') {
+        try {
+          listenerResult = GM_addValueChangeListener(STORAGE_KEY, onSettingsChange);
+          listenerFromLegacy = true;
+        } catch (_error) {
+          legacyListenerFailed = true;
+        }
+      }
+      if ((typeof GM_addValueChangeListener !== 'function' || legacyListenerFailed) &&
+          modernAddValueChangeListener) {
+        try {
+          listenerResult = modernAddValueChangeListener(STORAGE_KEY, onSettingsChange);
+        } catch (_error) {
+          listenerResult = null;
+        }
+      }
+      if (listenerResult && typeof listenerResult.then === 'function') {
+        let ready = Promise.resolve(listenerResult);
+        if (listenerFromLegacy && modernAddValueChangeListener) {
+          ready = ready.catch(() => modernAddValueChangeListener(STORAGE_KEY, onSettingsChange));
+        }
+        listenerReady = ready.then(() => undefined, () => undefined);
+      }
     }
+
+    if (!inheritedSettingsProvider && initialSettings.pendingRead) {
+      const readStoredSettings = () => {
+        const loadGeneration = settingsGeneration;
+        let stored;
+        try {
+          stored = initialSettings.pendingRead();
+        } catch (_error) {
+          return;
+        }
+        Promise.resolve(stored).then((value) => {
+          // A menu command or subscribed storage change can run while this
+          // read is pending. Never let its older snapshot win afterward.
+          if (settingsGeneration === loadGeneration) applyStoredSettings(value, false);
+        }, () => {});
+      };
+      if (listenerReady) listenerReady.then(readStoredSettings, readStoredSettings);
+      else readStoredSettings();
+    }
+
+    const armNativeReplaySnapshot = (event, fallbackText) => {
+      const clipboardData = event && event.clipboardData;
+      if (!clipboardData || typeof clipboardData.setData !== 'function') {
+        return { payload: () => nativeClipboardSnapshotPayload(new Map(), fallbackText) };
+      }
+      const values = new Map();
+      let capturedCharacters = 0;
+      const patches = [];
+      const record = (type, value) => {
+        const actualType = String(type == null ? '' : type);
+        const actualValue = String(value == null ? '' : value);
+        if (!actualType || actualType.length > 256) return;
+        const key = actualType.toLowerCase();
+        const previous = values.get(key);
+        if (!previous && values.size >= 64) return;
+        const previousLength = previous ? previous.value.length : 0;
+        if (actualValue.length > MAX_CLIPBOARD_MARKUP_LENGTH ||
+            capturedCharacters - previousLength + actualValue.length > MAX_CLIPBOARD_MARKUP_LENGTH) {
+          // The native clipboard accepted the replacement, so retaining the
+          // older captured value would replay stale data. Fail closed by
+          // forgetting this flavor, matching isolated-relay overflow handling.
+          if (previous) capturedCharacters -= previousLength;
+          values.delete(key);
+          return;
+        }
+        values.set(key, { type: actualType, value: actualValue });
+        capturedCharacters += actualValue.length - previousLength;
+      };
+      const harvest = () => {
+        for (const type of clipboardTypes(clipboardData).slice(0, 64)) {
+          record(type, clipboardGet(clipboardData, type));
+        }
+      };
+      const patchMethod = (target, name, replacement) => {
+        let previous;
+        try {
+          previous = Object.getOwnPropertyDescriptor(target, name);
+          Object.defineProperty(target, name, {
+            value: replacement,
+            configurable: true,
+            enumerable: previous ? Boolean(previous.enumerable) : false,
+            writable: true
+          });
+          patches.push({ target, name, previous, replacement });
+          return true;
+        } catch (_error) {
+          return false;
+        }
+      };
+      const restorePatches = () => {
+        for (let index = patches.length - 1; index >= 0; index -= 1) {
+          const patch = patches[index];
+          try {
+            const current = Object.getOwnPropertyDescriptor(patch.target, patch.name);
+            if (!current || current.value !== patch.replacement) continue;
+            if (patch.previous) Object.defineProperty(patch.target, patch.name, patch.previous);
+            else delete patch.target[patch.name];
+          } catch (_error) {
+            // Do not overwrite a page replacement made during the event.
+          }
+        }
+      };
+      const state = {
+        finished: false,
+        payload: () => nativeClipboardSnapshotPayload(values, fallbackText),
+        finish: null,
+        bubbleListener: null,
+        cleanupTimer: null
+      };
+      state.finish = () => {
+        if (state.finished) return;
+        harvest();
+        state.finished = true;
+        restorePatches();
+        if (state.bubbleListener) {
+          documentObject.removeEventListener('copy', state.bubbleListener, false);
+        }
+        if (state.cleanupTimer != null && pageWindow && typeof pageWindow.clearTimeout === 'function') {
+          pageWindow.clearTimeout(state.cleanupTimer);
+          state.cleanupTimer = null;
+        }
+      };
+
+      const originalSetData = clipboardData.setData;
+      patchMethod(clipboardData, 'setData', function cleanNativeReplaySetData(type, value) {
+        const actualType = '' + type;
+        const actualValue = '' + value;
+        const result = Reflect.apply(originalSetData, this, [actualType, actualValue]);
+        record(actualType, actualValue);
+        return result;
+      });
+      if (typeof clipboardData.clearData === 'function') {
+        const originalClearData = clipboardData.clearData;
+        patchMethod(clipboardData, 'clearData', function cleanNativeReplayClearData(type) {
+          const all = arguments.length === 0;
+          const actualType = all ? '' : '' + type;
+          const result = all
+            ? Reflect.apply(originalClearData, this, [])
+            : Reflect.apply(originalClearData, this, [actualType]);
+          if (all) {
+            values.clear();
+            capturedCharacters = 0;
+          } else {
+            const previous = values.get(actualType.toLowerCase());
+            if (previous) capturedCharacters -= previous.value.length;
+            values.delete(actualType.toLowerCase());
+          }
+          return result;
+        });
+      }
+      if (typeof event.stopPropagation === 'function') {
+        const originalStop = event.stopPropagation;
+        patchMethod(event, 'stopPropagation', function cleanNativeReplayStopPropagation() {
+          // Capture cached/prototype writes made so far, but keep the wrappers
+          // active because later listeners on this same target still run.
+          harvest();
+          return Reflect.apply(originalStop, event, arguments);
+        });
+      }
+      if (typeof event.stopImmediatePropagation === 'function') {
+        const originalStopImmediate = event.stopImmediatePropagation;
+        patchMethod(event, 'stopImmediatePropagation', function cleanNativeReplayStopImmediatePropagation() {
+          // stopImmediatePropagation() blocks other listeners, but the caller
+          // itself keeps running and may perform additional clipboard writes.
+          harvest();
+          return Reflect.apply(originalStopImmediate, event, arguments);
+        });
+      }
+      state.bubbleListener = (bubbleEvent) => {
+        // Window-bubble listeners run after document bubble and may make the
+        // final native clipboard write. Harvest here, but let only the task
+        // restore wrappers and freeze the snapshot after dispatch completes.
+        if (bubbleEvent === event) harvest();
+      };
+      documentObject.addEventListener('copy', state.bubbleListener, false);
+      if (pageWindow && typeof pageWindow.setTimeout === 'function') {
+        state.cleanupTimer = pageWindow.setTimeout(state.finish, 0);
+      }
+      return state;
+    };
 
     const handleCopy = (event) => {
       if (!event || handledEvents.has(event)) return;
       handledEvents.add(event);
+      const eventIntentGeneration = ++clipboardIntentGeneration;
       const eventSettings = currentSettings();
+      if (eventSettings.outputMode === 'native') {
+        const replayAfterPendingWrite = hasPendingClipboardWrite();
+        invalidatePendingRewrites();
+        if (replayAfterPendingWrite) {
+          const nativeGeneration = eventIntentGeneration;
+          const nativeModeGeneration = modeGeneration;
+          const selection = documentObject.getSelection ? documentObject.getSelection() : null;
+          const selectedNativeText = selectedNativeClipboardText(selection, event.target);
+          // In an isolated userscript world, the ready page relay owns exact
+          // DataTransfer capture. Layering another set of wrappers here can
+          // restore the relay's inactive wrappers in reverse cleanup order.
+          // Keep a selection-only fallback in case the relay cannot enqueue;
+          // its exact-format replay runs later and wins when available.
+          const nativeSnapshot = pageRelayReady()
+            ? { payload: () => nativeClipboardSnapshotPayload(new Map(), selectedNativeText) }
+            : armNativeReplaySnapshot(event, selectedNativeText);
+          // A Clipboard API write that has already started cannot be aborted.
+          // Replay only the newer native representations behind it so that an
+          // older Office recovery cannot become the final clipboard contents.
+          enqueueClipboardPayload(
+            () => nativeSnapshot.payload(),
+            pageWindow,
+            () => currentSettings().outputMode === 'native' &&
+              clipboardIntentGeneration === nativeGeneration && modeGeneration === nativeModeGeneration
+          );
+        }
+        return;
+      }
       // Any newer keyboard/context-menu copy invalidates an in-flight async
       // recovery and replays behind a write that has already started.
       const replayAfterPendingWrite = hasPendingClipboardWrite();
-      const eventGeneration = ++copyGeneration;
+      const eventGeneration = eventIntentGeneration;
+      const eventModeGeneration = modeGeneration;
       let officeState = null;
       let siteState = null;
       if (isMicrosoftOfficeWebPage(documentObject, pageWindow)) {
@@ -11425,7 +11899,9 @@
           originalSetData: null,
           originalClearData: null,
           settings: eventSettings,
-          isCurrent: () => activeOfficeState === officeState && officeGeneration === generation
+          isCurrent: () => activeOfficeState === officeState &&
+            officeGeneration === generation && currentSettings().outputMode !== 'native' &&
+            modeGeneration === eventModeGeneration && clipboardIntentGeneration === eventGeneration
         };
         activeOfficeState = officeState;
         officeCopyStates.set(event, officeState);
@@ -11441,7 +11917,7 @@
       const payload = isGoogleDocsEditorPage(documentObject, pageWindow)
         ? null
         : getCopyPayload(documentObject, selection, eventSettings, pageWindow, event.target);
-      if (!officeState && !payload && !(googleDocsPage && pageRelayInstalled)) {
+      if (!officeState && !payload && !(googleDocsPage && pageRelayReady())) {
         siteState = createSiteCopyState();
         siteState.settings = eventSettings;
         siteCopyStates.set(event, siteState);
@@ -11449,7 +11925,7 @@
       }
       if (replayAfterPendingWrite) {
         const selectedNativeText = selectedNativeClipboardText(selection, event.target);
-        const isReplayCurrent = () => copyGeneration === eventGeneration;
+        const isReplayCurrent = () => clipboardIntentGeneration === eventGeneration;
         // A Clipboard API call that already started cannot be cancelled. Queue
         // a replay behind it so its late completion cannot become the final
         // clipboard state. Resolve Office/site data only when the replay runs,
@@ -11517,6 +11993,7 @@
     documentObject.addEventListener('copy', handleCopy, true);
     if (view && view.addEventListener) view.addEventListener('copy', handleOfficeCopyBubble, false);
     if (view && view.addEventListener) view.addEventListener('copy', handleSiteCopyBubble, false);
+    pageRelayInstallation.controllerReady = true;
 
     if (googleDocsPage && options.observeGoogleDocsFrames !== false) {
       observeGoogleDocsClipboardFrames(documentObject, (childDocument, childWindow) => {
@@ -11529,72 +12006,69 @@
       });
     }
 
-    const registerMenuCommand = typeof GM_registerMenuCommand === 'function'
+    const legacyRegisterMenuCommand = typeof GM_registerMenuCommand === 'function'
       ? GM_registerMenuCommand
-      : (global.GM && typeof global.GM.registerMenuCommand === 'function'
-        ? global.GM.registerMenuCommand.bind(global.GM)
-        : null);
-    if (registerMenuCommand && options.registerMenus !== false) {
+      : null;
+    const modernRegisterMenuCommand = global.GM && typeof global.GM.registerMenuCommand === 'function'
+      ? global.GM.registerMenuCommand.bind(global.GM)
+      : null;
+    const registerMenuCommand = (caption, callback) => {
+      let result;
+      let resultFromLegacy = false;
+      if (legacyRegisterMenuCommand) {
+        try {
+          result = legacyRegisterMenuCommand(caption, callback);
+          resultFromLegacy = true;
+        } catch (_error) {
+          if (!modernRegisterMenuCommand) throw _error;
+          result = modernRegisterMenuCommand(caption, callback);
+        }
+      } else if (modernRegisterMenuCommand) {
+        result = modernRegisterMenuCommand(caption, callback);
+      } else {
+        return;
+      }
+      if (result && typeof result.then === 'function') {
+        let settled = Promise.resolve(result);
+        if (resultFromLegacy && modernRegisterMenuCommand) {
+          settled = settled.catch(() => modernRegisterMenuCommand(caption, callback));
+        }
+        settled.catch(() => {});
+      }
+    };
+    const menuWindow = documentObject.defaultView || pageWindow;
+    let topLevelMenu = true;
+    try {
+      topLevelMenu = !menuWindow || menuWindow.top === menuWindow;
+    } catch (_error) {
+      topLevelMenu = false;
+    }
+    if ((legacyRegisterMenuCommand || modernRegisterMenuCommand) &&
+        options.registerMenus !== false && topLevelMenu) {
       const updateSettings = (nextSettings) => {
         settingsGeneration += 1;
-        settings = saveSettings(nextSettings);
+        settings = observeSettings(saveSettings(nextSettings));
+        if (settings.outputMode === 'native') invalidatePendingRewrites();
       };
       const setMode = (mode) => {
         updateSettings({ outputMode: mode });
-        refreshModeMenus();
       };
       const modeMenus = [
         { mode: 'faithful', label: 'Faithful readable (recommended)' },
         { mode: 'calculator', label: 'Calculator-safe' },
-        { mode: 'latex', label: 'Original LaTeX' }
+        { mode: 'latex', label: 'Original LaTeX' },
+        { mode: 'native', label: 'Original copy/paste' }
       ];
-      const modeMenuIds = new Map();
-      let pendingModeMenuRender = null;
-      let modeMenusRendered = false;
-      const renderModeMenus = () => {
-        const pendingIds = [];
-        for (const item of modeMenus) {
-          const options = { autoClose: true };
-          if (modeMenuIds.has(item.mode)) options.id = modeMenuIds.get(item.mode);
-          const commandId = registerMenuCommand(
-            (settings.outputMode === item.mode ? '✓ ' : '') + item.label,
-            () => setMode(item.mode),
-            options
-          );
-          if (commandId && typeof commandId.then === 'function') {
-            pendingIds.push(Promise.resolve(commandId).then((resolvedId) => {
-              if (resolvedId != null) modeMenuIds.set(item.mode, resolvedId);
-            }, () => {}));
-          } else if (commandId != null) {
-            modeMenuIds.set(item.mode, commandId);
-          }
+      for (const item of modeMenus) {
+        try {
+          // Register once. Re-registering merely to move a checkmark creates
+          // duplicates in managers that do not support in-place menu IDs.
+          registerMenuCommand(item.label, () => setMode(item.mode));
+        } catch (_error) {
+          // Clipboard behavior must remain available if a manager rejects its
+          // optional popup-menu API.
         }
-        return pendingIds.length ? Promise.all(pendingIds) : null;
-      };
-      const trackModeMenuRender = (promise) => {
-        let tracked;
-        tracked = Promise.resolve(promise).then(() => {
-          if (pendingModeMenuRender === tracked) pendingModeMenuRender = null;
-        }, () => {
-          if (pendingModeMenuRender === tracked) pendingModeMenuRender = null;
-        });
-        pendingModeMenuRender = tracked;
-      };
-      refreshModeMenus = () => {
-        if (!modeMenusRendered) {
-          modeMenusRendered = true;
-          const firstRender = renderModeMenus();
-          if (firstRender) trackModeMenuRender(firstRender);
-          return;
-        }
-        if (!pendingModeMenuRender) {
-          const immediateRender = renderModeMenus();
-          if (immediateRender) trackModeMenuRender(immediateRender);
-          return;
-        }
-        trackModeMenuRender(pendingModeMenuRender.then(renderModeMenus, renderModeMenus));
-      };
-      refreshModeMenus();
+      }
     }
 
     return { handleCopy, get settings() { return { ...currentSettings() }; } };

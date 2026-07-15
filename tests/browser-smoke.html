@@ -64,7 +64,12 @@
 
   <pre id="result">pending</pre>
   <script>
-    if (!new URLSearchParams(location.search).has('isolated')) {
+    const cleanMathCopySmokeParams = new URLSearchParams(location.search);
+    if (cleanMathCopySmokeParams.has('native')) {
+      globalThis.GM_getValue = () => ({ outputMode: 'native' });
+      globalThis.GM_setValue = () => undefined;
+    }
+    if (!cleanMathCopySmokeParams.has('isolated')) {
       document.write('<script src="../clean-math-copy.user.js"><\/script>');
     }
   </script>
@@ -88,7 +93,8 @@
           plain: transfer.getData('text/plain'),
           html: transfer.getData('text/html'),
           htmlFormat: transfer.getData('HTML Format'),
-          mathML: transfer.getData('application/mathml+xml')
+          mathML: transfer.getData('application/mathml+xml'),
+          nativeCustom: transfer.getData('application/x-native-smoke')
         };
       };
       const copyRange = (element, start, end) => {
@@ -110,7 +116,78 @@
         return dispatchCopy(element);
       };
 
-      if (new URLSearchParams(location.search).has('isolated')) {
+      const parameters = new URLSearchParams(location.search);
+      const isolatedMode = parameters.has('isolated');
+      const nativeMode = parameters.has('native');
+      const finishChecks = () => {
+        const output = { ok: checks.every((check) => check.pass), checks };
+        document.querySelector('#result').textContent = JSON.stringify(output);
+        const failed = checks.filter((check) => !check.pass).map((check) =>
+          check.name + ' [actual=' + JSON.stringify(check.actual) + ', expected=' + JSON.stringify(check.expected) + ']'
+        );
+        const ownTitle = output.ok ? 'PASS ' + checks.length + '/' + checks.length : 'FAIL ' + failed.join(' | ');
+        if (!isolatedMode || !output.ok) {
+          document.title = ownTitle;
+          return;
+        }
+        document.title = 'WAIT page-world browser smoke';
+        const frame = document.createElement('iframe');
+        frame.hidden = true;
+        frame.src = '/browser-smoke.html?page-world=1' + (nativeMode ? '&native=1' : '');
+        frame.addEventListener('load', () => {
+          const pageTitle = frame.contentDocument.title;
+          if (!/^PASS\b/.test(pageTitle)) {
+            document.title = /^FAIL\b/.test(pageTitle)
+              ? pageTitle
+              : 'FAIL page-world fixture did not finish [' + JSON.stringify(pageTitle) + ']';
+            return;
+          }
+          const pageCount = Number((pageTitle.match(/^PASS\s+(\d+)\//) || [])[1] || 0);
+          const combined = checks.length + pageCount + Number(parameters.get('prior') || 0);
+          if (nativeMode) {
+            document.title = 'PASS ' + combined + '/' + combined;
+            return;
+          }
+          location.replace('/browser-smoke.html?isolated=1&native=1&prior=' + combined);
+        });
+        document.body.appendChild(frame);
+      };
+
+      if (nativeMode) {
+        if (isolatedMode) {
+          assertEqual(
+            'native isolated page relay installed',
+            Boolean(document.querySelector('[data-clean-math-copy-relay-ready="1"]')),
+            true
+          );
+        }
+        const target = document.querySelector('#root-renderer .visual-layout');
+        let methodsStayedNative = false;
+        target.addEventListener('copy', (event) => {
+          const setData = event.clipboardData.setData;
+          const clearData = event.clipboardData.clearData;
+          event.clipboardData.setData('text/plain', '  native x2\n\n  ');
+          event.clipboardData.setData('text/html', '<b>  native x<sup>2</sup><br><br>  </b>');
+          event.clipboardData.setData('application/x-native-smoke', 'opaque');
+          methodsStayedNative = event.clipboardData.setData === setData &&
+            event.clipboardData.clearData === clearData;
+          event.stopImmediatePropagation();
+        });
+        const copied = copyContents(target);
+        assertEqual('native clipboard methods stay untouched', methodsStayedNative, true);
+        assertEqual('native event stays uncancelled', copied.prevented, false);
+        assertEqual('native whitespace and newlines stay exact', copied.plain, '  native x2\n\n  ');
+        assertEqual(
+          'native rich HTML stays exact',
+          copied.html,
+          '<b>  native x<sup>2</sup><br><br>  </b>'
+        );
+        assertEqual('native custom clipboard format stays exact', copied.nativeCustom, 'opaque');
+        finishChecks();
+        return;
+      }
+
+      if (isolatedMode) {
         const relay = document.querySelector('[data-clean-math-copy-relay-ready="1"]');
         assertEqual(
           'isolated page relay installed',
@@ -118,7 +195,7 @@
           true
         );
         if (relay) {
-          const relayEvent = relay.id + '-request';
+          const relayEvent = relay.getAttribute('data-clean-math-copy-test-event-name');
           const relayRequest = (request) => {
             relay.textContent = JSON.stringify(request);
             relay.dispatchEvent(new CustomEvent(relayEvent));
@@ -321,36 +398,7 @@
       const flatDigit = copyContents(flatDigitEditor);
       assertEqual('flat adjacent digit is never guessed', flatDigit.plain, '(27.187)2');
 
-      const output = { ok: checks.every((check) => check.pass), checks };
-      document.querySelector('#result').textContent = JSON.stringify(output);
-      const failed = checks.filter((check) => !check.pass).map((check) =>
-        check.name + ' [actual=' + JSON.stringify(check.actual) + ', expected=' + JSON.stringify(check.expected) + ']'
-      );
-      const ownTitle = output.ok ? 'PASS ' + checks.length + '/' + checks.length : 'FAIL ' + failed.join(' | ');
-      if (!new URLSearchParams(location.search).has('isolated')) {
-        document.title = ownTitle;
-        return;
-      }
-      if (!output.ok) {
-        document.title = ownTitle;
-        return;
-      }
-      document.title = 'WAIT page-world browser smoke';
-      const frame = document.createElement('iframe');
-      frame.hidden = true;
-      frame.src = '/browser-smoke.html?page-world=1';
-      frame.addEventListener('load', () => {
-        const pageTitle = frame.contentDocument.title;
-        if (!/^PASS\b/.test(pageTitle)) {
-          document.title = /^FAIL\b/.test(pageTitle)
-            ? pageTitle
-            : 'FAIL page-world fixture did not finish [' + JSON.stringify(pageTitle) + ']';
-          return;
-        }
-        const pageCount = Number((pageTitle.match(/^PASS\s+(\d+)\//) || [])[1] || 0);
-        document.title = 'PASS ' + (checks.length + pageCount) + '/' + (checks.length + pageCount);
-      });
-      document.body.appendChild(frame);
+      finishChecks();
     })();
   </script>
 </body>

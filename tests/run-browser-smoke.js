@@ -44,6 +44,7 @@ function delay(milliseconds) {
 
 async function waitForResult(port, processState, isolatedFixture) {
   const deadline = Date.now() + 45000;
+  const expectedFixture = new URL(isolatedFixture);
   let lastError = null;
   let lastTitle = '';
   while (Date.now() < deadline) {
@@ -61,7 +62,16 @@ async function waitForResult(port, processState, isolatedFixture) {
       if (!response.ok) throw new Error('DevTools endpoint returned HTTP ' + response.status);
       const pages = await response.json();
       lastError = null;
-      const isolated = pages.find((item) => item.url === isolatedFixture);
+      const isolated = pages.find((item) => {
+        try {
+          const candidate = new URL(item.url);
+          return candidate.origin === expectedFixture.origin &&
+            candidate.pathname === expectedFixture.pathname &&
+            candidate.searchParams.has('isolated');
+        } catch (_error) {
+          return false;
+        }
+      });
       if (isolated) lastTitle = isolated.title || '';
       if (isolated && /^FAIL\b/.test(isolated.title || '')) throw new Error(isolated.title + ' at ' + isolated.url);
       if (isolated && /^PASS\b/.test(isolated.title || '')) return isolated.title;
@@ -134,6 +144,11 @@ function isolatedExtension(profile, scriptSource, relaySource) {
   const prelude = [
     "'use strict';",
     "if (new URLSearchParams(location.search).has('isolated')) {",
+    "const cleanMathCopySmokeParams = new URLSearchParams(location.search);",
+    "if (cleanMathCopySmokeParams.has('native')) {",
+    "  globalThis.GM_getValue = () => ({ outputMode: 'native' });",
+    "  globalThis.GM_setValue = () => undefined;",
+    "}",
     "globalThis.GM_info = { injectInto: 'content' };",
     'globalThis.GM_addElement = (parentOrTag, tagOrAttributes, attributesInput) => {',
     "  const hasParent = typeof parentOrTag !== 'string';",
@@ -146,19 +161,27 @@ function isolatedExtension(profile, scriptSource, relaySource) {
     '    else element.setAttribute(name, String(value));',
     '  }',
     '  parent.appendChild(element);',
-    "  document.dispatchEvent(new CustomEvent('clean-math-copy-test-inject'));",
+    '  const carrierMatch = element.textContent.match(/"(clean-math-copy-relay-[^"]+)"/);',
+    '  const eventMatch = element.textContent.match(/"(clean-math-copy-request-[^"]+)"/);',
+    "  document.dispatchEvent(new CustomEvent('clean-math-copy-test-inject', {",
+    '    detail: JSON.stringify({',
+    "      carrierId: carrierMatch ? carrierMatch[1] : '',",
+    "      eventName: eventMatch ? eventMatch[1] : ''",
+    '    })',
+    '  }));',
     '  return element;',
     '};'
   ].join('\n');
   const pageRelay = [
     "'use strict';",
     relaySource + ';',
-    "document.addEventListener('clean-math-copy-test-inject', () => {",
-    "  const carriers = document.querySelectorAll('[id^=\"clean-math-copy-relay-\"]');",
-    '  for (const carrier of carriers) {',
-    "    if (carrier.getAttribute('data-clean-math-copy-relay-ready') !== '1') {",
-    "      cleanMathCopyPageRelayMain(carrier.id, carrier.id + '-request');",
-    '    }',
+    "document.addEventListener('clean-math-copy-test-inject', (event) => {",
+    "  let details = {};",
+    "  try { details = JSON.parse(String(event.detail || '{}')); } catch (error) {}",
+    '  const carrier = details.carrierId ? document.getElementById(details.carrierId) : null;',
+    "  if (carrier && details.eventName && carrier.getAttribute('data-clean-math-copy-relay-ready') !== '1') {",
+    '    cleanMathCopyPageRelayMain(details.carrierId, details.eventName);',
+    "    carrier.setAttribute('data-clean-math-copy-test-event-name', details.eventName);",
     '  }',
     '}, true);'
   ].join('\n');

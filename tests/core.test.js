@@ -457,6 +457,7 @@ test('cleans copy artifacts without breaking emoji joiners or intentional newlin
 });
 
 test('normalizes invalid settings safely', () => {
+  assert.deepEqual(cleanCopy.normalizeSettings({ outputMode: 'native' }), { outputMode: 'native' });
   assert.deepEqual(cleanCopy.normalizeSettings({ outputMode: 'bogus' }), { outputMode: 'faithful' });
   assert.deepEqual(cleanCopy.normalizeSettings({
     outputMode: 'ascii',
