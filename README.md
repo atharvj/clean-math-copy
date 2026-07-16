@@ -1,6 +1,7 @@
 # Clean Math Copy
 
 Copies equations as accurate, readable text and removes accidental spacing or line breaks from ordinary copied text. It supports rendered web math, Google Docs, Word for the web, and selectable PDFs opened in the browser.
+Math recognition follows the selected structure and visible layout, not a website allowlist.
 
 ## Install
 

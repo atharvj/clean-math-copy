@@ -52,6 +52,32 @@ function giveCssStackGeometry(root, left = 10, width = 60) {
   });
 }
 
+function cssStackTestRect(left, top, width, height) {
+  return { left, top, right: left + width, bottom: top + height, width, height };
+}
+
+function giveNamedCssStackGeometry(documentObject, name, options = {}) {
+  const left = options.left == null ? 10 : options.left;
+  const top = options.top == null ? 10 : options.top;
+  const width = options.width == null ? 60 : options.width;
+  const rowHeight = options.rowHeight == null ? 20 : options.rowHeight;
+  const gap = options.gap == null ? 2 : options.gap;
+  const upper = documentObject.querySelector('[data-test-stack-row="' + name + '-top"]');
+  const lower = documentObject.querySelector('[data-test-stack-row="' + name + '-bottom"]');
+  if (!upper || !lower) throw new Error('Missing CSS-stack test rows for ' + name);
+  upper.getBoundingClientRect = () => cssStackTestRect(left, top, width, rowHeight);
+  lower.getBoundingClientRect = () => cssStackTestRect(
+    left,
+    top + rowHeight + gap,
+    width,
+    rowHeight
+  );
+  const rule = documentObject.querySelector('[data-test-stack-rule="' + name + '"]');
+  if (rule) {
+    rule.getBoundingClientRect = () => cssStackTestRect(left, top + rowHeight, width, gap);
+  }
+}
+
 function cssStackLimitFixture() {
   const instance = dom([
     '<style>',
@@ -508,7 +534,8 @@ test('math-root discovery is linear-ish, reused once, and safely budgets documen
       single.window,
       singleTarget
     ).text, 'x');
-    assert.equal(connectedDiscoveryScans, 1);
+    assert.equal(connectedDiscoveryScans, 0,
+      'root discovery must not materialize an unbounded selector result');
   } finally {
     single.window.Element.prototype.querySelectorAll = originalQueryAll;
   }
@@ -731,8 +758,12 @@ test('faithful MathML recognizes real renderer accent glyphs', () => {
   assert.equal(render('<mover accent="true"><mi>x</mi><mo>ˇ</mo></mover>'), 'x̌');
   assert.equal(render('<mover accent="true"><mi>x</mi><mo>˚</mo></mover>'), 'x̊');
   assert.equal(render('<munder accentunder="true"><mi>x</mi><mo>‾</mo></munder>'), 'x̲');
-  assert.equal(render('<mover><mi>x</mi><mo>⏞</mo></mover>'), 'overset(⏞, x)');
-  assert.equal(render('<munder><mi>x</mi><mo>⏟</mo></munder>'), 'underset(⏟, x)');
+  assert.equal(render('<mover><mi>x</mi><mo>⏞</mo></mover>'), 'overbrace(x)');
+  assert.equal(render('<munder><mi>x</mi><mo>⏟</mo></munder>'), 'underbrace(x)');
+  assert.equal(render('<mover><mover><mrow><mi>x</mi><mo>+</mo><mi>y</mi></mrow>' +
+    '<mo>⏞</mo></mover><mi>n</mi></mover>'), 'overbrace(x + y)ⁿ');
+  assert.equal(render('<munder><munder><mrow><mi>x</mi><mo>+</mo><mi>y</mi></mrow>' +
+    '<mo>⏟</mo></munder><mi>n</mi></munder>'), 'underbrace(x + y)ₙ');
 });
 
 test('faithful MathML linearizes alignment tables as equation rows, not matrices', () => {
@@ -1258,6 +1289,38 @@ test('rejects over-deep MathML and OMML safely instead of recursing into untrust
     deep
   ), null);
   assert.equal(cleanCopy.ommlToMathML(instance.window.document.querySelector('#deep-office'), instance.window.document), null);
+});
+
+test('rejects an over-wide math tree before materializing its child collection', () => {
+  const instance = dom('<math id="wide"></math>');
+  const wide = instance.window.document.querySelector('#wide');
+  const fragment = instance.window.document.createDocumentFragment();
+  for (let index = 0; index < 5001; index += 1) {
+    const token = instance.window.document.createElementNS(
+      'http://www.w3.org/1998/Math/MathML',
+      'mi'
+    );
+    token.textContent = 'x';
+    fragment.appendChild(token);
+  }
+  wide.appendChild(fragment);
+  Object.defineProperty(wide, 'children', {
+    configurable: true,
+    get() {
+      throw new Error('the complete untrusted child collection was materialized');
+    }
+  });
+  let payload;
+  assert.doesNotThrow(() => {
+    payload = cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, wide),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      wide
+    );
+  });
+  assert.equal(payload, null);
 });
 
 test('recognizes absolute-value bars even when a renderer mislabels them as identifiers or text', () => {
@@ -1897,7 +1960,7 @@ test('direct MathJax CHTML source mapping requires matching authored structure',
   ].join('');
   assert.equal(
     copy(String.raw`\underbrace{x+y}_{n\text{ terms}}`, underbrace).text,
-    '(underbrace(x + y))_(n terms)'
+    'underbrace(x + y)_(n terms)'
   );
 
   const overbrace = [
@@ -1909,7 +1972,7 @@ test('direct MathJax CHTML source mapping requires matching authored structure',
     '<mjx-mo data-semantic-id="1">+</mjx-mo><mjx-mi data-semantic-id="2">y</mjx-mi>',
     '</mjx-base></mjx-mover></mjx-texatom></mjx-base></mjx-mover>'
   ].join('');
-  assert.equal(copy(String.raw`\overbrace{x+y}^{n}`, overbrace).text, '(overbrace(x + y))ⁿ');
+  assert.equal(copy(String.raw`\overbrace{x+y}^{n}`, overbrace).text, 'overbrace(x + y)ⁿ');
 
   const overbraceWithSubscript = [
     '<mjx-munder data-latex="\\overbrace{x}_n"><mjx-row><mjx-base>',
@@ -1920,7 +1983,7 @@ test('direct MathJax CHTML source mapping requires matching authored structure',
     '<mjx-row><mjx-under><mjx-mi data-semantic-id="3">n</mjx-mi>',
     '</mjx-under></mjx-row></mjx-munder>'
   ].join('');
-  assert.equal(copy(String.raw`\overbrace{x}_n`, overbraceWithSubscript).text, 'x̅ₙ');
+  assert.equal(copy(String.raw`\overbrace{x}_n`, overbraceWithSubscript).text, 'overbrace(x)ₙ');
 
   const underbraceWithSuperscript = [
     '<mjx-mover data-latex="\\underbrace{x}^n"><mjx-over>',
@@ -1931,7 +1994,7 @@ test('direct MathJax CHTML source mapping requires matching authored structure',
     '<mjx-mo data-semantic-id="1">⏟</mjx-mo></mjx-under></mjx-row>',
     '</mjx-munder></mjx-texatom></mjx-base></mjx-mover>'
   ].join('');
-  assert.equal(copy(String.raw`\underbrace{x}^n`, underbraceWithSuperscript).text, 'x̲ⁿ');
+  assert.equal(copy(String.raw`\underbrace{x}^n`, underbraceWithSuperscript).text, 'underbrace(x)ⁿ');
 });
 
 test('direct MathJax CHTML authenticates live limit, cases, and binomial renderer shapes', () => {
@@ -2797,10 +2860,10 @@ test('CSS-stacked recovery fails closed on prose, citations, UI stacks, and inco
       assert.equal(widget.copy(outputMode), null, top + '/' + bottom + ' ' + outputMode);
     }
   }
-  assert.notEqual(
+  assert.equal(
     fixture('v1.2', 'v2.3', '', 'intbl').copy('faithful'),
     null,
-    'an authenticated legacy math renderer can intentionally use version-like operands'
+    'a site-specific legacy class cannot authenticate version-like UI values'
   );
 
   const accents = fixture('x⃗+ŷ', 'z');
@@ -3171,7 +3234,7 @@ test('CSS-stacked math authentication fails closed for lookalikes, hidden conten
     style + '<p id="target"><span class="stack intbl fraction"><em>1</em><strong>2</strong></span></p>',
     (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
   );
-  assert.equal(knownNumeric.text, '1/2', 'known math renderers retain numeric-only fractions');
+  assert.equal(knownNumeric, null, 'site-specific renderer classes cannot authenticate numeric-only fractions');
   const semanticNumeric = copy(
     style + '<p id="target"><span class="stack math-fraction fraction"><em>1</em><strong>2</strong></span></p>',
     (_window, target) => giveCssStackGeometry(target.querySelector('.stack'))
@@ -3191,6 +3254,495 @@ test('CSS-stacked math authentication fails closed for lookalikes, hidden conten
     null,
     'ordinary semantic emphasis stays on the browser path'
   );
+});
+
+test('CSS-stacked formulas are domain-neutral across unrelated hosts, tags, classes, wrappers, and layouts', () => {
+  const hosts = [
+    'https://alpha.invalid/lesson/7',
+    'https://subdomain.example.org/article?id=19',
+    'https://en.wikipedia.org/wiki/Unrelated_page',
+    'https://docs.google.com/document/d/fake/edit',
+    'https://word-edit.officeapps.live.com/we/wordeditorframe.aspx',
+    'http://localhost:8080/math'
+  ];
+  const variants = [
+    { rootTag: 'span', rowTag: 'i', className: '', depth: 0, rootDisplay: 'inline-table', rowDisplay: 'table-row', rule: 'top' },
+    { rootTag: 'section', rowTag: 'mark', className: 'random-card', depth: 1, rootDisplay: 'flex', rowDisplay: 'block', rule: 'bottom' },
+    { rootTag: 'output', rowTag: 'div', className: 'q-9381', depth: 4, rootDisplay: 'grid', rowDisplay: 'flex', rule: 'dedicated' },
+    { rootTag: 'blockquote', rowTag: 'var', className: 'renderer-v47', depth: 12, rootDisplay: 'flow-root', rowDisplay: 'contents', rule: 'top', noise: true },
+    { rootTag: 'h2', rowTag: 'small', className: 'layout', depth: 2, rootDisplay: 'contents', rowDisplay: 'inline', rule: 'bottom', reverse: true },
+    { rootTag: 'main', rowTag: 'dfn', className: 'unrelated', depth: 3, rootDisplay: 'table-cell', rowDisplay: 'table-row', rule: 'dedicated', reverse: true },
+    { rootTag: 'header', rowTag: 'cite', className: 'stackish-but-not-semantic', depth: 5, rootDisplay: 'inline-grid', rowDisplay: 'inline-flex', rule: 'top', noise: true }
+  ];
+  const expected = {
+    faithful: '(x² + 1)/(y − 2)',
+    calculator: '(x^(2)+1)/(y-2)',
+    latex: '$\\frac{x^{2}+1}{y-2}$'
+  };
+
+  const fixture = (url, options) => {
+    const topStyle = 'display:' + options.rowDisplay + ';' +
+      (options.rule === 'top' ? 'border-bottom:1px solid currentColor;' : '');
+    const bottomStyle = 'display:' + options.rowDisplay + ';' +
+      (options.rule === 'bottom' ? 'border-top:1px solid currentColor;' : '');
+    const top = '<' + options.rowTag + ' data-test-stack-row="formula-top" style="' + topStyle + '">' +
+      'x' + (options.noise ? '<!-- split --><wbr>' : '') + '<sup>2</sup>+1</' + options.rowTag + '>';
+    const bottom = '<' + options.rowTag + ' data-test-stack-row="formula-bottom" style="' + bottomStyle + '">' +
+      'y−2</' + options.rowTag + '>';
+    const first = options.reverse ? bottom : top;
+    const last = options.reverse ? top : bottom;
+    let children = first + last;
+    if (options.rule === 'dedicated') {
+      children = first + '<b data-test-stack-rule="formula" ' +
+        'style="display:block;border-top:1px solid currentColor"></b>' + last;
+    }
+    if (options.noise) children = '<!-- before --><wbr>' + children + '<!-- after -->';
+    for (let depth = 0; depth < options.depth; depth += 1) {
+      children = '<span class="neutral-' + depth + '" style="display:' +
+        (depth % 2 ? 'contents' : 'inline-block') + '">' + children + '</span>';
+    }
+    const instance = dom([
+      '<div id="target">Before <', options.rootTag, ' id="formula" class="', options.className,
+      '" style="display:', options.rootDisplay, '">', children, '</', options.rootTag,
+      '> after</div>'
+    ].join(''), url);
+    giveNamedCssStackGeometry(instance.window.document, 'formula', { left: 20, width: 80 });
+    return instance;
+  };
+
+  for (const [hostIndex, url] of hosts.entries()) {
+    for (const [variantIndex, variant] of variants.entries()) {
+      const instance = fixture(url, variant);
+      const document = instance.window.document;
+      const target = document.querySelector('#target');
+      const formula = document.querySelector('#formula');
+      const selection = selectContents(instance.window, formula);
+      const label = 'host ' + hostIndex + ', variant ' + variantIndex;
+      for (const [outputMode, text] of Object.entries(expected)) {
+        const payload = cleanCopy.getCopyPayload(
+          document,
+          selection,
+          { outputMode },
+          instance.window,
+          target
+        );
+        assert.equal(payload && payload.reason, 'css-stacked-math', label + ' ' + outputMode);
+        assert.equal(payload && payload.text, text, label + ' ' + outputMode);
+        assert.equal(/[\n\r\s]$/u.test(payload.text), false, label + ' trailing whitespace');
+      }
+      assert.equal(
+        cleanCopy.getCopyPayload(document, selection, { outputMode: 'native' }, instance.window, target),
+        null,
+        label + ' native mode'
+      );
+    }
+  }
+});
+
+test('open Shadow DOM composed selections use the same generic math recovery', () => {
+  const instance = dom('<main><div id="host"></div></main>', 'https://shadow-components.invalid/app');
+  const documentObject = instance.window.document;
+  const host = documentObject.querySelector('#host');
+  const shadow = host.attachShadow({ mode: 'open' });
+  shadow.innerHTML = [
+    '<span id="fraction" role="math" style="display:inline-table">',
+    '<span id="numerator" style="display:table-row;border-bottom:1px solid currentColor">x<sup>2</sup>+1</span>',
+    '<span id="denominator" style="display:table-row">y−2</span>',
+    '</span>'
+  ].join('');
+  const fraction = shadow.querySelector('#fraction');
+  const numerator = shadow.querySelector('#numerator');
+  const denominator = shadow.querySelector('#denominator');
+  fraction.getBoundingClientRect = () => ({
+    left: 20, top: 10, right: 100, bottom: 50, width: 80, height: 40
+  });
+  numerator.getBoundingClientRect = () => ({
+    left: 20, top: 10, right: 100, bottom: 25, width: 80, height: 15
+  });
+  denominator.getBoundingClientRect = () => ({
+    left: 20, top: 35, right: 100, bottom: 50, width: 80, height: 15
+  });
+
+  let composedOptions = null;
+  const selection = {
+    isCollapsed: false,
+    rangeCount: 1,
+    anchorNode: numerator.firstChild,
+    focusNode: denominator.firstChild,
+    getComposedRanges(options) {
+      composedOptions = options;
+      return [{
+        startContainer: shadow,
+        startOffset: 0,
+        endContainer: shadow,
+        endOffset: shadow.childNodes.length
+      }];
+    },
+    getRangeAt() {
+      throw new Error('the composed selection must be used');
+    }
+  };
+  const expected = {
+    faithful: '(x² + 1)/(y − 2)',
+    calculator: '(x^(2)+1)/(y-2)',
+    latex: '$\\frac{x^{2}+1}{y-2}$'
+  };
+  for (const [outputMode, text] of Object.entries(expected)) {
+    const payload = cleanCopy.getCopyPayload(
+      documentObject,
+      selection,
+      { outputMode },
+      instance.window,
+      host
+    );
+    assert.equal(payload && payload.reason, 'css-stacked-math', outputMode);
+    assert.equal(payload && payload.text, text, outputMode);
+  }
+  assert.deepEqual(composedOptions && composedOptions.shadowRoots, [shadow]);
+  host.style.opacity = '0';
+  assert.equal(cleanCopy.getCopyPayload(
+    documentObject,
+    selection,
+    { outputMode: 'faithful' },
+    instance.window,
+    host
+  ), null, 'a hidden shadow host cannot authenticate otherwise valid internal geometry');
+});
+
+test('numeric CSS fractions require explicit generic semantics, never a site-shaped class name', () => {
+  const semanticAttributes = [
+    'role="math"',
+    'aria-roledescription="Formula"',
+    'data-math="true"',
+    'data-formula="equation"',
+    'data-equation="1"'
+  ];
+  const hosts = [
+    'https://numbers.invalid/',
+    'https://example.net/random/path',
+    'https://docs.google.com/document/d/fake/pub'
+  ];
+  const build = (url, attributes, className) => {
+    const instance = dom([
+      '<div id="target"><span id="outer" class="neutral-owner" style="display:inline-block">',
+      '<span id="fraction" class="', className, '" ', attributes, ' style="display:inline-table">',
+      '<i data-test-stack-row="numeric-top" style="display:table-row;border-bottom:1px solid currentColor">1</i>',
+      '<b data-test-stack-row="numeric-bottom" style="display:table-row">2</b>',
+      '</span></span></div>'
+    ].join(''), url);
+    giveNamedCssStackGeometry(instance.window.document, 'numeric');
+    return instance;
+  };
+  const expected = {
+    faithful: '1/2',
+    calculator: '1/2',
+    latex: '$\\frac{1}{2}$'
+  };
+
+  for (const [hostIndex, url] of hosts.entries()) {
+    const untrusted = build(url, '', 'intbl fraction legacy-renderer-v2');
+    const untrustedTarget = untrusted.window.document.querySelector('#target');
+    const untrustedSelection = selectContents(
+      untrusted.window,
+      untrusted.window.document.querySelector('#outer')
+    );
+    for (const outputMode of Object.keys(expected)) {
+      assert.equal(cleanCopy.getCopyPayload(
+        untrusted.window.document,
+        untrustedSelection,
+        { outputMode },
+        untrusted.window,
+        untrustedTarget
+      ), null, 'class-only fraction on host ' + hostIndex + ' in ' + outputMode);
+    }
+
+    for (const [semanticIndex, attributes] of semanticAttributes.entries()) {
+      const instance = build(url, attributes, 'opaque-' + hostIndex + '-' + semanticIndex);
+      const document = instance.window.document;
+      const target = document.querySelector('#target');
+      const selection = selectContents(instance.window, document.querySelector('#outer'));
+      for (const [outputMode, text] of Object.entries(expected)) {
+        const payload = cleanCopy.getCopyPayload(
+          document,
+          selection,
+          { outputMode },
+          instance.window,
+          target
+        );
+        assert.equal(payload && payload.text, text, attributes + ' ' + outputMode);
+      }
+    }
+  }
+});
+
+test('nested CSS fractions preserve hierarchy and exact partial selections on every host', () => {
+  const hosts = [
+    'https://nested.invalid/',
+    'https://example.edu/course/physics',
+    'https://en.wikipedia.org/wiki/Fraction',
+    'http://localhost:3000/'
+  ];
+  const cases = [
+    ['left', '(a/b)/c', '(a/b)/c', '$\\frac{\\frac{a}{b}}{c}$'],
+    ['right', 'a/(c/d)', 'a/(c/d)', '$\\frac{a}{\\frac{c}{d}}$'],
+    ['both', '(a/b)/(c/d)', '(a/b)/(c/d)', '$\\frac{\\frac{a}{b}}{\\frac{c}{d}}$']
+  ];
+  const inner = (name, numerator, denominator) => [
+    '<span id="', name, '" class="opaque-', name, '" style="display:inline-table">',
+    '<mark data-test-stack-row="', name, '-top" style="display:table-row;border-bottom:1px solid currentColor">',
+    numerator, '</mark>',
+    '<var data-test-stack-row="', name, '-bottom" style="display:table-row">', denominator, '</var>',
+    '</span>'
+  ].join('');
+  const build = (url, kind) => {
+    const numerator = kind === 'left' || kind === 'both' ? inner('left', 'a', 'b') : 'a';
+    const denominator = kind === 'right' || kind === 'both' ? inner('right', 'c', 'd') : 'c';
+    const instance = dom([
+      '<div id="target"><section id="outer" class="not-a-renderer" style="display:grid">',
+      '<div data-test-stack-row="outer-top" style="display:block;border-bottom:1px solid currentColor">',
+      numerator, '</div>',
+      '<div data-test-stack-row="outer-bottom" style="display:block">', denominator, '</div>',
+      '</section></div>'
+    ].join(''), url);
+    const document = instance.window.document;
+    giveNamedCssStackGeometry(document, 'outer', { left: 10, top: 10, width: 100, rowHeight: 30 });
+    if (document.querySelector('#left')) {
+      giveNamedCssStackGeometry(document, 'left', { left: 20, top: 12, width: 30, rowHeight: 9, gap: 1 });
+    }
+    if (document.querySelector('#right')) {
+      giveNamedCssStackGeometry(document, 'right', { left: 20, top: 43, width: 30, rowHeight: 9, gap: 1 });
+    }
+    return instance;
+  };
+
+  for (const url of hosts) {
+    for (const [kind, faithful, calculator, latex] of cases) {
+      const instance = build(url, kind);
+      const document = instance.window.document;
+      const target = document.querySelector('#target');
+      const selection = selectContents(instance.window, document.querySelector('#outer'));
+      for (const [outputMode, text] of Object.entries({ faithful, calculator, latex })) {
+        const payload = cleanCopy.getCopyPayload(
+          document,
+          selection,
+          { outputMode },
+          instance.window,
+          target
+        );
+        assert.equal(payload && payload.text, text, url + ' ' + kind + ' ' + outputMode);
+      }
+    }
+  }
+
+  const partial = dom([
+    '<div id="target"><section id="outer" style="display:inline-table">',
+    '<div data-test-stack-row="outer-top" style="display:table-row;border-bottom:1px solid currentColor">',
+    '<span id="inner" style="display:inline-table">',
+    '<mark data-test-stack-row="inner-top" style="display:table-row;border-bottom:1px solid currentColor">a+b</mark>',
+    '<var data-test-stack-row="inner-bottom" style="display:table-row">c+d</var>',
+    '</span></div>',
+    '<div data-test-stack-row="outer-bottom" style="display:table-row">e+f</div>',
+    '</section></div>'
+  ].join(''), 'https://partial-selection.invalid/');
+  const document = partial.window.document;
+  const target = document.querySelector('#target');
+  giveNamedCssStackGeometry(document, 'outer', { width: 100, rowHeight: 30 });
+  giveNamedCssStackGeometry(document, 'inner', { left: 20, top: 12, width: 40, rowHeight: 9, gap: 1 });
+  const innerTop = document.querySelector('[data-test-stack-row="inner-top"]').firstChild;
+  const innerBottom = document.querySelector('[data-test-stack-row="inner-bottom"]').firstChild;
+  const outerBottom = document.querySelector('[data-test-stack-row="outer-bottom"]').firstChild;
+
+  const innerPartial = selectRange(partial.window, innerTop, 2, innerBottom, 1);
+  for (const [outputMode, text] of Object.entries({
+    faithful: 'b/c', calculator: 'b/c', latex: '$\\frac{b}{c}$'
+  })) {
+    assert.equal(cleanCopy.getCopyPayload(
+      document, innerPartial, { outputMode }, partial.window, target
+    ).text, text, 'inner partial ' + outputMode);
+  }
+
+  const crossHierarchy = selectRange(partial.window, innerTop, 2, outerBottom, 1);
+  for (const [outputMode, text] of Object.entries({
+    faithful: '(b/(c + d))/e',
+    calculator: '(b/(c+d))/e',
+    latex: '$\\frac{\\frac{b}{c+d}}{e}$'
+  })) {
+    assert.equal(cleanCopy.getCopyPayload(
+      document, crossHierarchy, { outputMode }, partial.window, target
+    ).text, text, 'cross-hierarchy partial ' + outputMode);
+  }
+
+  const exactInner = selectContents(partial.window, document.querySelector('#inner'));
+  assert.equal(cleanCopy.getCopyPayload(
+    document, exactInner, { outputMode: 'faithful' }, partial.window, target
+  ).text, '(a + b)/(c + d)');
+});
+
+test('unsupported visual-stack layouts fail back to native instead of flattening false math', () => {
+  const hosts = ['https://fallback.invalid/', 'https://example.com/app', 'https://docs.google.com/presentation/d/fake/edit'];
+  const unsupportedDisplays = ['list-item', 'ruby', 'table-caption', 'run-in'];
+  for (const url of hosts) {
+    for (const display of unsupportedDisplays) {
+      const instance = dom([
+        '<div id="target">before <span id="stack" style="display:', display, '">',
+        '<i data-test-stack-row="unsupported-top" style="display:block;border-bottom:1px solid currentColor">x+1</i>',
+        '<b data-test-stack-row="unsupported-bottom" style="display:block">y</b>',
+        '</span> after</div>'
+      ].join(''), url);
+      const document = instance.window.document;
+      const target = document.querySelector('#target');
+      giveNamedCssStackGeometry(document, 'unsupported');
+      const selection = selectContents(instance.window, document.querySelector('#stack'));
+      for (const outputMode of ['faithful', 'calculator', 'latex']) {
+        assert.equal(cleanCopy.getCopyPayload(
+          document,
+          selection,
+          { outputMode },
+          instance.window,
+          target
+        ), null, url + ' ' + display + ' ' + outputMode);
+      }
+    }
+  }
+});
+
+test('ordinary HTML superscripts and subscripts are repaired identically on unrelated hosts', () => {
+  const hosts = [
+    'https://scripts.invalid/',
+    'https://example.org/notes',
+    'https://en.wikipedia.org/wiki/HTML',
+    'https://docs.google.com/document/d/fake/pub',
+    'http://localhost:4173/'
+  ];
+  const expectedFormula = {
+    faithful: 'F_g = G(m₁m₂/r²)',
+    calculator: 'F_(g) = G(m_(1)m_(2)/r^(2))',
+    latex: 'F_{g} = G(m_{1}m_{2}/r^{2})'
+  };
+  const expectedStyled = {
+    faithful: 'x² + H₂O',
+    calculator: 'x^(2) + H_(2)O',
+    latex: 'x^{2} + H_{2}O'
+  };
+
+  for (const url of hosts) {
+    const formula = dom([
+      '<article id="target">F<sub>g</sub> = G(m<sub>1</sub>m<sub>2</sub>/r<sup>2</sup>)</article>'
+    ].join(''), url);
+    const formulaTarget = formula.window.document.querySelector('#target');
+    const formulaSelection = selectContents(formula.window, formulaTarget);
+    for (const [outputMode, text] of Object.entries(expectedFormula)) {
+      const payload = cleanCopy.getCopyPayload(
+        formula.window.document,
+        formulaSelection,
+        { outputMode },
+        formula.window,
+        formulaTarget
+      );
+      assert.equal(payload && payload.reason, 'semantic-html-scripts', url + ' tag reason');
+      assert.equal(payload && payload.text, text, url + ' tag ' + outputMode);
+    }
+
+    const styled = dom([
+      '<style>.raised-', hosts.indexOf(url), '{vertical-align:super}',
+      '.lowered-', hosts.indexOf(url), '{font-variant-position:sub}</style>',
+      '<p id="target">x<span class="raised-', hosts.indexOf(url), '">2</span> + ',
+      'H<span class="lowered-', hosts.indexOf(url), '">2</span>O</p>'
+    ].join(''), url);
+    const styledTarget = styled.window.document.querySelector('#target');
+    const styledSelection = selectContents(styled.window, styledTarget);
+    for (const [outputMode, text] of Object.entries(expectedStyled)) {
+      assert.equal(cleanCopy.getCopyPayload(
+        styled.window.document,
+        styledSelection,
+        { outputMode },
+        styled.window,
+        styledTarget
+      ).text, text, url + ' computed style ' + outputMode);
+    }
+    assert.equal(cleanCopy.getCopyPayload(
+      styled.window.document,
+      styledSelection,
+      { outputMode: 'native' },
+      styled.window,
+      styledTarget
+    ), null, url + ' native mode');
+  }
+
+  const nested = dom('<p id="target">x<sub>i<sup>2</sup></sub></p>', 'https://nested-scripts.invalid/');
+  const nestedTarget = nested.window.document.querySelector('#target');
+  const nestedSelection = selectContents(nested.window, nestedTarget);
+  for (const [outputMode, text] of Object.entries({
+    faithful: 'x_(i^2)', calculator: 'x_(i^(2))', latex: 'x_{i^{2}}'
+  })) {
+    assert.equal(cleanCopy.getCopyPayload(
+      nested.window.document,
+      nestedSelection,
+      { outputMode },
+      nested.window,
+      nestedTarget
+    ).text, text, 'nested scripts ' + outputMode);
+  }
+
+  const exponent = nestedTarget.querySelector('sup').firstChild;
+  const exponentOnly = selectRange(nested.window, exponent, 0, exponent, 1);
+  assert.equal(cleanCopy.getCopyPayload(
+    nested.window.document,
+    exponentOnly,
+    { outputMode: 'faithful' },
+    nested.window,
+    nestedTarget
+  ).text, '²');
+  for (const outputMode of ['calculator', 'latex']) {
+    assert.equal(cleanCopy.getCopyPayload(
+      nested.window.document,
+      exponentOnly,
+      { outputMode },
+      nested.window,
+      nestedTarget
+    ), null, outputMode + ' cannot emit a base-less ordinary script');
+  }
+});
+
+test('semantic-script discovery never queries an unrelated document-sized subtree', () => {
+  const noise = Array.from({ length: 5000 }, (_value, index) =>
+    '<i class="unrelated-' + index + '"><b>noise</b></i>').join('');
+  const instance = dom(
+    '<div id="target"><span id="start">alpha   </span><span id="end">beta</span>' +
+    '<section id="unselected">' + noise + '</section></div>'
+  );
+  const documentObject = instance.window.document;
+  const target = documentObject.querySelector('#target');
+  const originalQuerySelectorAll = target.querySelectorAll;
+  let unboundedSemanticQueries = 0;
+  let unboundedProtectedQueries = 0;
+  target.querySelectorAll = function querySelectorAll(selector) {
+    if (selector === 'sup,sub,[style*="vertical-align" i],' +
+        '[style*="font-variant-position" i],[class]') unboundedSemanticQueries += 1;
+    if (selector === 'pre, code, textarea, input, [data-clean-math-copy-preserve]') {
+      unboundedProtectedQueries += 1;
+    }
+    return Reflect.apply(originalQuerySelectorAll, this, [selector]);
+  };
+  const selection = selectRange(
+    instance.window,
+    documentObject.querySelector('#start').firstChild,
+    0,
+    documentObject.querySelector('#end').firstChild,
+    4
+  );
+  const payload = cleanCopy.getCopyPayload(
+    documentObject,
+    selection,
+    { outputMode: 'faithful' },
+    instance.window,
+    target
+  );
+  assert.equal(payload && payload.text, 'alpha beta');
+  assert.equal(unboundedSemanticQueries, 0,
+    'script detection must walk only intersecting nodes under a hard budget');
+  assert.equal(unboundedProtectedQueries, 0,
+    'protected-range detection must also avoid an unbounded selector result');
 });
 
 test('CSS-stacked math preserves surrounding rich prose and table spans', () => {
@@ -7718,4 +8270,1621 @@ test('rewrites invisible artifacts without touching emoji joiners', () => {
   );
   assert.equal(payload.reason, 'invisible-artifacts');
   assert.equal(payload.text, 'A BC 👩‍💻');
+});
+
+const EMBEDDED_TEST_MATHML_NAMESPACE = 'http://www.w3.org/1998/Math/MathML';
+const EMBEDDED_TEST_SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
+
+function giveEmbeddedTestRect(element, width = 28, height = 18) {
+  element.getBoundingClientRect = () => ({
+    left: 12,
+    top: 8,
+    right: 12 + width,
+    bottom: 8 + height,
+    width,
+    height
+  });
+}
+
+function selectEmbeddedTestNode(window, element) {
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  const range = window.document.createRange();
+  range.selectNode(element);
+  selection.addRange(range);
+  return selection;
+}
+
+function embeddedMetadataFixture(options = {}) {
+  const instance = dom(
+    '<p id="target">Before <span id="slot"></span> after</p>',
+    options.url || 'https://embedded-math.invalid/article'
+  );
+  const documentObject = instance.window.document;
+  const slot = documentObject.querySelector('#slot');
+  const surface = documentObject.createElementNS(
+    options.surfaceTag === 'svg' ? EMBEDDED_TEST_SVG_NAMESPACE : 'http://www.w3.org/1999/xhtml',
+    options.surfaceTag || 'img'
+  );
+  surface.id = 'surface';
+  let root = surface;
+  if (options.wrapper) {
+    root = documentObject.createElement(options.wrapperTag || 'figure');
+    root.id = 'math-root';
+    root.className = options.wrapperClass || 'third-party-equation-shell';
+    root.appendChild(surface);
+  } else {
+    root.id = 'math-root';
+  }
+  for (const [name, value] of Object.entries(options.attributes || {})) {
+    root.setAttribute(name, value);
+  }
+  if (options.alt != null) surface.setAttribute('alt', options.alt);
+  if (options.rootStyle) root.setAttribute('style', options.rootStyle);
+  slot.replaceWith(root);
+  if (options.positiveRect !== false) giveEmbeddedTestRect(surface);
+  return {
+    instance,
+    document: documentObject,
+    target: documentObject.querySelector('#target'),
+    root,
+    surface
+  };
+}
+
+function mathJaxSvgFixture(options = {}) {
+  const instance = dom(
+    '<p id="target">Before <mjx-container id="math-root" class="MathJax" jax="SVG"></mjx-container> after</p>',
+    options.url || 'https://svg-math.invalid/article'
+  );
+  const documentObject = instance.window.document;
+  const root = documentObject.querySelector('#math-root');
+  const svg = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'svg');
+  const top = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'g');
+  top.setAttribute('data-mml-node', 'math');
+  top.setAttribute('data-latex', options.source || 'x^{2}');
+  const structure = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'g');
+  structure.setAttribute('data-mml-node', options.structure || 'msup');
+  structure.setAttribute('data-semantic-id', 'structure-0');
+  const glyphs = options.glyphs || [{ code: '78' }, { code: '32' }];
+  glyphs.forEach((definition, index) => {
+    const item = typeof definition === 'string' ? { code: definition } : definition;
+    const token = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'g');
+    const point = Number.parseInt(item.code || '0', 16);
+    const inferredCharacter = Number.isInteger(point) && point >= 0 && point <= 0x10ffff
+      ? String.fromCodePoint(point)
+      : '';
+    token.setAttribute('data-mml-node', item.node || (/[0-9]/u.test(inferredCharacter) ? 'mn' : 'mi'));
+    const glyph = documentObject.createElementNS(
+      EMBEDDED_TEST_SVG_NAMESPACE,
+      item.tag || 'path'
+    );
+    if (item.code != null) glyph.setAttribute('data-c', item.code);
+    if (item.href != null) glyph.setAttribute('href', item.href);
+    if ((item.tag || 'path') === 'path' && item.d !== null) {
+      glyph.setAttribute('d', item.d || 'M0 0L10 0L10 10Z');
+    }
+    glyph.setAttribute('data-test-glyph', String(index));
+    token.appendChild(glyph);
+    structure.appendChild(token);
+  });
+  if ((options.structure || 'msup') === 'mfrac' && options.fractionRule !== false) {
+    const rule = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'rect');
+    rule.setAttribute('width', '10');
+    rule.setAttribute('height', '1');
+    structure.appendChild(rule);
+  }
+  top.appendChild(structure);
+  for (let index = 0; index < (options.nestedMetadata || 0); index += 1) {
+    const metadata = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'g');
+    metadata.setAttribute('data-latex', 'x');
+    top.appendChild(metadata);
+  }
+  svg.appendChild(top);
+  root.appendChild(svg);
+  if (options.rootStyle) root.setAttribute('style', options.rootStyle);
+  if (options.jax) root.setAttribute('jax', options.jax);
+  if (typeof options.mutate === 'function') options.mutate({ documentObject, root, svg, top, structure });
+  if (options.positiveRect !== false) {
+    giveEmbeddedTestRect(root, 44, 24);
+    giveEmbeddedTestRect(svg, 44, 24);
+  }
+  return {
+    instance,
+    document: documentObject,
+    target: documentObject.querySelector('#target'),
+    root,
+    svg,
+    top,
+    structure
+  };
+}
+
+function mathJaxV4SnapshotFixture(source, build, options = {}) {
+  const instance = dom(
+    '<p id="target">Before <mjx-container id="math-root" class="MathJax" jax="SVG"></mjx-container> after</p>',
+    options.url || 'https://mathjax-v4.invalid/article'
+  );
+  const documentObject = instance.window.document;
+  const root = documentObject.querySelector('#math-root');
+  const svg = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'svg');
+  const defs = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'defs');
+  const paint = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'g');
+  paint.setAttribute('transform', 'scale(1,-1)');
+  const top = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'g');
+  top.setAttribute('data-mml-node', 'math');
+  top.setAttribute('data-latex', source);
+  let glyphIndex = 0;
+  const group = (parent, node, latex) => {
+    const element = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'g');
+    if (node) element.setAttribute('data-mml-node', node);
+    if (latex != null) element.setAttribute('data-latex', latex);
+    parent.appendChild(element);
+    return element;
+  };
+  const glyph = (parent, node, latex, code, optionsForGlyph = {}) => {
+    const token = group(parent, node, latex);
+    const use = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'use');
+    const id = 'MJX-v4-test-' + glyphIndex;
+    glyphIndex += 1;
+    use.setAttribute('data-c', code);
+    use.setAttribute('href', '#' + id);
+    token.appendChild(use);
+    const path = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'path');
+    path.id = id;
+    path.setAttribute('d', optionsForGlyph.emptyPath ? '' : 'M0 0L10 0L10 10Z');
+    defs.appendChild(path);
+    return token;
+  };
+  const nativeText = (parent, text) => {
+    const element = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'text');
+    element.setAttribute('data-variant', 'normal');
+    element.setAttribute('transform', 'scale(1,-1)');
+    element.textContent = text;
+    parent.appendChild(element);
+    return element;
+  };
+  const rect = (parent) => {
+    const element = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'rect');
+    element.setAttribute('width', '10');
+    element.setAttribute('height', '1');
+    parent.appendChild(element);
+    return element;
+  };
+  build({ documentObject, root, svg, defs, top, group, glyph, nativeText, rect });
+  paint.appendChild(top);
+  svg.append(defs, paint);
+  root.appendChild(svg);
+  giveEmbeddedTestRect(root, 60, 28);
+  giveEmbeddedTestRect(svg, 60, 28);
+  return {
+    instance,
+    document: documentObject,
+    target: documentObject.querySelector('#target'),
+    root,
+    svg,
+    defs,
+    top
+  };
+}
+
+function mathJaxV4Payload(fixture, outputMode = 'faithful') {
+  return cleanCopy.getCopyPayload(
+    fixture.document,
+    selectContents(fixture.instance.window, fixture.target),
+    { outputMode },
+    fixture.instance.window,
+    fixture.target
+  );
+}
+
+test('generic embedded MathML recovery is host-neutral for mixed and whole selections', () => {
+  const rawMathML = [
+    '<math xmlns="', EMBEDDED_TEST_MATHML_NAMESPACE, '"><mfrac><msup>',
+    '<mi>x</mi><mn>2</mn></msup><mi>y</mi></mfrac></math>'
+  ].join('');
+  const expectedMixed = {
+    faithful: 'Before x²/y after',
+    calculator: 'Before ((x^(2))/y) after',
+    latex: 'Before $\\frac{{x}^{2}}{y}$ after'
+  };
+  for (const url of [
+    'https://alpha.invalid/lesson',
+    'https://en.wikipedia.org/wiki/Example',
+    'https://docs.google.com/document/d/host-neutral-test/edit',
+    'https://word.cloud.microsoft/edit.aspx',
+    'https://localhost.invalid:8443/custom-renderer'
+  ]) {
+    for (const [outputMode, expected] of Object.entries(expectedMixed)) {
+      const fixture = embeddedMetadataFixture({
+        url,
+        attributes: { 'data-mathml': rawMathML }
+      });
+      const payload = cleanCopy.getCopyPayload(
+        fixture.document,
+        selectContents(fixture.instance.window, fixture.target),
+        { outputMode },
+        fixture.instance.window,
+        fixture.target
+      );
+      assert.equal(payload.text, expected, url + ' ' + outputMode);
+      assert.equal(payload.reason, 'rendered-math', url + ' ' + outputMode);
+      assert.equal(payload.mathRanges, 1, url + ' ' + outputMode);
+      assert.doesNotMatch(payload.html, /data-mathml|<img\b|\\frac/u, url + ' ' + outputMode);
+      if (outputMode === 'faithful') assert.match(payload.html, /<sup>2<\/sup>/u, url);
+    }
+  }
+
+  const whole = embeddedMetadataFixture({
+    attributes: { 'data-mathml': rawMathML }
+  });
+  for (const [outputMode, expected] of Object.entries({
+    faithful: 'x²/y',
+    calculator: '((x^(2))/y)',
+    latex: '$\\frac{{x}^{2}}{y}$'
+  })) {
+    const payload = cleanCopy.getCopyPayload(
+      whole.document,
+      selectEmbeddedTestNode(whole.instance.window, whole.root),
+      { outputMode },
+      whole.instance.window,
+      whole.root
+    );
+    assert.equal(payload.text, expected, outputMode);
+    assert.match(payload.mathML, /^<math\b/u, outputMode);
+    assert.doesNotMatch(payload.mathML, /data-mathml|script|foreignObject/iu, outputMode);
+  }
+
+  const wrapped = embeddedMetadataFixture({
+    wrapper: true,
+    wrapperTag: 'vendor-widget',
+    wrapperClass: 'vendor-formula-frame',
+    attributes: { 'data-mathml': rawMathML }
+  });
+  assert.equal(cleanCopy.getCopyPayload(
+    wrapped.document,
+    selectContents(wrapped.instance.window, wrapped.target),
+    { outputMode: 'faithful' },
+    wrapped.instance.window,
+    wrapped.target
+  ).text, 'Before x²/y after');
+
+  const encoded = embeddedMetadataFixture({
+    attributes: {
+      'data-mathml': '«math xmlns=¨http://www.w3.org/1998/Math/MathML¨»' +
+        '«msqrt»«mi»q«/mi»«/msqrt»«/math»'
+    }
+  });
+  assert.equal(cleanCopy.getCopyPayload(
+    encoded.document,
+    selectContents(encoded.instance.window, encoded.target),
+    { outputMode: 'faithful' },
+    encoded.instance.window,
+    encoded.target
+  ).text, 'Before √q after');
+
+  const legacyWithoutNamespace = embeddedMetadataFixture({
+    attributes: { 'data-mathml': '<math><msup><mi>r</mi><mn>2</mn></msup></math>' }
+  });
+  assert.equal(cleanCopy.getCopyPayload(
+    legacyWithoutNamespace.document,
+    selectContents(legacyWithoutNamespace.instance.window, legacyWithoutNamespace.target),
+    { outputMode: 'faithful' },
+    legacyWithoutNamespace.instance.window,
+    legacyWithoutNamespace.target
+  ).text, 'Before r² after');
+});
+
+test('generic embedded TeX requires all independent source metadata to agree', () => {
+  const equivalent = embeddedMetadataFixture({
+    attributes: { 'data-equation-content': '\\frac{x^2}{y}' },
+    alt: 'LaTeX: \\frac{x^{2}}{y}'
+  });
+  for (const [outputMode, expected] of Object.entries({
+    faithful: 'Before x²/y after',
+    calculator: 'Before (x^(2))/y after',
+    latex: 'Before $\\frac{x^2}{y}$ after'
+  })) {
+    const payload = cleanCopy.getCopyPayload(
+      equivalent.document,
+      selectContents(equivalent.instance.window, equivalent.target),
+      { outputMode },
+      equivalent.instance.window,
+      equivalent.target
+    );
+    assert.equal(payload.text, expected, outputMode);
+    assert.equal(payload.mathML, '', outputMode);
+    assert.doesNotMatch(payload.html, /data-equation-content|<img\b|LaTeX:/iu, outputMode);
+  }
+
+  for (const options of [
+    {
+      attributes: { 'data-equation-content': 'x' },
+      alt: 'LaTeX: y'
+    },
+    {
+      attributes: { 'data-equation-content': 'x', 'data-latex': 'y' },
+      alt: 'LaTeX: x'
+    },
+    {
+      attributes: {
+        'data-mathml': '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>',
+        'data-latex': 'y'
+      },
+      alt: 'LaTeX: y'
+    }
+  ]) {
+    const fixture = embeddedMetadataFixture(options);
+    assert.equal(cleanCopy.getCopyPayload(
+      fixture.document,
+      selectContents(fixture.instance.window, fixture.target),
+      { outputMode: 'faithful' },
+      fixture.instance.window,
+      fixture.target
+    ), null, JSON.stringify(options.attributes));
+  }
+});
+
+test('embedded math requires every accessibility representation to agree', () => {
+  const fractionMathML = '<math xmlns="http://www.w3.org/1998/Math/MathML">' +
+    '<mfrac><msup><mi>x</mi><mn>2</mn></msup><mi>y</mi></mfrac></math>';
+  const agreeing = embeddedMetadataFixture({
+    wrapper: true,
+    wrapperTag: 'vendor-equation',
+    wrapperClass: 'portable-equation',
+    attributes: {
+      'data-mathml': fractionMathML,
+      'data-latex': '\\frac{x^2}{y}'
+    },
+    alt: 'x²/y'
+  });
+  agreeing.surface.setAttribute('aria-label', 'Equation: x^2/y');
+  agreeing.root.setAttribute('aria-label', 'LaTeX: \\frac{x^{2}}{y}');
+  assert.equal(cleanCopy.getCopyPayload(
+    agreeing.document,
+    selectContents(agreeing.instance.window, agreeing.target),
+    { outputMode: 'faithful' },
+    agreeing.instance.window,
+    agreeing.target
+  ).text, 'Before x²/y after');
+
+  const staleMathImage = embeddedMetadataFixture({
+    attributes: {
+      'data-mathml': '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>'
+    },
+    alt: 'A cat'
+  });
+  assert.equal(cleanCopy.getCopyPayload(
+    staleMathImage.document,
+    selectContents(staleMathImage.instance.window, staleMathImage.target),
+    { outputMode: 'faithful' },
+    staleMathImage.instance.window,
+    staleMathImage.target
+  ), null, 'hidden MathML cannot replace a contradictory visible image description');
+
+  const conflictingLabels = embeddedMetadataFixture({
+    attributes: { 'data-equation-content': 'x' },
+    alt: 'LaTeX: x'
+  });
+  conflictingLabels.surface.setAttribute('aria-label', 'LaTeX: y');
+  assert.equal(cleanCopy.getCopyPayload(
+    conflictingLabels.document,
+    selectContents(conflictingLabels.instance.window, conflictingLabels.target),
+    { outputMode: 'faithful' },
+    conflictingLabels.instance.window,
+    conflictingLabels.target
+  ), null, 'alt must not hide a contradictory aria-label');
+
+  const mutation = embeddedMetadataFixture({
+    wrapper: true,
+    wrapperTag: 'vendor-equation',
+    wrapperClass: 'portable-equation',
+    attributes: { 'data-equation-content': 'x' },
+    alt: 'LaTeX: x'
+  });
+  mutation.root.setAttribute('aria-label', 'Formula: x');
+  assert.equal(cleanCopy.getCopyPayload(
+    mutation.document,
+    selectContents(mutation.instance.window, mutation.target),
+    { outputMode: 'faithful' },
+    mutation.instance.window,
+    mutation.target
+  ).text, 'Before x after');
+  mutation.root.setAttribute('aria-label', 'Formula: y');
+  assert.equal(cleanCopy.getCopyPayload(
+    mutation.document,
+    selectContents(mutation.instance.window, mutation.target),
+    { outputMode: 'faithful' },
+    mutation.instance.window,
+    mutation.target
+  ), null, 'a later copy must audit a mutated lower-priority accessibility field');
+});
+
+test('embedded metadata decoding is bounded, mutation-safe, and audits every visual wrapper', () => {
+  const namedEntities = embeddedMetadataFixture({
+    attributes: {
+      'data-mathml': '<math xmlns="http://www.w3.org/1998/Math/MathML">' +
+        '<mi>&alpha;</mi><mo>&NotEqual;</mo><mi>&beta;</mi></math>'
+    }
+  });
+  const parserPrototype = namedEntities.instance.window.DOMParser.prototype;
+  const originalParse = parserPrototype.parseFromString;
+  let parseCalls = 0;
+  parserPrototype.parseFromString = function countedParse(...args) {
+    parseCalls += 1;
+    return Reflect.apply(originalParse, this, args);
+  };
+  try {
+    assert.equal(cleanCopy.getCopyPayload(
+      namedEntities.document,
+      selectContents(namedEntities.instance.window, namedEntities.target),
+      { outputMode: 'faithful' },
+      namedEntities.instance.window,
+      namedEntities.target
+    ).text, 'Before α ≠ β after');
+    assert.equal(parseCalls, 2,
+      'all unique named entities share one inert decode parse plus one XML parse');
+  } finally {
+    parserPrototype.parseFromString = originalParse;
+  }
+
+  const unknownEntity = embeddedMetadataFixture({
+    attributes: {
+      'data-mathml': '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>&notARealEntity;</mi></math>'
+    }
+  });
+  assert.equal(cleanCopy.getCopyPayload(
+    unknownEntity.document,
+    selectContents(unknownEntity.instance.window, unknownEntity.target),
+    { outputMode: 'faithful' },
+    unknownEntity.instance.window,
+    unknownEntity.target
+  ), null, 'an unknown or partially decoded entity cannot become visible math');
+
+  const tooManyEntities = embeddedMetadataFixture({
+    attributes: {
+      'data-mathml': '<math xmlns="http://www.w3.org/1998/Math/MathML"><mrow>' +
+        Array.from({ length: 1025 }, (_value, index) => '<mi>&FakeEntity' + index + ';</mi>').join('') +
+        '</mrow></math>'
+    }
+  });
+  const oversizedParserPrototype = tooManyEntities.instance.window.DOMParser.prototype;
+  const oversizedOriginalParse = oversizedParserPrototype.parseFromString;
+  let oversizedParseCalls = 0;
+  oversizedParserPrototype.parseFromString = function countedOversizedParse(...args) {
+    oversizedParseCalls += 1;
+    return Reflect.apply(oversizedOriginalParse, this, args);
+  };
+  try {
+    assert.equal(cleanCopy.getCopyPayload(
+      tooManyEntities.document,
+      selectContents(tooManyEntities.instance.window, tooManyEntities.target),
+      { outputMode: 'faithful' },
+      tooManyEntities.instance.window,
+      tooManyEntities.target
+    ), null);
+    assert.equal(oversizedParseCalls, 0,
+      'an adversarial number of unique names is rejected before any parser allocation');
+  } finally {
+    oversizedParserPrototype.parseFromString = oversizedOriginalParse;
+  }
+
+  const mutation = embeddedMetadataFixture({
+    attributes: {
+      'data-equation-content': 'x',
+      'data-latex': 'x'
+    },
+    alt: 'LaTeX: x'
+  });
+  assert.equal(cleanCopy.getCopyPayload(
+    mutation.document,
+    selectContents(mutation.instance.window, mutation.target),
+    { outputMode: 'faithful' },
+    mutation.instance.window,
+    mutation.target
+  ).text, 'Before x after');
+  mutation.root.setAttribute('data-equation-content', 'x\u0001x');
+  mutation.root.removeAttribute('data-latex');
+  assert.equal(cleanCopy.getCopyPayload(
+    mutation.document,
+    selectContents(mutation.instance.window, mutation.target),
+    { outputMode: 'faithful' },
+    mutation.instance.window,
+    mutation.target
+  ), null, 'metadata field separators cannot alias a previously cached descriptor');
+
+  const hiddenIntermediate = embeddedMetadataFixture({
+    wrapper: true,
+    wrapperTag: 'vendor-equation',
+    wrapperClass: 'portable-equation',
+    attributes: {
+      'data-mathml': '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>'
+    }
+  });
+  const hiddenBox = hiddenIntermediate.document.createElement('span');
+  hiddenBox.style.opacity = '0';
+  hiddenIntermediate.surface.before(hiddenBox);
+  hiddenBox.appendChild(hiddenIntermediate.surface);
+  assert.equal(cleanCopy.getCopyPayload(
+    hiddenIntermediate.document,
+    selectContents(hiddenIntermediate.instance.window, hiddenIntermediate.target),
+    { outputMode: 'faithful' },
+    hiddenIntermediate.instance.window,
+    hiddenIntermediate.target
+  ), null, 'a hidden wrapper between metadata owner and pixels cannot authenticate the source');
+
+  const oversizedAccessibleText = embeddedMetadataFixture({
+    attributes: { 'data-equation-content': 'x' },
+    alt: 'LaTeX: ' + 'x'.repeat(50001)
+  });
+  assert.equal(cleanCopy.getCopyPayload(
+    oversizedAccessibleText.document,
+    selectContents(oversizedAccessibleText.instance.window, oversizedAccessibleText.target),
+    { outputMode: 'faithful' },
+    oversizedAccessibleText.instance.window,
+    oversizedAccessibleText.target
+  ), null, 'oversized accessibility metadata is rejected before agreement or cache work');
+});
+
+test('generic embedded metadata fails closed on hidden, malformed, oversized, or ambiguous surfaces', () => {
+  const valid = '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>';
+  const cases = [
+    { attributes: { 'data-mathml': valid }, positiveRect: false },
+    { attributes: { 'data-mathml': valid }, rootStyle: 'display:none' },
+    { attributes: { 'data-mathml': valid }, rootStyle: 'opacity:0' },
+    { attributes: { 'data-mathml': valid }, rootStyle: 'transform:scale(0)' },
+    { attributes: { 'data-mathml': '<math xmlns="urn:not-mathml"><mi>x</mi></math>' } },
+    { attributes: { 'data-mathml': '<math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</math>' } },
+    { attributes: { 'data-mathml': '<math xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mi>x</mi></mfrac></math>' } },
+    { attributes: { 'data-mathml': '<math xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mi>x</mi><script>y</script></mfrac></math>' } },
+    { attributes: { 'data-mathml': '<!DOCTYPE math><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>' } },
+    { attributes: { 'data-mathml': '<?xml version="1.0"?><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math>' } },
+    { attributes: { 'data-mathml': '<math xmlns="http://www.w3.org/1998/Math/MathML"><unknown>x</unknown></math>' } },
+    { attributes: { 'data-mathml': 'x'.repeat(1024 * 1024 + 1) } },
+    { attributes: { 'data-equation-content': 'x'.repeat(50001) }, alt: 'equation image' }
+  ];
+  for (const [index, options] of cases.entries()) {
+    const fixture = embeddedMetadataFixture(options);
+    assert.equal(cleanCopy.getCopyPayload(
+      fixture.document,
+      selectContents(fixture.instance.window, fixture.target),
+      { outputMode: 'faithful' },
+      fixture.instance.window,
+      fixture.target
+    ), null, 'unsafe embedded metadata case ' + index);
+  }
+
+  for (const ancestorStyle of ['opacity:0', 'display:none', 'clip-path:circle(0)', 'overflow:hidden']) {
+    const fixture = embeddedMetadataFixture({ attributes: { 'data-mathml': valid } });
+    fixture.target.setAttribute('style', ancestorStyle);
+    assert.equal(cleanCopy.getCopyPayload(
+      fixture.document,
+      selectContents(fixture.instance.window, fixture.target),
+      { outputMode: 'faithful' },
+      fixture.instance.window,
+      fixture.target
+    ), null, 'hidden or unmeasurable embedded-math ancestor: ' + ancestorStyle);
+  }
+
+  const transformedAncestor = embeddedMetadataFixture({
+    wrapper: true,
+    wrapperClass: 'portable-equation',
+    attributes: { 'data-mathml': valid }
+  });
+  transformedAncestor.target.setAttribute('style', 'transform:translateX(2px)');
+  assert.equal(cleanCopy.getCopyPayload(
+    transformedAncestor.document,
+    selectContents(transformedAncestor.instance.window, transformedAncestor.root),
+    { outputMode: 'faithful' },
+    transformedAncestor.instance.window,
+    transformedAncestor.root
+  ).text, 'x', 'a still-visible transformed ancestor remains supported for an exact formula');
+
+  for (const shape of ['arbitrary-wrapper', 'two-surfaces', 'visible-wrapper-text']) {
+    const fixture = embeddedMetadataFixture({
+      wrapper: true,
+      wrapperTag: 'div',
+      wrapperClass: shape === 'arbitrary-wrapper' ? 'ordinary-card' : 'some-equation',
+      attributes: { 'data-mathml': valid }
+    });
+    if (shape === 'arbitrary-wrapper') fixture.root.id = 'ordinary-card-root';
+    if (shape === 'two-surfaces') {
+      const second = fixture.document.createElement('img');
+      giveEmbeddedTestRect(second);
+      fixture.root.appendChild(second);
+    } else if (shape === 'visible-wrapper-text') {
+      fixture.root.appendChild(fixture.document.createTextNode(' ordinary prose'));
+    }
+    const range = fixture.document.createRange();
+    range.selectNodeContents(fixture.target);
+    assert.equal(cleanCopy.rootsForRange(range).includes(fixture.root), false, shape);
+  }
+});
+
+test('embedded MathML is sanitized and a strict inner visual selection is never widened', () => {
+  const fixture = embeddedMetadataFixture({
+    wrapper: true,
+    surfaceTag: 'svg',
+    attributes: {
+      'data-mathml': '<math xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>x</mi>' +
+        '<script>SECRET_SCRIPT</script><foreignObject>SECRET_FOREIGN</foreignObject></mrow></math>'
+    }
+  });
+  fixture.surface.appendChild(fixture.document.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'path'));
+  const whole = cleanCopy.getCopyPayload(
+    fixture.document,
+    selectEmbeddedTestNode(fixture.instance.window, fixture.root),
+    { outputMode: 'faithful' },
+    fixture.instance.window,
+    fixture.root
+  );
+  assert.equal(whole.text, 'x');
+  assert.doesNotMatch(whole.html + whole.mathML, /SECRET|script|foreignObject/iu);
+
+  assert.equal(cleanCopy.getCopyPayload(
+    fixture.document,
+    selectContents(fixture.instance.window, fixture.surface),
+    { outputMode: 'faithful' },
+    fixture.instance.window,
+    fixture.surface
+  ), null, 'selecting only the visual child must not promote the whole semantic formula');
+});
+
+test('MathJax SVG recovery is host-neutral and preserves exact whole and mixed boundaries', () => {
+  const expectedMixed = {
+    faithful: 'Before x² after',
+    calculator: 'Before x^(2) after',
+    latex: 'Before $x^{2}$ after'
+  };
+  for (const url of [
+    'https://one.invalid/a',
+    'https://en.wikipedia.org/wiki/Unrelated',
+    'https://docs.google.com/document/d/svg-test/edit',
+    'https://word.cloud.microsoft/svg-test',
+    'https://another.invalid/math'
+  ]) {
+    for (const [outputMode, expected] of Object.entries(expectedMixed)) {
+      const fixture = mathJaxSvgFixture({ url });
+      const payload = cleanCopy.getCopyPayload(
+        fixture.document,
+        selectContents(fixture.instance.window, fixture.target),
+        { outputMode },
+        fixture.instance.window,
+        fixture.target
+      );
+      assert.equal(payload.text, expected, url + ' ' + outputMode);
+      assert.equal(payload.reason, 'rendered-math', url + ' ' + outputMode);
+      assert.equal(payload.mathML, '', url + ' ' + outputMode);
+      assert.doesNotMatch(payload.html, /<svg|<path|data-latex|data-c/iu, url + ' ' + outputMode);
+      if (outputMode === 'faithful') assert.match(payload.html, /<sup>2<\/sup>/u, url);
+    }
+  }
+
+  const exact = mathJaxSvgFixture();
+  for (const element of [exact.root, exact.svg]) {
+    const payload = cleanCopy.getCopyPayload(
+      exact.document,
+      selectContents(exact.instance.window, element),
+      { outputMode: 'faithful' },
+      exact.instance.window,
+      element
+    );
+    assert.equal(payload.text, 'x²', element.localName);
+  }
+  assert.equal(cleanCopy.getCopyPayload(
+    exact.document,
+    selectContents(exact.instance.window, exact.structure),
+    { outputMode: 'faithful' },
+    exact.instance.window,
+    exact.structure
+  ), null, 'an inner SVG group is a strict partial, not the whole equation');
+
+  for (const [outputMode, expected] of Object.entries({
+    faithful: 'Before x/y after',
+    calculator: 'Before x/y after',
+    latex: 'Before $\\frac{x}{y}$ after'
+  })) {
+    const fraction = mathJaxSvgFixture({
+      source: '\\frac{x}{y}',
+      structure: 'mfrac',
+      glyphs: [{ code: '78' }, { code: '79' }]
+    });
+    assert.equal(cleanCopy.getCopyPayload(
+      fraction.document,
+      selectContents(fraction.instance.window, fraction.target),
+      { outputMode },
+      fraction.instance.window,
+      fraction.target
+    ).text, expected, outputMode);
+  }
+});
+
+test('MathJax SVG recovery rejects stale structure, stale glyphs, and unsafe SVG content', () => {
+  const cases = [
+    { name: 'stale-structure', options: { structure: 'mfrac' } },
+    { name: 'missing-structure', options: { structure: 'mrow' } },
+    { name: 'stale-identifier', options: { glyphs: [{ code: '79' }, { code: '32' }] } },
+    {
+      name: 'stale-order',
+      options: {
+        source: 'x-y',
+        structure: 'mrow',
+        glyphs: [{ code: '79' }, { code: '2d', node: 'mo' }, { code: '78' }]
+      }
+    },
+    {
+      name: 'stale-operator',
+      options: {
+        source: 'x+y',
+        structure: 'mrow',
+        glyphs: [{ code: '78' }, { code: '2d', node: 'mo' }, { code: '79' }]
+      }
+    },
+    {
+      name: 'foreign-object',
+      options: {
+        mutate({ documentObject, svg }) {
+          const foreign = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'foreignObject');
+          foreign.textContent = 'SECRET';
+          svg.appendChild(foreign);
+        }
+      }
+    },
+    {
+      name: 'external-use',
+      options: { glyphs: [{ code: '78', tag: 'use', href: 'https://attacker.invalid/glyph' }, { code: '32' }] }
+    },
+    {
+      name: 'embedded-image',
+      options: {
+        mutate({ documentObject, svg }) {
+          const image = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'image');
+          image.setAttribute('href', 'data:image/svg+xml,SECRET');
+          svg.appendChild(image);
+        }
+      }
+    },
+    {
+      name: 'svg-text',
+      options: {
+        mutate({ documentObject, svg }) {
+          const text = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'text');
+          text.textContent = 'SECRET';
+          svg.appendChild(text);
+        }
+      }
+    },
+    { name: 'invalid-codepoint', options: { glyphs: [{ code: '110000' }, { code: '32' }] } },
+    { name: 'zero-geometry', options: { positiveRect: false } },
+    { name: 'hidden-root', options: { rootStyle: 'opacity:0' } },
+    { name: 'wrong-renderer', options: { jax: 'CHTML' } }
+  ];
+  for (const testCase of cases) {
+    const fixture = mathJaxSvgFixture(testCase.options);
+    assert.equal(cleanCopy.getCopyPayload(
+      fixture.document,
+      selectContents(fixture.instance.window, fixture.target),
+      { outputMode: 'faithful' },
+      fixture.instance.window,
+      fixture.target
+    ), null, testCase.name);
+    assert.equal(cleanCopy.getCopyPayload(
+      fixture.document,
+      selectContents(fixture.instance.window, fixture.root),
+      { outputMode: 'faithful' },
+      fixture.instance.window,
+      fixture.root
+    ), null, testCase.name + ' exact root');
+  }
+
+  const localUse = mathJaxSvgFixture({
+    source: 'x',
+    structure: 'mrow',
+    glyphs: [{ code: '78', tag: 'use', href: '#MJX-glyph-x' }],
+    mutate({ documentObject, svg }) {
+      const defs = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'defs');
+      const path = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'path');
+      path.id = 'MJX-glyph-x';
+      path.setAttribute('d', 'M0 0L10 0L10 10Z');
+      defs.appendChild(path);
+      svg.prepend(defs);
+    }
+  });
+  assert.equal(cleanCopy.getCopyPayload(
+    localUse.document,
+    selectContents(localUse.instance.window, localUse.target),
+    { outputMode: 'faithful' },
+    localUse.instance.window,
+    localUse.target
+  ).text, 'Before x after');
+});
+
+test('renderer-internal SVG metadata cannot exhaust generic math-root discovery', () => {
+  const fixture = mathJaxSvgFixture({
+    source: 'x',
+    structure: 'mrow',
+    glyphs: [{ code: '78' }],
+    nestedMetadata: 4100
+  });
+  const selection = selectContents(fixture.instance.window, fixture.target);
+  const range = selection.getRangeAt(0);
+  assert.deepEqual(cleanCopy.rootsForRange(range), [fixture.root]);
+  assert.equal(cleanCopy.getCopyPayload(
+    fixture.document,
+    selectContents(fixture.instance.window, fixture.root),
+    { outputMode: 'faithful' },
+    fixture.instance.window,
+    fixture.root
+  ).text, 'x');
+});
+
+test('genuine MathJax v4 SVG topology authenticates scripts, limits, roots, accents, braces, and native text', () => {
+  const cases = [
+    {
+      source: 'x_i^2', expected: 'xᵢ²',
+      build({ top, group, glyph }) {
+        const scripts = group(top, 'msubsup', 'x_i^2');
+        glyph(scripts, 'mi', 'x', '1D465');
+        const upper = glyph(scripts, 'mn', '2', '32');
+        upper.setAttribute('transform', 'translate(10,100) scale(0.707)');
+        const lower = glyph(scripts, 'mi', 'i', '1D456');
+        lower.setAttribute('transform', 'translate(10,-100) scale(0.707)');
+      }
+    },
+    {
+      source: '\\frac{x+y}{z}', expected: '(x + y)/z',
+      build({ top, group, glyph, rect }) {
+        const fraction = group(top, 'mfrac', '\\frac{x+y}{z}');
+        const numerator = group(fraction, 'mrow', 'x+y');
+        glyph(numerator, 'mi', 'x', '1D465');
+        glyph(numerator, 'mo', '+', '2B');
+        glyph(numerator, 'mi', 'y', '1D466');
+        glyph(fraction, 'mi', 'z', '1D467');
+        rect(fraction);
+      }
+    },
+    {
+      source: '\\sqrt{x+y}', expected: '√(x + y)',
+      build({ top, group, glyph, rect }) {
+        const root = group(top, 'msqrt', '\\sqrt{x+y}');
+        glyph(root, 'mo', null, '221A');
+        const body = group(root, '', null);
+        glyph(body, 'mi', 'x', '1D465');
+        glyph(body, 'mo', '+', '2B');
+        glyph(body, 'mi', 'y', '1D466');
+        rect(root);
+      }
+    },
+    {
+      source: '\\sqrt[3]{x}', expected: '∛x',
+      build({ top, group, glyph, rect }) {
+        const root = group(top, 'mroot', '\\sqrt[3]{x}');
+        glyph(root, 'mo', null, '221A');
+        glyph(root, 'mn', '3', '33');
+        const body = group(root, '', null);
+        glyph(body, 'mi', 'x', '1D465');
+        rect(root);
+      }
+    },
+    {
+      source: '\\sum_{i=1}^{n}i', expected: '∑ᵢ₌₁ⁿ i',
+      build({ top, group, glyph }) {
+        const limits = group(top, 'munderover', '\\sum_{i=1}^{n}');
+        glyph(limits, 'mo', '\\sum', '2211');
+        const lower = group(limits, 'TeXAtom', '{i=1}');
+        lower.setAttribute('transform', 'translate(0,-100) scale(0.707)');
+        glyph(lower, 'mi', 'i', '1D456');
+        glyph(lower, 'mo', '=', '3D');
+        glyph(lower, 'mn', '1', '31');
+        const upper = group(limits, 'TeXAtom', '{n}');
+        upper.setAttribute('transform', 'translate(0,100) scale(0.707)');
+        glyph(upper, 'mi', 'n', '1D45B');
+        glyph(top, 'mi', 'i', '1D456');
+      }
+    },
+    {
+      source: '\\int_0^1 x\\,dx', expected: '∫₀¹ x dx',
+      build({ top, group, glyph }) {
+        const limits = group(top, 'msubsup', '\\int_0^1');
+        glyph(limits, 'mo', '\\int', '222B');
+        const upper = glyph(limits, 'mn', '1', '31');
+        upper.setAttribute('transform', 'translate(0,100) scale(0.707)');
+        const lower = glyph(limits, 'mn', '0', '30');
+        lower.setAttribute('transform', 'translate(0,-100) scale(0.707)');
+        glyph(top, 'mi', 'x', '1D465');
+        group(top, 'mspace', '\\,');
+        glyph(top, 'mi', 'd', '1D451');
+        glyph(top, 'mi', 'x', '1D465');
+      }
+    },
+    {
+      source: '\\overline{xy}', expected: 'overline(xy)',
+      build({ top, group, glyph }) {
+        const over = group(top, 'mover', '\\overline{xy}');
+        const body = group(over, 'mrow', 'xy');
+        glyph(body, 'mi', 'x', '1D465');
+        glyph(body, 'mi', 'y', '1D466');
+        glyph(over, 'mo', null, '2015');
+      }
+    },
+    {
+      source: '\\underline{x}', expected: 'x̲',
+      build({ top, group, glyph }) {
+        const under = group(top, 'munder', '\\underline{x}');
+        glyph(under, 'mi', 'x', '1D465');
+        glyph(under, 'mo', null, '2015');
+      }
+    },
+    {
+      source: '\\overbrace{x+y}^{n}', expected: 'overbrace(x + y)ⁿ',
+      build({ top, group, glyph }) {
+        const outer = group(top, 'mover', '\\overbrace{x+y}^{n}');
+        const atom = group(outer, 'TeXAtom', '\\overbrace{x+y}');
+        const style = group(atom, 'mstyle', null);
+        const inner = group(style, 'mover', null);
+        const body = group(inner, 'mrow', 'x+y');
+        glyph(body, 'mi', 'x', '1D465');
+        glyph(body, 'mo', '+', '2B');
+        glyph(body, 'mi', 'y', '1D466');
+        glyph(inner, 'mo', null, '23DE');
+        const upper = group(outer, 'TeXAtom', '{n}');
+        glyph(upper, 'mi', 'n', '1D45B');
+      }
+    },
+    {
+      source: '\\underbrace{x+y}_{n}', expected: 'underbrace(x + y)ₙ',
+      build({ top, group, glyph }) {
+        const outer = group(top, 'munder', '\\underbrace{x+y}_{n}');
+        const atom = group(outer, 'TeXAtom', '\\underbrace{x+y}');
+        const style = group(atom, 'mstyle', null);
+        const inner = group(style, 'munder', null);
+        const body = group(inner, 'mrow', 'x+y');
+        glyph(body, 'mi', 'x', '1D465');
+        glyph(body, 'mo', '+', '2B');
+        glyph(body, 'mi', 'y', '1D466');
+        glyph(inner, 'mo', null, '23DF');
+        const lower = group(outer, 'TeXAtom', '{n}');
+        glyph(lower, 'mi', 'n', '1D45B');
+      }
+    },
+    {
+      source: '\\text{漢字}', expected: '漢字',
+      build({ top, group, nativeText }) {
+        nativeText(group(top, 'mtext', '\\text{漢字}'), '漢字');
+      }
+    },
+    {
+      source: '\\text{👩‍💻}', expected: '👩‍💻',
+      build({ top, group, glyph, nativeText }) {
+        const text = group(top, 'mtext', '\\text{👩‍💻}');
+        nativeText(text, '👩');
+        glyph(text, '', null, '200D', { emptyPath: true });
+        nativeText(text, '💻');
+      }
+    }
+  ];
+  for (const testCase of cases) {
+    const fixture = mathJaxV4SnapshotFixture(testCase.source, testCase.build);
+    const payload = mathJaxV4Payload(fixture);
+    assert.ok(payload, testCase.source);
+    assert.equal(payload.text, 'Before ' + testCase.expected + ' after', testCase.source);
+  }
+});
+
+test('MathJax SVG agreement preserves authored punctuation order and rejects stale interleaving', () => {
+  const valid = [
+    ['f(x)', ['66', '28', '78', '29']],
+    ['1.2', ['31', '2E', '32']],
+    ['|x|', ['7C', '78', '7C']],
+    ['x/y', ['78', '2F', '79']],
+    ['a*(b+c)', ['61', '2217', '28', '62', '2B', '63', '29']]
+  ];
+  for (const [source, codes] of valid) {
+    const fixture = mathJaxSvgFixture({
+      source,
+      structure: 'mrow',
+      glyphs: codes.map((code) => ({ code, node: /[0-9]/u.test(String.fromCodePoint(parseInt(code, 16))) ? 'mn' : 'mo' }))
+    });
+    assert.ok(mathJaxV4Payload(fixture), source);
+  }
+
+  const stale = [
+    ['f(x)', ['66', '5B', '78', '5D']],
+    ['1.2', ['31', '32']],
+    ['|x|', ['78']],
+    ['x/y', ['78', '2C', '79']],
+    ['a*(b+c)', ['28', '61', '2217', '62', '29', '2B', '63']],
+    ['\\clubsuit', ['2660']]
+  ];
+  for (const [source, codes] of stale) {
+    const fixture = mathJaxSvgFixture({
+      source,
+      structure: 'mrow',
+      glyphs: codes.map((code) => ({ code, node: 'mo' }))
+    });
+    assert.equal(mathJaxV4Payload(fixture), null, source + ' beside stale SVG');
+  }
+});
+
+test('MathJax SVG exact topology rejects stale binomial grouping and table cell boundaries', () => {
+  const binomial = (stale) => mathJaxV4SnapshotFixture(String.raw`\binom{(n)}{k}`,
+    ({ top, group, glyph }) => {
+      const row = group(top, 'mrow', String.raw`\binom{(n)}{k}`);
+      glyph(row, 'mo', String.raw`\bigl (`, '28');
+      const stack = group(row, 'mfrac', null);
+      if (stale) {
+        glyph(stack, 'mi', 'n', '1D45B');
+        const lower = group(stack, 'mrow', '(k)');
+        glyph(lower, 'mo', '(', '28');
+        glyph(lower, 'mi', 'k', '1D458');
+        glyph(lower, 'mo', ')', '29');
+      } else {
+        const upper = group(stack, 'mrow', '(n)');
+        glyph(upper, 'mo', '(', '28');
+        glyph(upper, 'mi', 'n', '1D45B');
+        glyph(upper, 'mo', ')', '29');
+        glyph(stack, 'mi', 'k', '1D458');
+      }
+      glyph(row, 'mo', String.raw`\bigr )`, '29');
+    });
+  assert.equal(mathJaxV4Payload(binomial(false)).text, 'Before C((n), k) after');
+  assert.equal(mathJaxV4Payload(binomial(true)), null,
+    'the same balanced parentheses cannot move from one binomial operand to the other');
+
+  const matrix = (source, cells) => mathJaxV4SnapshotFixture(source, ({ top, group, glyph }) => {
+    const row = group(top, 'mrow', source);
+    glyph(row, 'mo', '(', '28');
+    const table = group(row, 'mtable', null);
+    for (const sourceRow of cells) {
+      const renderedRow = group(table, 'mtr', null);
+      for (const tokens of sourceRow) {
+        const cell = group(renderedRow, 'mtd', null);
+        for (const token of tokens) glyph(cell, token.node, token.text, token.code);
+      }
+    }
+    glyph(row, 'mo', ')', '29');
+  });
+  const groupedSource = String.raw`\begin{pmatrix}(a+b)&c\\d&e\end{pmatrix}`;
+  const token = (text, code, node = 'mi') => ({ text, code, node });
+  const grouped = [
+    [[token('(', '28', 'mo'), token('a', '61'), token('+', '2B', 'mo'), token('b', '62'),
+      token(')', '29', 'mo')], [token('c', '63')]],
+    [[token('d', '64')], [token('e', '65')]]
+  ];
+  assert.equal(mathJaxV4Payload(matrix(groupedSource, grouped)).text,
+    'Before [(a + b), c; d, e] after');
+  const movedGrouping = [
+    [[token('a', '61'), token('+', '2B', 'mo'), token('(', '28', 'mo'), token('b', '62'),
+      token(')', '29', 'mo')], [token('c', '63')]],
+    [[token('d', '64')], [token('e', '65')]]
+  ];
+  assert.equal(mathJaxV4Payload(matrix(groupedSource, movedGrouping)), null,
+    'balanced grouping cannot move between matching table anchors');
+
+  const boundarySource = String.raw`\begin{pmatrix}a&bc\\d&e\end{pmatrix}`;
+  const movedBoundary = [
+    [[token('a', '61'), token('b', '62')], [token('c', '63')]],
+    [[token('d', '64')], [token('e', '65')]]
+  ];
+  assert.equal(mathJaxV4Payload(matrix(boundarySource, movedBoundary)), null,
+    'the same row-major glyph string cannot cross an mtd boundary');
+
+  const repeatedSource = String.raw`\begin{pmatrix}x&y\\x&y\end{pmatrix}`;
+  const changedRows = [
+    [[token('x', '78')], [token('y', '79')], [token('x', '78')]],
+    [[token('y', '79')]]
+  ];
+  assert.equal(mathJaxV4Payload(matrix(repeatedSource, changedRows)), null,
+    'repeated identifiers cannot conceal changed row and cell topology');
+});
+
+test('MathJax SVG authenticates every multiscript slot from geometry', () => {
+  const fixture = (positions, source = String.raw`\prescript{14}{6}{C}`) =>
+    mathJaxV4SnapshotFixture(source, ({ top, group, glyph }) => {
+      const scripts = group(top, 'mmultiscripts', source);
+      const scriptedNumber = (value, codes, transform) => {
+        const wrapper = group(scripts, '', null);
+        wrapper.setAttribute('transform', transform);
+        for (const code of codes) glyph(wrapper, 'mn', value, code);
+      };
+      scriptedNumber('14', ['31', '34'], positions.upper);
+      scriptedNumber('6', ['36'], positions.lower);
+      const base = glyph(scripts, 'mi', 'C', '43');
+      base.setAttribute('transform', positions.base);
+    });
+  const validPositions = {
+    upper: 'translate(0,100)',
+    lower: 'translate(0,-100)',
+    base: 'translate(100,0)'
+  };
+  assert.equal(mathJaxV4Payload(fixture(validPositions)).text, 'Before ¹⁴₆C after');
+  assert.equal(mathJaxV4Payload(fixture({
+    ...validPositions,
+    upper: 'translate(0,-100)',
+    lower: 'translate(0,100)'
+  })), null, 'upper and lower slots cannot swap');
+  assert.equal(mathJaxV4Payload(fixture({
+    ...validPositions,
+    upper: 'translate(200,100)'
+  })), null, 'pre- and post-script slots cannot swap');
+  assert.equal(mathJaxV4Payload(fixture({
+    upper: 'translate(100,0)',
+    lower: 'translate(0,-100)',
+    base: 'translate(0,100)'
+  })), null, 'base and script roles cannot swap while DOM text order stays unchanged');
+  assert.equal(mathJaxV4Payload(fixture({
+    ...validPositions,
+    upper: 'scale(.707)'
+  })), null, 'ambiguous geometry fails closed');
+});
+
+test('MathJax SVG combined scripts use visual offsets, never DOM-order guesses', () => {
+  const fixtureFor = (stale) => mathJaxV4SnapshotFixture('x_i^2', ({ top, group, glyph }) => {
+    const scripts = group(top, 'msubsup', 'x_i^2');
+    glyph(scripts, 'mi', 'x', '1D465');
+    const paintedUpper = glyph(scripts, stale ? 'mi' : 'mn', stale ? 'i' : '2', stale ? '1D456' : '32');
+    paintedUpper.setAttribute('transform', 'translate(10,100) scale(0.707)');
+    const paintedLower = glyph(scripts, stale ? 'mn' : 'mi', stale ? '2' : 'i', stale ? '32' : '1D456');
+    paintedLower.setAttribute('transform', 'translate(10,-100) scale(0.707)');
+  });
+  assert.equal(mathJaxV4Payload(fixtureFor(false)).text, 'Before xᵢ² after');
+  assert.equal(mathJaxV4Payload(fixtureFor(true)), null);
+
+  const noOffsets = mathJaxSvgFixture({
+    source: 'x_i^2', structure: 'msubsup',
+    glyphs: [{ code: '78' }, { code: '32' }, { code: '69' }]
+  });
+  assert.equal(mathJaxV4Payload(noOffsets), null, 'ambiguous combined-script paint order fails closed');
+});
+
+test('MathJax SVG requires every painted line and every glyph source to be visible and drawable', () => {
+  for (const style of [
+    'display:none', 'visibility:hidden', 'opacity:0', 'clip-path:circle(0)',
+    'mask-image:linear-gradient(transparent,transparent)', 'filter:opacity(0)'
+  ]) {
+    const fixture = mathJaxSvgFixture({ mutate({ svg }) { svg.setAttribute('style', style); } });
+    assert.equal(mathJaxV4Payload(fixture), null, 'direct SVG ' + style);
+  }
+  for (const style of ['opacity:0', 'display:none', 'clip-path:circle(0)', 'filter:opacity(0)']) {
+    const fixture = mathJaxSvgFixture();
+    fixture.target.setAttribute('style', style);
+    assert.equal(mathJaxV4Payload(fixture), null, 'ancestor ' + style);
+  }
+  const hiddenGlyph = mathJaxSvgFixture({
+    mutate({ top }) { top.firstElementChild.firstElementChild.setAttribute('style', 'opacity:0'); }
+  });
+  assert.equal(mathJaxV4Payload(hiddenGlyph), null, 'a hidden glyph cannot authenticate metadata');
+
+  const emptyPath = mathJaxSvgFixture({ glyphs: [{ code: '78', d: null }, { code: '32' }] });
+  assert.equal(mathJaxV4Payload(emptyPath), null, 'empty path');
+  const missingUse = mathJaxSvgFixture({
+    source: 'x', structure: 'mrow', glyphs: [{ code: '78', tag: 'use', href: '#MJX-missing' }]
+  });
+  assert.equal(mathJaxV4Payload(missingUse), null, 'missing local use target');
+  const emptyUse = mathJaxSvgFixture({
+    source: 'x', structure: 'mrow', glyphs: [{ code: '78', tag: 'use', href: '#MJX-empty' }],
+    mutate({ documentObject, svg }) {
+      const defs = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'defs');
+      const path = documentObject.createElementNS(EMBEDDED_TEST_SVG_NAMESPACE, 'path');
+      path.id = 'MJX-empty';
+      path.setAttribute('d', '');
+      defs.appendChild(path);
+      svg.prepend(defs);
+    }
+  });
+  assert.equal(mathJaxV4Payload(emptyUse), null, 'empty non-joining use target');
+});
+
+test('MathJax SVG top-source work is aggregate-bounded and cloned line metadata is parsed once', () => {
+  const repeatedSource = 'x'.repeat(41);
+  const fixture = mathJaxSvgFixture({ source: repeatedSource, structure: 'mrow', glyphs: [{ code: '78' }] });
+  const firstSvg = fixture.svg;
+  for (let index = 0; index < 40; index += 1) {
+    const clone = firstSvg.cloneNode(true);
+    for (const path of clone.querySelectorAll('defs path')) path.id += '-line-' + index;
+    for (const use of clone.querySelectorAll('use')) {
+      use.setAttribute('href', use.getAttribute('href') + '-line-' + index);
+    }
+    giveEmbeddedTestRect(clone, 44, 24);
+    fixture.root.appendChild(clone);
+  }
+  assert.equal(mathJaxV4Payload(fixture).text, 'Before ' + repeatedSource + ' after',
+    'line glyph segments concatenate while one exact source is reused');
+
+  const oversized = mathJaxSvgFixture({ source: 'x', structure: 'mrow', glyphs: [{ code: '78' }] });
+  const top = oversized.top;
+  top.setAttribute('data-latex', ' '.repeat(50001) + 'x');
+  assert.equal(mathJaxV4Payload(oversized), null, 'raw metadata is bounded before trimming');
+});
+
+test('calculator aggregates bind an immediate identifier call as their complete body', () => {
+  assert.equal(cleanCopy.latexToCalculator('\\lim_{x\\to0}f(x)'), 'limit(f(x),x->0)');
+  assert.equal(cleanCopy.latexToCalculator('\\sum_{i=1}^n f(i)'), 'sum(f(i),i=1,n)');
+  assert.equal(cleanCopy.latexToCalculator('\\int_0^1 f(x)\\,dx'), 'integral(f(x),x,0,1)');
+  assert.equal(cleanCopy.latexToFaithful('\\underbrace{x}_{n}'), 'underbrace(x)ₙ');
+  assert.equal(cleanCopy.latexToFaithful('\\overbrace{x+y}^{n}'), 'overbrace(x + y)ⁿ');
+  assert.equal(cleanCopy.latexToCalculator('\\overbrace{x+y}^{n}'), 'x+y');
+  assert.equal(cleanCopy.latexToCalculator('\\underbrace{x+y}_{n}'), 'x+y');
+  assert.equal(cleanCopy.latexToCalculator('\\overbrace{x+y}z'), '(x+y)*z');
+  assert.equal(cleanCopy.latexToCalculator('2\\underbrace{x+y}'), '2*(x+y)');
+});
+
+test('nested bounded CSS operators stay readable and LaTeX-safe while calculator mode fails closed', () => {
+  const cases = [
+    ['lim', 'x→0', 'f(x)', '(lim_(x → 0) f(x))/y', '$\\frac{\\lim_{x\\to 0} f(x)}{y}$'],
+    ['∑', 'i=1', 'aᵢ', '(∑ᵢ₌₁ aᵢ)/y', '$\\frac{\\sum_{i=1} a_{i}}{y}$'],
+    ['∏', 'i=1', 'aᵢ', '(∏ᵢ₌₁ aᵢ)/y', '$\\frac{\\prod_{i=1} a_{i}}{y}$'],
+    ['∫', 'a', 'f(x)dx', '(∫ₐ f(x)dx)/y', '$\\frac{\\int_{a} f(x)dx}{y}$']
+  ];
+  const build = (operator, bound, body) => {
+    const instance = dom([
+      '<div id="target"><section id="outer" style="display:inline-table">',
+      '<div data-test-stack-row="outer-top" style="display:table-row;border-bottom:1px solid currentColor">',
+      '<span id="bounded" style="display:inline-table">',
+      '<i data-test-stack-row="bounded-top" style="display:table-row">', operator, '</i>',
+      '<b data-test-stack-row="bounded-bottom" style="display:table-row">', bound, '</b>',
+      '</span> ', body, '</div>',
+      '<div data-test-stack-row="outer-bottom" style="display:table-row">y</div>',
+      '</section></div>'
+    ].join(''), 'https://bounded-operators.invalid/random/path');
+    giveNamedCssStackGeometry(instance.window.document, 'outer', {
+      left: 10, top: 10, width: 100, rowHeight: 30, gap: 2
+    });
+    giveNamedCssStackGeometry(instance.window.document, 'bounded', {
+      left: 15, top: 12, width: 35, rowHeight: 10, gap: 1
+    });
+    return instance;
+  };
+
+  for (const [operator, bound, body, faithful, latex] of cases) {
+    const instance = build(operator, bound, body);
+    const documentObject = instance.window.document;
+    const target = documentObject.querySelector('#target');
+    const outer = documentObject.querySelector('#outer');
+    assert.equal(cleanCopy.getCopyPayload(
+      documentObject,
+      selectContents(instance.window, outer),
+      { outputMode: 'faithful' },
+      instance.window,
+      target
+    ).text, faithful, operator + ' faithful');
+    assert.equal(cleanCopy.getCopyPayload(
+      documentObject,
+      selectContents(instance.window, outer),
+      { outputMode: 'latex' },
+      instance.window,
+      target
+    ).text, latex, operator + ' LaTeX');
+    assert.equal(cleanCopy.getCopyPayload(
+      documentObject,
+      selectContents(instance.window, outer),
+      { outputMode: 'calculator' },
+      instance.window,
+      target
+    ), null, operator + ' calculator mode must not invent aggregate scope');
+  }
+
+  const prose = build('lim', 'x→0', 'Current plan');
+  const proseTarget = prose.window.document.querySelector('#target');
+  for (const outputMode of ['faithful', 'calculator', 'latex']) {
+    assert.equal(cleanCopy.getCopyPayload(
+      prose.window.document,
+      selectContents(prose.window, prose.window.document.querySelector('#outer')),
+      { outputMode },
+      prose.window,
+      proseTarget
+    ), null, 'a nested operator cannot authenticate an ordinary prose tail in ' + outputMode);
+  }
+});
+
+test('source-less role=math ancestors yield to authenticated visual stacks but source-bearing roots remain strict', () => {
+  const build = (numerator, denominator, attributes = '') => {
+    const instance = dom([
+      '<div id="target" role="math" ', attributes, '>Equation: ',
+      '<span id="fraction" style="display:inline-table">',
+      '<i data-test-stack-row="role-top" style="display:table-row;border-bottom:1px solid currentColor">',
+      numerator, '</i>',
+      '<b data-test-stack-row="role-bottom" style="display:table-row">', denominator, '</b>',
+      '</span></div>'
+    ].join(''), 'https://source-less-role.invalid/lesson');
+    giveNamedCssStackGeometry(instance.window.document, 'role', { width: 40, rowHeight: 10, gap: 1 });
+    return instance;
+  };
+  for (const [numerator, denominator] of [['x', 'y'], ['1', '2']]) {
+    const instance = build(numerator, denominator);
+    const documentObject = instance.window.document;
+    const target = documentObject.querySelector('#target');
+    const expectedFormula = numerator + '/' + denominator;
+    const expectedModes = {
+      faithful: expectedFormula,
+      calculator: expectedFormula,
+      latex: '$\\frac{' + numerator + '}{' + denominator + '}$'
+    };
+    for (const [outputMode, formulaText] of Object.entries(expectedModes)) {
+      const exact = cleanCopy.getCopyPayload(
+        documentObject,
+        selectContents(instance.window, documentObject.querySelector('#fraction')),
+        { outputMode },
+        instance.window,
+        target
+      );
+      assert.equal(exact && exact.text, formulaText, numerator + '/' + denominator + ' exact ' + outputMode);
+      const whole = cleanCopy.getCopyPayload(
+        documentObject,
+        selectContents(instance.window, target),
+        { outputMode },
+        instance.window,
+        target
+      );
+      assert.equal(whole && whole.text, 'Equation: ' + formulaText,
+        numerator + '/' + denominator + ' whole ' + outputMode);
+    }
+  }
+
+  const sourceBearing = build('x', 'y', 'data-latex="z"');
+  const sourceDocument = sourceBearing.window.document;
+  const sourceTarget = sourceDocument.querySelector('#target');
+  for (const selected of [sourceDocument.querySelector('#fraction'), sourceTarget]) {
+    for (const outputMode of ['faithful', 'calculator', 'latex']) {
+      assert.equal(cleanCopy.getCopyPayload(
+        sourceDocument,
+        selectContents(sourceBearing.window, selected),
+        { outputMode },
+        sourceBearing.window,
+        sourceTarget
+      ), null, 'independent source disagreement remains strict in ' + outputMode);
+    }
+  }
+});
+
+test('CSS-stack descriptor discovery is locally memoized for deeply nested formulas', () => {
+  const depth = 24;
+  let formula = 'x';
+  let expected = 'x';
+  for (let level = 1; level <= depth; level += 1) {
+    formula = [
+      '<span id="memo-', level, '" style="display:inline-table">',
+      '<i data-test-stack-row="memo-', level, '-top" style="display:table-row;border-bottom:1px solid currentColor">',
+      formula, '</i>',
+      '<b data-test-stack-row="memo-', level, '-bottom" style="display:table-row">y</b>',
+      '</span>'
+    ].join('');
+    expected = level === 1 ? expected + '/y' : '(' + expected + ')/y';
+  }
+  const instance = dom('<div id="target">' + formula + '</div>', 'https://memoized.invalid/formula');
+  const documentObject = instance.window.document;
+  for (let level = 1; level <= depth; level += 1) {
+    giveNamedCssStackGeometry(documentObject, 'memo-' + level, { width: 100 });
+  }
+  const originalGetComputedStyle = instance.window.getComputedStyle.bind(instance.window);
+  let computedStyleReads = 0;
+  instance.window.getComputedStyle = (...args) => {
+    computedStyleReads += 1;
+    return originalGetComputedStyle(...args);
+  };
+  const payload = cleanCopy.getCopyPayload(
+    documentObject,
+    selectContents(instance.window, documentObject.querySelector('#memo-' + depth)),
+    { outputMode: 'faithful' },
+    instance.window,
+    documentObject.querySelector('#target')
+  );
+  assert.equal(payload && payload.text, expected);
+  assert.ok(computedStyleReads < 5000,
+    'descriptor memoization should keep style reads bounded; observed ' + computedStyleReads);
+});
+
+test('CSS-stack recognition bounds a high-fanout direct child list before collection materialization', () => {
+  const instance = dom([
+    '<div id="target"><span id="stack" style="display:inline-table">',
+    '<i data-test-stack-row="wide-css-top" style="display:table-row;border-bottom:1px solid currentColor">x</i>',
+    '<b data-test-stack-row="wide-css-bottom" style="display:table-row">y</b>',
+    '</span></div>'
+  ].join(''), 'https://wide-layout.invalid/');
+  const documentObject = instance.window.document;
+  const stack = documentObject.querySelector('#stack');
+  const fragment = documentObject.createDocumentFragment();
+  for (let index = 0; index < 300; index += 1) fragment.appendChild(documentObject.createElement('wbr'));
+  stack.appendChild(fragment);
+  giveNamedCssStackGeometry(documentObject, 'wide-css');
+  Object.defineProperty(stack, 'children', {
+    configurable: true,
+    get() {
+      throw new Error('the full untrusted HTMLCollection was materialized');
+    }
+  });
+  let payload;
+  assert.doesNotThrow(() => {
+    payload = cleanCopy.getCopyPayload(
+      documentObject,
+      selectContents(instance.window, stack),
+      { outputMode: 'faithful' },
+      instance.window,
+      documentObject.querySelector('#target')
+    );
+  });
+  assert.ok(!payload || payload.reason !== 'css-stacked-math');
+});
+
+test('block vertical-align is ordinary layout, while inline vertical-align remains a mathematical script', () => {
+  const block = dom(
+    '<div id="target">Label<div style="display:block;vertical-align:super">Value</div></div>',
+    'https://ordinary-layout.invalid/'
+  );
+  const blockTarget = block.window.document.querySelector('#target');
+  for (const outputMode of ['faithful', 'calculator', 'latex']) {
+    const payload = cleanCopy.getCopyPayload(
+      block.window.document,
+      selectContents(block.window, blockTarget),
+      { outputMode },
+      block.window,
+      blockTarget
+    );
+    assert.equal(payload && payload.text, 'Label\nValue', 'block layout in ' + outputMode);
+    assert.doesNotMatch(payload.text, /[_^]/u);
+  }
+
+  const inline = dom(
+    '<p id="target">x<span style="display:inline;vertical-align:super">2</span></p>',
+    'https://inline-script.invalid/'
+  );
+  const inlineTarget = inline.window.document.querySelector('#target');
+  for (const [outputMode, text] of Object.entries({
+    faithful: 'x²', calculator: 'x^(2)', latex: 'x^{2}'
+  })) {
+    assert.equal(cleanCopy.getCopyPayload(
+      inline.window.document,
+      selectContents(inline.window, inlineTarget),
+      { outputMode },
+      inline.window,
+      inlineTarget
+    ).text, text, 'inline script in ' + outputMode);
+  }
+});
+
+test('ambiguous UI stacks and visible numeric punctuation fail closed without explicit math semantics', () => {
+  const build = (top, bottom, attributes = '') => {
+    const instance = dom([
+      '<div id="target"><span id="fraction" ', attributes, ' style="display:inline-table">',
+      '<i data-test-stack-row="ui-top" style="display:table-row;border-bottom:1px solid currentColor">',
+      top, '</i>',
+      '<b data-test-stack-row="ui-bottom" style="display:table-row">', bottom, '</b>',
+      '</span></div>'
+    ].join(''), 'https://generic-ui.invalid/unrelated');
+    giveNamedCssStackGeometry(instance.window.document, 'ui', { width: 50 });
+    return instance;
+  };
+  const ambiguousPairs = [
+    ['OK', 'NO'], ['US', 'EU'], ['AM', 'PM'], ['A1', 'B2'],
+    ['Q1', 'Q2'], ['v1', 'v2'], ['kg', 'lb'],
+    ['10%', '20%'], ['#1', '#2'], ['$1', '$2']
+  ];
+  for (const [top, bottom] of ambiguousPairs) {
+    const instance = build(top, bottom);
+    const documentObject = instance.window.document;
+    const target = documentObject.querySelector('#target');
+    for (const outputMode of ['faithful', 'calculator', 'latex']) {
+      assert.equal(cleanCopy.getCopyPayload(
+        documentObject,
+        selectContents(instance.window, documentObject.querySelector('#fraction')),
+        { outputMode },
+        instance.window,
+        target
+      ), null, top + '/' + bottom + ' in ' + outputMode);
+    }
+  }
+
+  const variables = build('a', 'b');
+  const variablesTarget = variables.window.document.querySelector('#target');
+  assert.equal(cleanCopy.getCopyPayload(
+    variables.window.document,
+    selectContents(variables.window, variables.window.document.querySelector('#fraction')),
+    { outputMode: 'faithful' },
+    variables.window,
+    variablesTarget
+  ).text, 'a/b', 'ordinary single-glyph variables remain supported');
+
+  const explicitPercentage = build('10%', '20%', 'role="math"');
+  const percentageDocument = explicitPercentage.window.document;
+  const percentageTarget = percentageDocument.querySelector('#target');
+  for (const [outputMode, text] of Object.entries({
+    faithful: '10%/20%',
+    calculator: '(10/100)/(20/100)',
+    latex: '$\\frac{10\\%}{20\\%}$'
+  })) {
+    assert.equal(cleanCopy.getCopyPayload(
+      percentageDocument,
+      selectContents(explicitPercentage.window, percentageDocument.querySelector('#fraction')),
+      { outputMode },
+      explicitPercentage.window,
+      percentageTarget
+    ).text, text, 'explicit percentage fraction in ' + outputMode);
+  }
+});
+
+test('bounded CSS operators bind Unicode letter-script tails in every output mode', () => {
+  const cases = [
+    ['∑', 'i=1', 'aᵢ', '∑ᵢ₌₁ aᵢ', 'sum(a_(i),i=1)', '$\\sum_{i=1}{a_{i}}$'],
+    ['∏', 'i=1', 'aᵢ', '∏ᵢ₌₁ aᵢ', 'product(a_(i),i=1)', '$\\prod_{i=1}{a_{i}}$'],
+    ['∫', 'a', 'aⁿ', '∫ₐ aⁿ', 'integral(a^(n),a)', '$\\int_{a}{a^{n}}$']
+  ];
+  for (const [operator, bound, body, faithful, calculator, latex] of cases) {
+    const instance = dom([
+      '<div id="target"><span id="operator" style="display:inline-table">',
+      '<i data-test-stack-row="unicode-top" style="display:table-row">', operator, '</i>',
+      '<b data-test-stack-row="unicode-bottom" style="display:table-row">', bound, '</b>',
+      '</span> ', body, '</div>'
+    ].join(''), 'https://unicode-script.invalid/equation');
+    const documentObject = instance.window.document;
+    const target = documentObject.querySelector('#target');
+    giveNamedCssStackGeometry(documentObject, 'unicode', { width: 35, rowHeight: 10, gap: 1 });
+    for (const [outputMode, text] of Object.entries({ faithful, calculator, latex })) {
+      assert.equal(cleanCopy.getCopyPayload(
+        documentObject,
+        selectContents(instance.window, target),
+        { outputMode },
+        instance.window,
+        target
+      ).text, text, operator + ' Unicode tail in ' + outputMode);
+    }
+  }
+});
+
+test('numeric semantics survive deep neutral wrapper chains without authenticating an unmarked stack', () => {
+  const semanticAttributes = [
+    'role="math"',
+    'aria-roledescription="formula"',
+    'data-math="true"'
+  ];
+  const build = (attributes = '') => {
+    let contents = [
+      '<i data-test-stack-row="deep-top" style="display:table-row;border-bottom:1px solid currentColor">1</i>',
+      '<b data-test-stack-row="deep-bottom" style="display:table-row">2</b>'
+    ].join('');
+    for (let depth = 11; depth >= 0; depth -= 1) {
+      contents = '<span id="deep-' + depth + '" style="display:' +
+        (depth % 2 ? 'contents' : 'inline-block') + '">' + contents + '</span>';
+    }
+    const instance = dom(
+      '<div id="target"><section id="outer" ' + attributes +
+      ' style="display:inline-block">' + contents + '</section></div>',
+      'https://deep-semantics.invalid/random'
+    );
+    giveNamedCssStackGeometry(instance.window.document, 'deep', { width: 45 });
+    return instance;
+  };
+
+  for (const attributes of semanticAttributes) {
+    const instance = build(attributes);
+    const documentObject = instance.window.document;
+    const target = documentObject.querySelector('#target');
+    for (const selected of [documentObject.querySelector('#outer'), documentObject.querySelector('#deep-11')]) {
+      for (const [outputMode, text] of Object.entries({
+        faithful: '1/2', calculator: '1/2', latex: '$\\frac{1}{2}$'
+      })) {
+        assert.equal(cleanCopy.getCopyPayload(
+          documentObject,
+          selectContents(instance.window, selected),
+          { outputMode },
+          instance.window,
+          target
+        ).text, text, attributes + ' ' + selected.id + ' ' + outputMode);
+      }
+    }
+  }
+
+  const unmarked = build();
+  const unmarkedDocument = unmarked.window.document;
+  const unmarkedTarget = unmarkedDocument.querySelector('#target');
+  for (const selected of [unmarkedDocument.querySelector('#outer'), unmarkedDocument.querySelector('#deep-11')]) {
+    for (const outputMode of ['faithful', 'calculator', 'latex']) {
+      assert.equal(cleanCopy.getCopyPayload(
+        unmarkedDocument,
+        selectContents(unmarked.window, selected),
+        { outputMode },
+        unmarked.window,
+        unmarkedTarget
+      ), null, 'unmarked numeric stack ' + selected.id + ' ' + outputMode);
+    }
+  }
 });

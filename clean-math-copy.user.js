@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.5.0
+// @version      2.6.0
 // @description  Accurately copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Atharv Joshi
 // @license      MIT
@@ -75,6 +75,7 @@
   const MAX_PAGE_RELAY_OPERATIONS = 64;
   const MAX_MATHML_NODES = 5000;
   const MAX_MATHML_DEPTH = 128;
+  const MAX_EMBEDDED_ENTITY_NAMES = 1024;
   const MAX_RICH_SELECTION_NODES = 1000;
   const MAX_RICH_SELECTION_DEPTH = 128;
   const MAX_ORDINARY_SELECTION_MARKUP_LENGTH = 1024 * 1024;
@@ -124,6 +125,8 @@
   const POSITIONED_OVER_BUDGET = Symbol('clean-math-copy-positioned-over-budget');
   const PDF_VIEWER_INCOMPLETE = Symbol('clean-math-copy-pdf-viewer-incomplete');
   const CSS_STACK_MATH_UNREPRESENTABLE = Symbol('clean-math-copy-css-stack-unrepresentable');
+  const CSS_STACK_MATH_DOM_UNREPRESENTABLE = Symbol('clean-math-copy-css-stack-dom-unrepresentable');
+  const CSS_STACK_MATH_DESCRIPTOR_PENDING = Symbol('clean-math-copy-css-stack-descriptor-pending');
   const CSS_STACK_VISIBLE_SPECIALS = Object.freeze({
     '\\': '\ue200', '{': '\ue201', '}': '\ue202', '$': '\ue203',
     '#': '\ue204', '%': '\ue205', '&': '\ue206'
@@ -135,6 +138,18 @@
   const TRUSTED_RICH_STYLE_NODES = new WeakSet();
   const TRUSTED_PDF_VIEWER_ROOTS = new WeakSet();
   const TRUSTED_TEXT_PLACEHOLDERS = new WeakMap();
+  // Embedded image/SVG metadata is mutable page state. Cache descriptors only
+  // during one synchronous copy projection so changing an image, an
+  // accessibility representation, or its metadata can never reuse a result
+  // from an earlier copy and selected pages do not accumulate large cloned
+  // MathML trees for their entire lifetime.
+  let ACTIVE_COPY_EMBEDDED_MATH_CACHE = null;
+  // SVG renderer descriptors are deliberately cached only for the lifetime
+  // of one copy projection. A single selection can ask about the same root
+  // through discovery, source extraction, and serialization; rescanning a
+  // several-thousand-node SVG each time is wasteful. Persistent caching would
+  // be unsafe because pages can mutate renderer metadata or visibility.
+  let ACTIVE_COPY_MATHJAX_SVG_CACHE = null;
   const MATH_ROOT_SELECTOR = [
     '.katex-display',
     '.katex',
@@ -157,6 +172,8 @@
     '[data-latex]',
     '[data-tex]',
     '[data-math-source]',
+    '[data-mathml]',
+    '[data-equation-content]',
     '[data-automation-id*="equation" i]',
     '[aria-roledescription="equation" i]',
     'latex-js',
@@ -330,13 +347,30 @@
     'applet', 'audio', 'canvas', 'embed', 'frame', 'frameset', 'iframe', 'link',
     'meta', 'noscript', 'object', 'script', 'style', 'svg', 'template', 'video'
   ]);
-  const CSS_STACK_MATH_INLINE_TAGS = new Set([
-    'b', 'cite', 'dfn', 'em', 'i', 'mark', 'small', 'span',
-    'strong', 'sub', 'sup', 'u', 'var'
+  const CSS_STACK_MATH_UNSAFE_TAGS = new Set([
+    'a', 'area', 'audio', 'bdo', 'br', 'button', 'canvas', 'code', 'datalist',
+    'details', 'embed', 'fieldset', 'form', 'frame', 'frameset', 'hr', 'iframe',
+    'img', 'input', 'label', 'legend', 'li', 'link', 'map', 'math', 'menu',
+    'meta', 'meter', 'noscript', 'object', 'ol', 'optgroup', 'option', 'picture',
+    'pre', 'progress', 'rp', 'rt', 'ruby', 'script', 'select', 'slot', 'source',
+    'style', 'summary', 'svg', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead',
+    'template', 'textarea', 'track', 'tr', 'ul', 'video', 'caption', 'col', 'colgroup'
+  ]);
+  const CSS_STACK_MATH_LAYOUT_DISPLAYS = new Set([
+    'block', 'contents', 'flex', 'flow-root', 'grid', 'inline', 'inline-block',
+    'inline-flex', 'inline-grid', 'inline-table', 'table', 'table-cell',
+    'table-row', 'table-row-group'
   ]);
   const CSS_STACK_MATH_OPERATORS = new Map([
-    ['lim', '\\lim']
+    // Keep this table aligned with operators the faithful, calculator, and
+    // LaTeX serializers can all bind to a following body without changing
+    // meaning. Unsupported visual stacks fail native rather than producing a
+    // plausible-looking but false expression.
+    ['lim', '\\lim'], ['∑', '\\sum'], ['∏', '\\prod'], ['∫', '\\int']
   ]);
+  const CSS_STACK_MATH_OPERATOR_COMMANDS = new Set(
+    Array.from(CSS_STACK_MATH_OPERATORS.values(), (value) => String(value).replace(/^\\/u, ''))
+  );
   const ORDINARY_SEMANTIC_TABLE_DISPLAYS = Object.freeze({
     table: new Set(['table', 'inline-table']),
     thead: new Set(['table-header-group']),
@@ -608,7 +642,8 @@
 
   function faithfulFractionPart(input, denominator, options) {
     const text = resolveFaithfulScopes(String(input == null ? '' : input)).trim();
-    if (!text || faithfulFullyFenced(text) || faithfulExpressionIsAtomic(text)) return text;
+    const boundedAggregate = /^(?:lim(?![\p{L}\p{N}])|[∑∏∫])/u.test(text);
+    if (!text || faithfulFullyFenced(text) || (faithfulExpressionIsAtomic(text) && !boundedAggregate)) return text;
     const readableText = text.replace(new RegExp(FAITHFUL_FUNCTION_APPLY, 'g'), ' ');
     let depth = 0;
     const settings = options || {};
@@ -643,6 +678,13 @@
     }
     if (!settings.atomic &&
         /^(?:sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|sinh|cosh|tanh|log|ln|lg|exp|det|dim|gcd|hom|ker|Pr)\S*\s+\S/iu.test(readableText)) {
+      needsGrouping = true;
+    }
+    // In a linear numerator or denominator, a bounded aggregate followed by
+    // its body needs visible grouping. Without the fraction bar,
+    // `lim_(x → 0) f(x)/y` can be read as the limit of `f(x)/y` rather than
+    // `(lim_(x → 0) f(x))/y`.
+    if (!settings.atomic && /^(?:lim(?![\p{L}\p{N}])|[∑∏∫])/u.test(readableText)) {
       needsGrouping = true;
     }
     if (/[\p{L}\p{M}](?:[\u2080-\u209cᵢⱼᵦ-ᵪ]+|_[\p{L}\p{N}\p{M}])\s*[\p{Ll}\p{Lu}]/u.test(text)) {
@@ -767,6 +809,9 @@
 
   function faithfulAccent(command, input, combiningMark) {
     const value = resolveFaithfulScopes(String(input == null ? '' : input)).trim();
+    if (command === 'overbrace' || command === 'underbrace') {
+      return faithfulMarkedScope(command + '(' + value + ')', false);
+    }
     if (faithfulAtomicRadicand(value)) return value + combiningMark;
     const names = {
       bar: 'overline', overline: 'overline', overbrace: 'overbrace',
@@ -919,9 +964,11 @@
   }
 
   function convertLatexEnvironment(environment, body, options) {
-    const env = environment.replace(/\*$/, '').toLowerCase();
+    const rawEnv = environment.replace(/\*$/, '');
+    const env = rawEnv.toLowerCase();
     const calculatorMode = Boolean(options && options.calculatorMode);
     const agreementMode = Boolean(options && options.agreementMode);
+    const svgAgreementTopology = options && options.svgAgreementTopology;
     const convertCell = options && typeof options.convertCell === 'function'
       ? options.convertCell
       : latexToUnicode;
@@ -936,6 +983,24 @@
     const rows = splitLatexTopLevel(content, 'row').map((row) =>
       splitLatexTopLevel(row, 'cell').map((cell) => convertCell(cell.trim()))
     );
+    if (agreementMode && svgAgreementTopology) {
+      svgAgreementTopology.tables.push({
+        rows: rows.map((cells) => cells.map((cell) => mathJaxSvgAgreementKey(cell)))
+      });
+    }
+    if (agreementMode) {
+      const painted = rows.flat().join('');
+      if (env === 'cases' || env === 'dcases') return '{' + painted;
+      if (/matrix|array|smallmatrix/.test(env)) {
+        const fences = new Map([
+          ['pmatrix', ['(', ')']], ['bmatrix', ['[', ']']],
+          ['Bmatrix', ['{', '}']], ['vmatrix', ['|', '|']],
+          ['Vmatrix', ['‖', '‖']]
+        ]).get(rawEnv) || ['', ''];
+        return fences[0] + painted + fences[1];
+      }
+      return painted;
+    }
     if (env === 'cases') {
       if (calculatorMode) {
         return 'piecewise(' + rows.map((cells) => '[' + cells.join(',') + ']').join(',') + ')';
@@ -965,6 +1030,7 @@
       this.calculatorMode = Boolean(options && options.calculatorMode);
       this.faithfulMode = Boolean(options && options.faithfulMode);
       this.agreementMode = Boolean(options && options.agreementMode);
+      this.svgAgreementTopology = options && options.svgAgreementTopology || null;
       const source = stripLatexDelimiters(input);
       this.input = (this.faithfulMode ? escapeFaithfulSentinelCollisions(source) : source)
         .replace(/(^|[^\\])%[^\n\r]*/g, '$1')
@@ -1244,6 +1310,7 @@
           calculatorMode: mode === 'calculator',
           faithfulMode: mode === 'faithful',
           agreementMode: this.agreementMode,
+          svgAgreementTopology: this.svgAgreementTopology,
           budget: this.budget
         }).parse();
         if (mode === 'faithful') return formatFaithfulMathText(parsed);
@@ -1445,7 +1512,27 @@
         scripts[marker] = this.parseArgument();
         this.skipCalculatorSpacing();
       }
-      const body = this.parseCalculatorArgumentAtom();
+      let body = this.parseCalculatorArgumentAtom();
+      // A plain identifier followed immediately by a delimited argument is
+      // one aggregate body (`lim f(x)`), not `lim f` multiplied by `(x)`.
+      // The generic argument parser intentionally consumes one atom, so bind
+      // this common function-call shape here before formatting the aggregate.
+      if (/^(?:[\p{L}\p{M}][\p{L}\p{N}\p{M}_]*|\ue100[^\ue101]+\ue101)$/u.test(body)) {
+        const checkpoint = this.position;
+        this.skipCalculatorSpacing();
+        const callArgument = this.parseCalculatorDelimitedArgument();
+        if (callArgument.matched) {
+          body += '(' + callArgument.value + ')';
+          while (this.input[this.position] === '^' || this.input[this.position] === '_') {
+            const marker = this.input[this.position];
+            this.position += 1;
+            body += marker + '(' + this.parseArgument() + ')';
+            this.skipCalculatorSpacing();
+          }
+        } else {
+          this.position = checkpoint;
+        }
+      }
       const functionNames = {
         sum: 'sum', prod: 'product', int: 'integral', iint: 'double_integral',
         iiint: 'triple_integral', oint: 'contour_integral', lim: 'limit'
@@ -1521,8 +1608,11 @@
         const upper = this.parseArgument();
         const lower = this.parseArgument();
         // `C` is useful in copied linear text but is not drawn by MathJax;
-        // omit only that synthesized label while authenticating the source.
-        return (this.agreementMode ? '(' : 'C(') + upper + ', ' + lower + ')';
+        // omit that label and the readability-only comma while authenticating
+        // the exact painted SVG token order.
+        return this.agreementMode
+          ? '(' + upper + lower + ')'
+          : 'C(' + upper + ', ' + lower + ')';
       }
       if (name === 'sqrt') {
         const index = this.parseOptionalArgument();
@@ -1633,14 +1723,29 @@
         return '';
       }
       const accents = {
-        overline: '\u0305', bar: '\u0305', overbrace: '\u0305',
-        underline: '\u0332', underbrace: '\u0332', hat: '\u0302', widehat: '\u0302',
+        overline: '\u0305', bar: '\u0305', overbrace: '\u23de',
+        underline: '\u0332', underbrace: '\u23df', hat: '\u0302', widehat: '\u0302',
         tilde: '\u0303', widetilde: '\u0303', vec: '\u20d7', overrightarrow: '\u20d7',
         overleftarrow: '\u20d6', dot: '\u0307', ddot: '\u0308', acute: '\u0301',
         grave: '\u0300', breve: '\u0306', check: '\u030c', mathring: '\u030a'
       };
       if (Object.prototype.hasOwnProperty.call(accents, name)) {
         const value = this.parseArgument();
+        if ((name === 'overbrace' || name === 'underbrace') && this.calculatorMode) {
+          const checkpoint = this.position;
+          this.skipCalculatorSpacing();
+          const annotationMarker = name === 'overbrace' ? '^' : '_';
+          if (this.input[this.position] === annotationMarker) {
+            this.position += 1;
+            this.parseArgument();
+          } else {
+            this.position = checkpoint;
+          }
+          // A brace is presentation-only in calculator mode, but its base is
+          // one atomic operand. Retain grouping so adjacent factors cannot
+          // turn overbrace{x+y}z into x+y*z.
+          return '(' + value + ')';
+        }
         return this.faithfulMode ? faithfulAccent(name, value, accents[name]) : value + accents[name];
       }
       if (name === 'overset' || name === 'stackrel') {
@@ -1680,6 +1785,7 @@
           calculatorMode: this.calculatorMode,
           faithfulMode: this.faithfulMode,
           agreementMode: this.agreementMode,
+          svgAgreementTopology: this.svgAgreementTopology,
           convertCell: (cell) => this.calculatorMode
             ? this.parseCalculatorInner(cell)
             : (this.faithfulMode ? this.parseFaithfulInner(cell) : this.parseUnicodeInner(cell))
@@ -1698,6 +1804,15 @@
         const upper = this.parseArgument();
         const lower = this.parseArgument();
         const base = this.parseArgument();
+        if (this.agreementMode && this.svgAgreementTopology) {
+          this.svgAgreementTopology.multiscripts.push({
+            base: mathJaxSvgAgreementKey(base),
+            preSub: mathJaxSvgAgreementKey(lower),
+            preSup: mathJaxSvgAgreementKey(upper),
+            postSub: '',
+            postSup: ''
+          });
+        }
         if (this.faithfulMode) {
           const upperScript = toFaithfulScript(upper, SUPERSCRIPTS, '^');
           const lowerScript = toFaithfulScript(lower, SUBSCRIPTS, '_');
@@ -1719,7 +1834,13 @@
         return name === 'boxed' ? 'boxed(' + value + ')' : value;
       }
       if (name === 'substack') {
-        return splitLatexTopLevel(this.readRawGroup(), 'row').map((row) => this.parseUnicodeInner(row)).join(', ');
+        const rows = splitLatexTopLevel(this.readRawGroup(), 'row').map((row) => this.parseUnicodeInner(row));
+        if (this.agreementMode && this.svgAgreementTopology) {
+          this.svgAgreementTopology.tables.push({
+            rows: rows.map((row) => [mathJaxSvgAgreementKey(row)])
+          });
+        }
+        return rows.join(this.agreementMode ? '' : ', ');
       }
       if (name === 'ce' || name === 'pu') return this.readRawGroup();
 
@@ -1763,11 +1884,14 @@
     }
   }
 
-  function latexToVisibleAgreement(input) {
+  function latexToVisibleAgreement(input, svgAgreementTopology) {
     try {
       const source = String(input == null ? '' : input);
       if (source.length > MAX_MATH_SOURCE_LENGTH) return '';
-      return formatMathText(new LatexParser(source, { agreementMode: true }).parse());
+      return formatMathText(new LatexParser(source, {
+        agreementMode: true,
+        svgAgreementTopology
+      }).parse());
     } catch (_error) {
       return '';
     }
@@ -1822,8 +1946,9 @@
   const CALCULATOR_FUNCTIONS = new Set([
     'C', 'abs', 'acos', 'acosh', 'arccos', 'arcsin', 'arctan', 'arg', 'asin', 'asinh',
     'atan', 'atanh', 'ceil', 'cos', 'cosh', 'cot', 'csc', 'det', 'exp', 'floor',
-    'gcd', 'integral', 'limit', 'ln', 'log', 'max', 'min', 'mod', 'norm', 'product',
-    'piecewise', 'round', 'sec', 'sign', 'sin', 'sinh', 'sqrt', 'sum', 'tan', 'tanh',
+    'erf', 'erfc', 'gcd', 'integral', 'limit', 'ln', 'log', 'max', 'min', 'mod',
+    'norm', 'product', 'piecewise', 'rank', 'round', 'sec', 'sign', 'sin', 'sinc',
+    'sinh', 'sqrt', 'sum', 'tan', 'tanh', 'tr', 'trace',
     'double_integral', 'triple_integral', 'contour_integral'
   ]);
 
@@ -2142,11 +2267,14 @@
     return stripBalancedOuterParentheses(text);
   }
 
-  function latexToCalculator(input) {
+  function latexToCalculator(input, options) {
     try {
       const source = String(input == null ? '' : input);
       if (source.length > MAX_MATH_SOURCE_LENGTH) return '';
-      return unicodeToCalculator(formatMathText(new LatexParser(source, { calculatorMode: true }).parse()));
+      return unicodeToCalculator(
+        formatMathText(new LatexParser(source, { calculatorMode: true }).parse()),
+        options
+      );
     } catch (_error) {
       return '';
     }
@@ -2266,9 +2394,13 @@
       if (!current || !current.node || current.node.nodeType !== 1) continue;
       count += 1;
       if (count > nodeLimit || current.depth > depthLimit) return false;
-      const children = elementChildren(current.node);
-      for (let index = children.length - 1; index >= 0; index -= 1) {
-        stack.push({ node: children[index], depth: current.depth + 1 });
+      // Do not materialize an untrusted element's entire child collection
+      // before applying the node limit. A single forged renderer can have an
+      // arbitrarily wide first level even though only a bounded prefix could
+      // ever be accepted.
+      for (let child = current.node.lastElementChild; child; child = child.previousElementSibling) {
+        stack.push({ node: child, depth: current.depth + 1 });
+        if (count + stack.length > nodeLimit) return false;
       }
     }
     return true;
@@ -2864,6 +2996,18 @@
       return calculatorResult(calculatorPower(base.text + '_(' + lower + ')', upper), 'operand');
     }
     if (name === 'mover' || name === 'munder' || name === 'munderover') {
+      const base = serializeMathMLCalculatorNode(children[0]);
+      const overMarker = name === 'mover' && normalizedMathToken(children[1] && children[1].textContent || '') === '⏞';
+      const underMarker = name === 'munder' && normalizedMathToken(children[1] && children[1].textContent || '') === '⏟';
+      if (overMarker || underMarker) {
+        return calculatorResult('(' + base.text + ')', 'operand', {
+          braceKind: overMarker ? 'overbrace' : 'underbrace'
+        });
+      }
+      // KaTeX represents a labelled brace as an outer mover/munder around the
+      // inner brace node. The label is presentation, not an exponent or index
+      // in an executable expression; retain the already-grouped base only.
+      if (base.braceKind) return base;
       const evaluation = calculatorEvaluationBase(children[0]);
       const lower = name === 'mover' ? '' : childText(1);
       const upper = name === 'munder' ? '' : childText(name === 'mover' ? 1 : 2);
@@ -2874,7 +3018,7 @@
       const operatorName = mathMLLargeOperatorName(children[0]);
       if (operatorName) return calculatorResult(operatorName + (lower ? '_(' + lower + ')' : '') +
         (upper ? '^(' + upper + ')' : ''), 'bounded', { operatorName, lower, upper });
-      return calculatorResult(childText(0), 'operand');
+      return calculatorResult(base.text, 'operand');
     }
     if (name === 'mfenced') {
       const open = node.getAttribute('open') == null ? '(' : node.getAttribute('open');
@@ -2900,7 +3044,8 @@
   }
 
   function mathMLToCalculator(mathElement) {
-    const text = serializeMathMLCalculatorNode(mathElement).text
+    const result = serializeMathMLCalculatorNode(mathElement);
+    const text = (result.braceKind ? stripBalancedOuterParentheses(result.text) : result.text)
       .replace(/\s*([-+=*/^<>])\s*/g, '$1')
       .replace(/\s*∝\s*/g, ' ∝ ')
       .replace(/\s+/g, ' ')
@@ -3314,7 +3459,8 @@
       'ˋ': ['grave', '\u0300'], '\u0300': ['grave', '\u0300'],
       '˘': ['breve', '\u0306'], '\u0306': ['breve', '\u0306'],
       'ˇ': ['check', '\u030c'], '\u030c': ['check', '\u030c'],
-      '˚': ['mathring', '\u030a'], '\u030a': ['mathring', '\u030a']
+      '˚': ['mathring', '\u030a'], '\u030a': ['mathring', '\u030a'],
+      '⏞': ['overbrace', '⏞']
     };
     if (!accents[value]) return null;
     return faithfulAccent(accents[value][0], base && base.text || '', accents[value][1]);
@@ -3322,6 +3468,7 @@
 
   function faithfulMathMLUnderAccent(base, lower) {
     const value = String(lower == null ? '' : lower).trim();
+    if (value === '⏟') return faithfulAccent('underbrace', base && base.text || '', '⏟');
     if (!['‾', '¯', 'ˉ', '\u0305', '\u0332'].includes(value)) return null;
     return faithfulAccent('underline', base && base.text || '', '\u0332');
   }
@@ -3452,11 +3599,24 @@
         ? faithfulMathMLUnderAccent(base, lower)
         : null;
       if (accent || underAccent) {
-        return faithfulResult(accent || underAccent, 'operand', { variableLike: base.variableLike });
+        const braceKind = upper.trim() === '⏞' ? 'overbrace' : (lower.trim() === '⏟' ? 'underbrace' : '');
+        return faithfulResult(accent || underAccent, 'operand', {
+          variableLike: base.variableLike,
+          ...(braceKind ? { braceKind } : null)
+        });
       }
       const large = Boolean(mathMLLargeOperatorName(children[0]) || /^(?:∑|∏|∐|∫|∬|∭|∮|lim)$/u.test(base.text));
       if (!large) {
         const annotationKind = ['relation', 'operator'].includes(base.kind) ? base.kind : 'operand';
+        if (base.braceKind) {
+          return faithfulResult(
+            faithfulScriptBaseText(base) +
+              (lower ? toFaithfulScript(lower, SUBSCRIPTS, '_') : '') +
+              (upper ? toFaithfulScript(upper, SUPERSCRIPTS, '^') : ''),
+            annotationKind,
+            { braceKind: base.braceKind, variableLike: base.variableLike }
+          );
+        }
         if (name === 'mover') return faithfulResult('overset(' + upper + ', ' + base.text + ')', annotationKind);
         if (name === 'munder') return faithfulResult('underset(' + lower + ', ' + base.text + ')', annotationKind);
         return faithfulResult(
@@ -4025,8 +4185,11 @@
   function katexAccentMarkerDetail(marker) {
     if (marker.classList.contains('overline')) return 'overline';
     if (marker.classList.contains('underline')) return 'underline';
-    if (marker.classList.contains('mover') && marker.querySelector('.brace-left')) return 'overbrace';
-    if (marker.classList.contains('munder') && marker.querySelector('.brace-left')) return 'underbrace';
+    const ownsBrace = Array.from(marker.querySelectorAll('.brace-left')).some((brace) =>
+      brace.closest('.mover,.munder') === marker
+    );
+    if (marker.classList.contains('mover') && ownsBrace) return 'overbrace';
+    if (marker.classList.contains('munder') && ownsBrace) return 'underbrace';
     if (!marker.classList.contains('accent')) return '';
     const ownedByMarker = (node) => node && node.closest && node.closest('.accent') === marker;
     const body = Array.from(marker.querySelectorAll('.accent-body')).find(ownedByMarker) || null;
@@ -4156,11 +4319,17 @@
     }
     for (const marker of Array.from(visualBranch.querySelectorAll('.mover'))) {
       const detail = katexAccentMarkerDetail(marker);
-      if (!detail || !add('mover', marker, marker, detail)) return null;
+      const labelledBrace = !detail && Array.from(marker.querySelectorAll('.mover,.munder')).some((nested) =>
+        nested !== marker && /^(?:overbrace|underbrace)$/u.test(katexAccentMarkerDetail(nested))
+      );
+      if ((!detail && !labelledBrace) || !add('mover', marker, marker, detail)) return null;
     }
     for (const marker of Array.from(visualBranch.querySelectorAll('.munder'))) {
       const detail = katexAccentMarkerDetail(marker);
-      if (!detail || !add('munder', marker, marker, detail)) return null;
+      const labelledBrace = !detail && Array.from(marker.querySelectorAll('.mover,.munder')).some((nested) =>
+        nested !== marker && /^(?:overbrace|underbrace)$/u.test(katexAccentMarkerDetail(nested))
+      );
+      if ((!detail && !labelledBrace) || !add('munder', marker, marker, detail)) return null;
     }
     for (const marker of Array.from(visualBranch.querySelectorAll('.op-limits'))) {
       if (!add(katexOverUnderMarkerKind(marker), marker, marker)) return null;
@@ -5180,6 +5349,16 @@
     return Boolean(container && candidate && (container === candidate || (container.contains && container.contains(candidate)) || (candidate.contains && candidate.contains(container))));
   }
 
+  function composedParentElement(node) {
+    if (!node) return null;
+    if (node.assignedSlot && node.assignedSlot.nodeType === 1) return node.assignedSlot;
+    if (node.parentElement) return node.parentElement;
+    const parent = node.parentNode;
+    return parent && parent.nodeType === 11 && parent.host && parent.host.nodeType === 1
+      ? parent.host
+      : null;
+  }
+
   function getMathJaxSource(root, pageWindow) {
     const mathJax = pageWindow && pageWindow.MathJax;
     if (!mathJax) return '';
@@ -5230,12 +5409,912 @@
       : userscriptGlobal;
   }
 
+  function rendererInternalSourceAttributeNode(element) {
+    if (!element || !element.matches || !element.matches(
+      '[data-latex],[data-tex],[data-math-source],[data-mathml],[data-equation-content]'
+    )) return false;
+    const owner = element.closest && element.closest(
+      'mjx-container,.katex,.katex-display,.MathJax,.MathJax_CHTML,.MathJax_SVG'
+    );
+    return Boolean(owner && owner !== element);
+  }
+
+  function embeddedMathOwnerShape(root) {
+    if (!root || root.nodeType !== 1 || !root.getAttribute ||
+        !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return null;
+    const boundedAttribute = (name, maximumLength) => {
+      const value = String(root.getAttribute(name) || '');
+      return value.length <= maximumLength ? value.trim() : null;
+    };
+    const rawMathML = boundedAttribute('data-mathml', MAX_CLIPBOARD_MARKUP_LENGTH);
+    if (rawMathML == null) return { root, invalid: true };
+    const sourceAttributes = ['data-equation-content', 'data-latex', 'data-tex', 'data-math-source'];
+    const rawSources = [];
+    for (const name of sourceAttributes) {
+      const source = boundedAttribute(name, MAX_MATH_SOURCE_LENGTH);
+      if (source == null) return { root, invalid: true };
+      if (source) rawSources.push(source);
+    }
+    if (!rawMathML && !rawSources.length) return null;
+    const tag = (root.localName || '').toLowerCase();
+    let surface = null;
+    if (tag === 'img' || tag === 'svg') surface = root;
+    else {
+      const surfaces = Array.from(root.querySelectorAll ? root.querySelectorAll('img,svg') : []);
+      if (surfaces.length !== 1 || cleanOrdinaryCharacters(root.textContent || '').trim()) return null;
+      surface = surfaces[0];
+      const identity = [
+        typeof root.className === 'string' ? root.className : '',
+        root.id || '',
+        root.getAttribute('role') || '',
+        root.getAttribute('aria-roledescription') || '',
+        tag.includes('-') ? tag : ''
+      ].join(' ');
+      if (!/(?:^|[\s_-])(?:math|latex|formula|equation)(?:$|[\s_-])/iu.test(identity)) return null;
+    }
+    const nestedOwners = Array.from(root.querySelectorAll ? root.querySelectorAll(
+      '[data-mathml],[data-equation-content],[data-latex],[data-tex],[data-math-source]'
+    ) : []).filter((candidate) => candidate !== root);
+    if (nestedOwners.length) return null;
+    return { root, surface, rawMathML, rawSources };
+  }
+
+  function embeddedMathSurfaceIsVisible(shape) {
+    const root = shape && shape.root;
+    const surface = shape && shape.surface;
+    const documentObject = root && root.ownerDocument;
+    const view = documentObject && documentObject.defaultView;
+    if (!root || !surface || !root.isConnected || !view || typeof view.getComputedStyle !== 'function') return false;
+    let reachedRoot = false;
+    for (let element = surface; element; element = element.parentElement) {
+      if (isVisuallyHiddenElement(element)) return false;
+      let computed;
+      try { computed = view.getComputedStyle(element); } catch (_error) { return false; }
+      const display = String(computed && computed.display || '').trim().toLowerCase();
+      const visibility = String(computed && computed.visibility || '').trim().toLowerCase();
+      const opacity = Number.parseFloat(String(computed && computed.opacity || '1'));
+      if (display === 'none' || /^(?:hidden|collapse)$/u.test(visibility) ||
+          (Number.isFinite(opacity) && opacity <= 0) ||
+          computedStyleHasUnsafeVisibleLayout(computed, false)) return false;
+      if (element === root) {
+        reachedRoot = true;
+        break;
+      }
+    }
+    if (!reachedRoot) return false;
+    const visualRect = cssStackMathPositiveRect(surface);
+    if (!visualRect) return false;
+    // Visibility and opacity inherit through layout in ways that a child's
+    // computed style does not always expose (notably opacity:0 on a parent).
+    // Audit every ancestor, but do not reject harmless transformed or fixed
+    // page chrome when the image itself still has a positive visible box.
+    for (let ancestor = composedParentElement(root); ancestor; ancestor = composedParentElement(ancestor)) {
+      let computed;
+      try { computed = view.getComputedStyle(ancestor); } catch (_error) { return false; }
+      const value = (name, property) => String(
+        computed && (computed[name] || computed.getPropertyValue && computed.getPropertyValue(property || name)) || ''
+      ).trim().toLowerCase();
+      if (value('display') === 'none' || value('contentVisibility', 'content-visibility') === 'hidden' ||
+          /^(?:hidden|collapse)$/u.test(value('visibility'))) return false;
+      const opacity = Number.parseFloat(value('opacity') || '1');
+      if (Number.isFinite(opacity) && opacity <= 0) return false;
+      const clip = value('clip');
+      const clipPath = value('clipPath', 'clip-path') || value('webkitClipPath', '-webkit-clip-path');
+      const mask = value('maskImage', 'mask-image') || value('webkitMaskImage', '-webkit-mask-image');
+      const filter = value('filter');
+      if ((clip && clip !== 'auto') || (clipPath && clipPath !== 'none') || (mask && mask !== 'none') ||
+          /(?:^|\s)opacity\(\s*0(?:[.]0*)?\s*\)/u.test(filter)) return false;
+    }
+    return cssStackMathClippingAncestorsExpose(surface, visualRect, view);
+  }
+
+  function normalizedEmbeddedTex(value) {
+    const source = stripLatexDelimiters(String(value == null ? '' : value).trim());
+    if (!source || source.length > MAX_MATH_SOURCE_LENGTH ||
+        /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(source)) return '';
+    const structure = latexStructuralSignature(source, false, null);
+    if (!structure || structure.invalid) return '';
+    const faithful = latexToFaithful(source);
+    return faithful && !faithful.includes('\\') ? source : '';
+  }
+
+  function embeddedTexSourcesAgree(values) {
+    const sources = values.map(normalizedEmbeddedTex).filter(Boolean);
+    if (!sources.length || sources.length !== values.length) return '';
+    const firstFaithful = faithfulAgreementKey(latexToFaithful(sources[0]));
+    const firstCalculator = faithfulAgreementKey(latexToCalculator(sources[0], {
+      preserveLongIdentifiers: true
+    }));
+    if (!firstFaithful || !firstCalculator) return '';
+    for (const source of sources.slice(1)) {
+      if (faithfulAgreementKey(latexToFaithful(source)) !== firstFaithful ||
+          faithfulAgreementKey(latexToCalculator(source, { preserveLongIdentifiers: true })) !== firstCalculator) {
+        return '';
+      }
+    }
+    return sources[0];
+  }
+
+  function embeddedRepresentationAgreementKey(value, latexInput = false) {
+    let source = cleanClipboardText(String(value == null ? '' : value)).trim();
+    if (!source || source.length > MAX_MATH_SOURCE_LENGTH) return '';
+    const label = source.match(/^\s*(latex|tex|math|mathematics|equation|formula)\s*:\s*([\s\S]+)$/iu);
+    const explicitlyLatex = Boolean(label && /^(?:latex|tex)$/iu.test(label[1]));
+    if (label) source = label[2].trim();
+    if (!source) return '';
+    if (latexInput || explicitlyLatex) {
+      source = normalizedEmbeddedTex(source);
+      if (!source) return '';
+    }
+    const faithful = latexToFaithful(source);
+    if (!faithful || faithful.includes('\\')) return '';
+    const calculator = unicodeToCalculator(faithful, { preserveLongIdentifiers: true });
+    return calculator ? faithfulAgreementKey(calculator) : '';
+  }
+
+  function decodeEmbeddedMathML(value) {
+    let source = String(value == null ? '' : value).trim();
+    if (!source || source.length > MAX_CLIPBOARD_MARKUP_LENGTH ||
+        /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(source) ||
+        /<!\s*(?:doctype|entity)|<\?|\?>/iu.test(source)) return '';
+    if (/^«\s*math(?:\s|»)/iu.test(source) && /«\s*\/\s*math\s*»\s*$/iu.test(source)) {
+      source = source.replace(/[«»§¨`]/gu, (character) => ({
+        '«': '<', '»': '>', '§': '&', '¨': '"', '`': "'"
+      })[character]);
+    }
+    return /^\s*<\s*math(?:\s|>)/iu.test(source) && /<\s*\/\s*math\s*>\s*$/iu.test(source)
+      ? source
+      : '';
+  }
+
+  function decodeEmbeddedXmlNamedEntities(source, documentObject) {
+    const standard = new Set(['amp', 'lt', 'gt', 'quot', 'apos']);
+    const input = String(source || '');
+    if (/&[A-Za-z][A-Za-z0-9]{64}/u.test(input)) return '';
+    const names = new Map();
+    for (const match of input.matchAll(/&([A-Za-z][A-Za-z0-9]{0,63});/gu)) {
+      if (standard.has(match[1]) || names.has(match[0])) continue;
+      names.set(match[0], names.size);
+      if (names.size > MAX_EMBEDDED_ENTITY_NAMES) return '';
+    }
+    if (!names.size) return input;
+    const entries = Array.from(names.entries());
+    const markup = '<!doctype html><html><body>' + entries.map(([entity], index) =>
+      '<span data-cmc-entity="' + index + '">' + entity + '</span>').join('') + '</body></html>';
+    const cache = new Map();
+    try {
+      // Entity names are strictly alphanumeric and length-bounded above, so
+      // they cannot inject markup. Decode all unique names in one inert parse:
+      // creating one document per token would turn a bounded MathML attribute
+      // into thousands of heavyweight parser invocations.
+      const parser = new documentObject.defaultView.DOMParser();
+      const parsed = parser.parseFromString(markup, 'text/html');
+      const decodedNodes = Array.from(parsed && parsed.body && parsed.body.children || []);
+      if (decodedNodes.length !== entries.length) return '';
+      for (let index = 0; index < entries.length; index += 1) {
+        const [entity] = entries[index];
+        const node = decodedNodes[index];
+        if (!node || node.getAttribute('data-cmc-entity') !== String(index)) return '';
+        const value = String(node.textContent || '');
+        // Unknown names can be partially consumed as a shorter HTML entity
+        // (for example &notSomething;). Reject any undecoded/partial suffix.
+        if (!value || value === entity || /[A-Za-z0-9]+;$/u.test(value) || /&[A-Za-z]/u.test(value)) return '';
+        // Numeric references are safe in either XML text or attribute context,
+        // including decoded entities whose visible value contains `<` or `&`.
+        cache.set(entity, Array.from(value, (character) =>
+          '&#x' + character.codePointAt(0).toString(16) + ';').join(''));
+      }
+    } catch (_error) {
+      return '';
+    }
+    return input.replace(/&([A-Za-z][A-Za-z0-9]{0,63});/gu, (entity, name) =>
+      standard.has(name) ? entity : (cache.get(entity) || entity));
+  }
+
+  function parsedEmbeddedMathML(raw, documentObject) {
+    let source = decodeEmbeddedMathML(raw);
+    const view = documentObject && documentObject.defaultView;
+    if (!source || !view || typeof view.DOMParser !== 'function') return null;
+    source = decodeEmbeddedXmlNamedEntities(source, documentObject);
+    if (!source) return null;
+    const openingEnd = source.indexOf('>');
+    const opening = openingEnd >= 0 ? source.slice(0, openingEnd + 1) : '';
+    // Legacy image-formula integrations often store a standalone <math>
+    // fragment without an explicit default namespace. It is unambiguously
+    // MathML in this dedicated attribute, so supply the standard namespace
+    // before XML parsing; an explicit wrong/empty namespace is still rejected.
+    if (opening && !/\bxmlns\s*=/iu.test(opening)) {
+      source = source.replace(/^(\s*<\s*math)(?=\s|>)/iu,
+        '$1 xmlns="' + MATHML_NAMESPACE + '"');
+    }
+    try {
+      const parsed = new view.DOMParser().parseFromString(source, 'application/xml');
+      if (!parsed || parsed.querySelector('parsererror') ||
+          (parsed.documentElement.localName || '').toLowerCase() !== 'math' ||
+          parsed.documentElement.namespaceURI !== MATHML_NAMESPACE) return null;
+      const imported = documentObject.importNode(parsed.documentElement, true);
+      const safe = sanitizedMathMLClone(imported);
+      return safe && embeddedMathMLStructureIsComplete(safe) && mathMLToFaithful(safe).trim()
+        ? safe
+        : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function embeddedMathMLStructureIsComplete(math) {
+    if (!math || !domTreeWithinBudget(math, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return false;
+    const fixedArity = new Map([
+      ['math', [1, Infinity]], ['semantics', [1, 1]],
+      ['mfrac', [2, 2]], ['mroot', [2, 2]],
+      ['msub', [2, 2]], ['msup', [2, 2]], ['msubsup', [3, 3]],
+      ['munder', [2, 2]], ['mover', [2, 2]], ['munderover', [3, 3]],
+      ['mprescripts', [0, 0]], ['none', [0, 0]], ['mspace', [0, 0]],
+      ['mi', [0, 0]], ['mn', [0, 0]], ['mo', [0, 0]], ['mtext', [0, 0]], ['ms', [0, 0]]
+    ]);
+    const meaningfulChildren = new Set([
+      'mfrac', 'mroot', 'msub', 'msup', 'msubsup', 'munder', 'mover', 'munderover'
+    ]);
+    const stack = [math];
+    let visited = 0;
+    while (stack.length) {
+      const node = stack.pop();
+      if (!node || node.nodeType !== 1) return false;
+      visited += 1;
+      if (visited > MAX_MATHML_NODES) return false;
+      const name = (node.localName || '').toLowerCase();
+      const children = elementChildren(node);
+      const arity = fixedArity.get(name);
+      if (arity && (children.length < arity[0] || children.length > arity[1])) return false;
+      if (meaningfulChildren.has(name) && children.some((child) =>
+        !mathMLToFaithful(child).trim())) return false;
+      if (name === 'mmultiscripts') {
+        if (!children.length || children.filter((child) =>
+          (child.localName || '').toLowerCase() === 'mprescripts').length > 1) return false;
+        const marker = children.findIndex((child) =>
+          (child.localName || '').toLowerCase() === 'mprescripts');
+        const postCount = (marker < 0 ? children.length : marker) - 1;
+        const preCount = marker < 0 ? 0 : children.length - marker - 1;
+        if (postCount < 0 || postCount % 2 || preCount % 2) return false;
+      }
+      for (let index = children.length - 1; index >= 0; index -= 1) stack.push(children[index]);
+    }
+    return true;
+  }
+
+  function embeddedMathDescriptor(root) {
+    const shape = embeddedMathOwnerShape(root);
+    if (!shape || shape.invalid) return null;
+    const boundedAccessibleAttribute = (element, name) => {
+      const value = String(element && element.getAttribute && element.getAttribute(name) || '');
+      return value.length <= MAX_MATH_SOURCE_LENGTH ? value.trim() : null;
+    };
+    const accessibleEntries = [];
+    const addAccessible = (element, name, owner) => {
+      const value = boundedAccessibleAttribute(element, name);
+      if (value == null) return false;
+      if (value) accessibleEntries.push({ owner, name, value });
+      return true;
+    };
+    if (!addAccessible(shape.surface, 'alt', 'surface') ||
+        !addAccessible(shape.surface, 'aria-label', 'surface') ||
+        (shape.root !== shape.surface && !addAccessible(shape.root, 'aria-label', 'root'))) return null;
+    const accessibleValues = accessibleEntries.map((entry) => entry.value);
+    // Length-delimited JSON prevents an authored control character from
+    // aliasing two different metadata layouts in the per-copy cache. Keep
+    // every accessibility field distinct: precedence (`alt || aria-label`)
+    // would hide a contradictory representation from the agreement audit.
+    const signature = JSON.stringify([
+      shape.rawMathML,
+      shape.rawSources,
+      accessibleEntries.map((entry) => [entry.owner, entry.name, entry.value])
+    ]);
+    const cache = ACTIVE_COPY_EMBEDDED_MATH_CACHE;
+    const cached = cache && cache.get(root);
+    if (cached && cached.signature === signature && cached.surface === shape.surface) {
+      return embeddedMathSurfaceIsVisible(shape) ? cached.descriptor : null;
+    }
+    const sources = shape.rawSources.slice();
+    const accessibleTexSources = accessibleValues.map((value) =>
+      value.match(/^\s*(?:latex|tex)\s*:\s*([\s\S]+)$/iu)
+    ).filter(Boolean);
+    for (const match of accessibleTexSources) sources.push(match[1]);
+    const source = sources.length ? embeddedTexSourcesAgree(sources) : '';
+    if (sources.length && !source) {
+      if (cache) cache.set(root, { signature, surface: shape.surface, descriptor: null });
+      return null;
+    }
+    const math = shape.rawMathML ? parsedEmbeddedMathML(shape.rawMathML, root.ownerDocument) : null;
+    if (shape.rawMathML && !math) {
+      if (cache) cache.set(root, { signature, surface: shape.surface, descriptor: null });
+      return null;
+    }
+    if (!math && source && !accessibleTexSources.length) {
+      // Pixels alone cannot authenticate source metadata. Source-only image
+      // renderers need an independently exposed TeX/LaTeX accessibility
+      // representation that agrees with every source attribute; otherwise a
+      // stale data-latex on an unrelated image could replace what was seen.
+      if (cache) cache.set(root, {
+        signature, surface: shape.surface, descriptor: null
+      });
+      return null;
+    }
+    const agreementKeys = [];
+    if (math) agreementKeys.push(embeddedRepresentationAgreementKey(mathMLToFaithful(math)));
+    if (source) agreementKeys.push(embeddedRepresentationAgreementKey(source, true));
+    for (const value of accessibleValues) {
+      agreementKeys.push(embeddedRepresentationAgreementKey(value));
+    }
+    if (agreementKeys.some((key) => !key) || new Set(agreementKeys).size > 1) {
+      if (cache) cache.set(root, { signature, surface: shape.surface, descriptor: null });
+      return null;
+    }
+    if (!math && !source) return null;
+    const descriptor = { ...shape, math, source };
+    if (cache) cache.set(root, { signature, surface: shape.surface, descriptor });
+    return embeddedMathSurfaceIsVisible(shape) ? descriptor : null;
+  }
+
+  const MATHJAX_SVG_STRUCTURAL_NAMES = new Set([
+    'msup', 'msub', 'msubsup', 'mmultiscripts', 'mfrac', 'msqrt', 'mroot',
+    'mover', 'munder', 'munderover', 'mtable'
+  ]);
+
+  function mathJaxSvgStructuralSignature(entries) {
+    const signature = emptyMathJaxChtmlStructure();
+    const aggregate = {
+      remainingCharacters: MAX_LATEX_PARSE_STEPS * 4,
+      complete: new Map(),
+      topLevel: new Map(),
+      exhausted: false
+    };
+    const structuralSelector = Array.from(
+      MATHJAX_SVG_STRUCTURAL_NAMES,
+      (name) => '[data-mml-node="' + name + '"]'
+    ).join(',');
+    const associatedSourceFor = (candidate, top) => {
+      let sourceOwner = candidate;
+      while (sourceOwner && sourceOwner !== top &&
+             !(sourceOwner.getAttribute && sourceOwner.getAttribute('data-latex'))) {
+        sourceOwner = sourceOwner.parentElement;
+      }
+      return sourceOwner && sourceOwner.getAttribute && sourceOwner.getAttribute('data-latex');
+    };
+    for (const entry of entries) {
+      const node = entry.node;
+      const top = entry.top;
+      const name = String(node.getAttribute('data-mml-node') || '').toLowerCase();
+      if (name === 'msup') signature.sup += 1;
+      else if (name === 'msub') signature.sub += 1;
+      else if (name === 'msubsup') { signature.sup += 1; signature.sub += 1; }
+      else if (name === 'mmultiscripts') {
+        const ownSource = node.getAttribute('data-latex');
+        const scripts = ownSource ? latexStructuralSignature(ownSource, true, aggregate) : null;
+        if (!scripts || scripts.invalid || (!scripts.sup && !scripts.sub)) signature.invalid = true;
+        else { signature.sup += scripts.sup; signature.sub += scripts.sub; }
+      } else if (name === 'mfrac') signature.fraction += 1;
+      else if (name === 'msqrt') signature.squareRoot += 1;
+      else if (name === 'mroot') signature.indexedRoot += 1;
+      else if (name === 'mtable') signature.table += 1;
+      else {
+        const structuralAncestor = node.parentElement && node.parentElement.closest(structuralSelector);
+        const associatedSource = associatedSourceFor(node, top);
+        const ownSource = node.getAttribute('data-latex');
+        const wrapper = associatedSource
+          ? latexStructuralSignature(associatedSource, true, aggregate)
+          : null;
+        const ownScripts = ownSource
+          ? latexStructuralSignature(ownSource, true, aggregate)
+          : null;
+        if (structuralAncestor &&
+            String(structuralAncestor.getAttribute('data-mml-node') || '').toLowerCase() === name && wrapper) {
+          const ancestorSource = associatedSourceFor(structuralAncestor, top);
+          const ancestorWrapper = ancestorSource
+            ? latexStructuralSignature(ancestorSource, true, aggregate)
+            : null;
+          const direction = name === 'munder' ? 'under' : 'over';
+          const sameWrapperKind = ancestorWrapper && !ancestorWrapper.invalid &&
+            wrapper[direction + 'Kinds'].length === 1 &&
+            ancestorWrapper[direction + 'Kinds'].length === 1 &&
+            wrapper[direction + 'Kinds'][0] === ancestorWrapper[direction + 'Kinds'][0];
+          if (sameWrapperKind && (ancestorWrapper.sup || ancestorWrapper.sub)) continue;
+        }
+        if (name === 'munder' && structuralAncestor &&
+            String(structuralAncestor.getAttribute('data-mml-node') || '').toLowerCase() === 'munderover' &&
+            (!wrapper || !wrapper.under)) continue;
+        if (!wrapper || wrapper.invalid) {
+          signature.invalid = true;
+        } else if (name === 'mover') {
+          if (wrapper.over === 1 && !wrapper.under) signature.over += 1;
+          else if (!(ownScripts && !ownScripts.invalid && (ownScripts.sup || ownScripts.sub) &&
+                     ((ownScripts.sup && !ownScripts.sub && !wrapper.over && !wrapper.under) ||
+                      (wrapper.under === 1 && !wrapper.over)))) signature.invalid = true;
+        } else if (name === 'munder') {
+          if (wrapper.under === 1 && !wrapper.over) signature.under += 1;
+          else if (!(ownScripts && !ownScripts.invalid && (ownScripts.sup || ownScripts.sub) &&
+                     ((wrapper.over === 1 && !wrapper.under) ||
+                      (ownScripts.sub && !ownScripts.sup && !wrapper.over && !wrapper.under)))) {
+            signature.invalid = true;
+          }
+        } else if (name === 'munderover') {
+          if (wrapper.over || wrapper.under) {
+            signature.over += wrapper.over;
+            signature.under += wrapper.under;
+          } else if (!ownSource) signature.invalid = true;
+        }
+        if (ownScripts) {
+          if (ownScripts.invalid) signature.invalid = true;
+          else { signature.sup += ownScripts.sup; signature.sub += ownScripts.sub; }
+        }
+      }
+      if (aggregate.exhausted || Object.values(signature).some((value) =>
+        typeof value === 'number' && value > MAX_MATHML_NODES)) signature.invalid = true;
+      if (signature.invalid) break;
+    }
+    return signature;
+  }
+
+  function mathJaxSvgPathDataIsDrawable(value, allowEmpty) {
+    const data = String(value == null ? '' : value).trim();
+    if (!data) return Boolean(allowEmpty);
+    if (data.length > MAX_CLIPBOARD_MARKUP_LENGTH ||
+        !/^[\sMmZzLlHhVvCcSsQqTtAaEe0-9.,+\-]+$/u.test(data) ||
+        !/[Mm]/u.test(data) || !/[0-9]/u.test(data) ||
+        /(?:nan|infinity)/iu.test(data)) return false;
+    return true;
+  }
+
+  function mathJaxSvgUseTarget(use, svg, character) {
+    const href = String(use.getAttribute('href') || use.getAttribute('xlink:href') || '');
+    if (!/^#[A-Za-z][A-Za-z0-9_.:-]{0,255}$/u.test(href)) return null;
+    const documentObject = svg && svg.ownerDocument;
+    const target = documentObject && documentObject.getElementById(href.slice(1));
+    if (!target || (target.localName || '').toLowerCase() !== 'path' ||
+        target.ownerDocument !== documentObject || !target.closest('defs')) return null;
+    const targetSvg = target.closest('svg');
+    if (targetSvg !== svg) {
+      const identity = String(targetSvg && (targetSvg.id || targetSvg.getAttribute('class')) || '');
+      const siblingLineCache = targetSvg && targetSvg.parentElement === svg.parentElement &&
+        svg.parentElement && svg.parentElement.matches &&
+        svg.parentElement.matches('mjx-container.MathJax[jax="SVG" i]') &&
+        targetSvg.parentElement === svg.parentElement;
+      if (!siblingLineCache && !/^MJX-SVG-global-cache$/u.test(identity)) return null;
+    }
+    const invisibleJoiner = /^\p{Cf}$/u.test(character);
+    return mathJaxSvgPathDataIsDrawable(target.getAttribute('d'), invisibleJoiner) ? target : null;
+  }
+
+  function mathJaxSvgSemanticGlyph(character, glyph, top) {
+    const point = character.codePointAt(0);
+    const structural = glyph.closest && glyph.closest(
+      '[data-mml-node="mover"],[data-mml-node="munder"],[data-mml-node="munderover"]'
+    );
+    let source = '';
+    for (let owner = structural; owner && owner !== top.parentElement; owner = owner.parentElement) {
+      source = String(owner.getAttribute && owner.getAttribute('data-latex') || '');
+      if (source) break;
+    }
+    if (point === 0x2015) {
+      if (/\\underline\b/u.test(source)) return '\u0332';
+      if (/\\overline\b/u.test(source)) return '\u0305';
+    }
+    if (point === 0x23de) return '\u23de';
+    if (point === 0x23df) return '\u23df';
+    const accentGlyphs = new Map([
+      [0x2c6, '\u0302'], [0x2dc, '\u0303'], [0xaf, '\u0305'], [0x2c9, '\u0305'],
+      [0x2d9, '\u0307'], [0xa8, '\u0308'], [0xb4, '\u0301'], [0x2ca, '\u0301'],
+      [0x2cb, '\u0300'], [0x2d8, '\u0306'], [0x2c7, '\u030c'], [0x2da, '\u030a'],
+      [0x2cd, '\u0332']
+    ]);
+    return accentGlyphs.get(point) || mathVariantBaseCharacter(character);
+  }
+
+  function mathJaxSvgAgreementKey(input) {
+    let value = String(input == null ? '' : input);
+    if (!value || value.length > MAX_SELECTION_KEY_LENGTH) return '';
+    const withoutLinearScriptWrappers = (source) => {
+      let result = '';
+      for (let index = 0; index < source.length; index += 1) {
+        if ((source[index] === '_' || source[index] === '^') && source[index + 1] === '(') {
+          let depth = 1;
+          let cursor = index + 2;
+          for (; cursor < source.length && depth > 0; cursor += 1) {
+            if (source[cursor] === '(') depth += 1;
+            else if (source[cursor] === ')') depth -= 1;
+          }
+          if (depth === 0) {
+            result += withoutLinearScriptWrappers(source.slice(index + 2, cursor - 1));
+            index = cursor - 1;
+            continue;
+          }
+        }
+        result += source[index];
+      }
+      return result;
+    };
+    value = withoutLinearScriptWrappers(value);
+    try { value = value.normalize('NFKD'); } catch (_error) { /* retain source */ }
+    const canonical = new Map([
+      ['-', '\u2212'], ['\u2010', '\u2212'], ['\u2011', '\u2212'],
+      ['\u2012', '\u2212'], ['\u2013', '\u2212'], ['\u2212', '\u2212'],
+      ['\u2217', '*'],
+      ['\u2223', '|'], ['\u2758', '|'], ['\u2016', '\u2016'], ['\u2225', '\u2016']
+    ]);
+    let result = '';
+    for (const rawCharacter of value) {
+      if (/^\s$/u.test(rawCharacter)) continue;
+      const character = mathVariantBaseCharacter(rawCharacter);
+      result += canonical.get(character) || character;
+      if (result.length > MAX_SELECTION_KEY_LENGTH) return '';
+    }
+    return result;
+  }
+
+  function mathJaxSvgVisibleProjection(top, svg) {
+    const documentObject = top && top.ownerDocument;
+    const view = documentObject && documentObject.defaultView;
+    if (!documentObject || !view || typeof view.getComputedStyle !== 'function') return null;
+    const state = {
+      glyphs: 0,
+      drawable: 0,
+      characters: 0,
+      invalid: false,
+      tables: [],
+      multiscripts: []
+    };
+    const visibilityCache = new WeakMap();
+    const visuallySafe = (element) => {
+      if (!element || element.nodeType !== 1) return false;
+      if (visibilityCache.has(element)) return visibilityCache.get(element);
+      let safe = true;
+      try {
+        const computed = view.getComputedStyle(element);
+        const value = (name, property) => String(
+          computed && (computed[name] || computed.getPropertyValue && computed.getPropertyValue(property || name)) || ''
+        ).trim().toLowerCase();
+        const opacity = Number.parseFloat(value('opacity') || '1');
+        const clip = value('clip');
+        const clipPath = value('clipPath', 'clip-path') || value('webkitClipPath', '-webkit-clip-path');
+        const mask = value('maskImage', 'mask-image') || value('webkitMaskImage', '-webkit-mask-image');
+        const filter = value('filter');
+        safe = value('display') !== 'none' && value('contentVisibility', 'content-visibility') !== 'hidden' &&
+          !/^(?:hidden|collapse)$/u.test(value('visibility')) &&
+          !(Number.isFinite(opacity) && opacity <= 0) &&
+          (!clip || clip === 'auto') && (!clipPath || clipPath === 'none') &&
+          (!mask || mask === 'none') && (!filter || filter === 'none');
+      } catch (_error) {
+        safe = false;
+      }
+      const transform = String(element.getAttribute && element.getAttribute('transform') || '');
+      if (/scale\(\s*0(?:[.][0]*)?(?:\s*[,)]|\s+0(?:[.][0]*)?\s*\))/u.test(transform)) safe = false;
+      if (safe && element !== top && element.parentElement && element.parentElement !== svg) {
+        safe = visuallySafe(element.parentElement);
+      }
+      visibilityCache.set(element, safe);
+      return safe;
+    };
+    const safeAttributes = (element) => {
+      for (const attribute of Array.from(element.attributes || [])) {
+        const name = String(attribute.name || '').toLowerCase();
+        const value = String(attribute.value || '');
+        if (/^on/u.test(name) || value.length > MAX_CLIPBOARD_MARKUP_LENGTH ||
+            /(?:javascript\s*:|data\s*:|url\s*\()/iu.test(value)) return false;
+        if ((name === 'href' || name === 'xlink:href') &&
+            (element.localName || '').toLowerCase() !== 'use') return false;
+      }
+      return true;
+    };
+    const decodedGlyph = (glyph) => {
+      if (!visuallySafe(glyph) || !safeAttributes(glyph)) return null;
+      const raw = String(glyph.getAttribute('data-c') || '');
+      if (!/^[0-9a-f]{1,6}$/iu.test(raw)) return null;
+      const point = Number.parseInt(raw, 16);
+      if (!Number.isInteger(point) || point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff)) return null;
+      const character = String.fromCodePoint(point);
+      const tag = (glyph.localName || '').toLowerCase();
+      let drawable = false;
+      if (tag === 'path') {
+        drawable = mathJaxSvgPathDataIsDrawable(glyph.getAttribute('d'), /^\p{Cf}$/u.test(character));
+      } else if (tag === 'use') {
+        const target = mathJaxSvgUseTarget(glyph, svg, character);
+        if (!target) return null;
+        drawable = Boolean(String(target.getAttribute('d') || '').trim());
+      } else {
+        return null;
+      }
+      if (!drawable && !/^\p{Cf}$/u.test(character)) return null;
+      state.glyphs += 1;
+      state.characters += 1;
+      if (drawable) state.drawable += 1;
+      if (state.glyphs > MAX_MATHML_NODES || state.characters > MAX_SELECTION_KEY_LENGTH) return null;
+      return mathJaxSvgSemanticGlyph(character, glyph, top);
+    };
+    const visit = (element) => {
+      if (state.invalid || !element || element.nodeType !== 1) return '';
+      const tag = (element.localName || '').toLowerCase();
+      if (tag === 'defs' || tag === 'rect') return '';
+      if (!safeAttributes(element)) { state.invalid = true; return ''; }
+      if (tag === 'path' || tag === 'use') {
+        if (!element.hasAttribute('data-c')) { state.invalid = true; return ''; }
+        const character = decodedGlyph(element);
+        if (character == null) state.invalid = true;
+        return character || '';
+      }
+      if (tag === 'text') {
+        const owner = element.closest && element.closest('[data-mml-node="mtext"]');
+        const text = String(element.textContent || '');
+        if (!owner || !nodeInside(top, owner) || element.children.length || !visuallySafe(element) ||
+            !text || text.length > MAX_MATH_SOURCE_LENGTH ||
+            /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(text)) {
+          state.invalid = true;
+          return '';
+        }
+        const count = Array.from(text).length;
+        state.glyphs += count;
+        state.characters += count;
+        if (/[^\s\p{Cf}]/u.test(text)) state.drawable += 1;
+        if (state.glyphs > MAX_MATHML_NODES || state.characters > MAX_SELECTION_KEY_LENGTH) {
+          state.invalid = true;
+          return '';
+        }
+        return text;
+      }
+      if (!['g', 'svg'].includes(tag)) { state.invalid = true; return ''; }
+      const children = Array.from(element.children || []);
+      const name = String(element.getAttribute('data-mml-node') || '').toLowerCase();
+      if (name === 'msubsup' || name === 'munderover') {
+        const semantic = children.filter((child) => child.hasAttribute && child.hasAttribute('data-mml-node'));
+        if (semantic.length !== 3 || children.some((child) => !semantic.includes(child))) {
+          state.invalid = true;
+          return '';
+        }
+        const verticalOffset = (child) => {
+          const transform = String(child.getAttribute('transform') || '');
+          const translated = transform.match(/translate\(\s*[-+]?(?:\d+(?:[.]\d*)?|[.]\d+)\s*[, ]\s*([-+]?(?:\d+(?:[.]\d*)?|[.]\d+))/u);
+          if (translated) return Number.parseFloat(translated[1]);
+          const matrix = transform.match(/matrix\([^)]*[, ]\s*([-+]?(?:\d+(?:[.]\d*)?|[.]\d+))\s*\)$/u);
+          return matrix ? Number.parseFloat(matrix[1]) : NaN;
+        };
+        const firstOffset = verticalOffset(semantic[1]);
+        const secondOffset = verticalOffset(semantic[2]);
+        if (!Number.isFinite(firstOffset) || !Number.isFinite(secondOffset) || firstOffset === secondOffset) {
+          state.invalid = true;
+          return '';
+        }
+        const lower = firstOffset < secondOffset ? semantic[1] : semantic[2];
+        const upper = lower === semantic[1] ? semantic[2] : semantic[1];
+        return visit(semantic[0]) + visit(lower) + visit(upper);
+      }
+      if (name === 'mmultiscripts') {
+        if (children.length < 2) { state.invalid = true; return ''; }
+        const translatedPosition = (child) => {
+          const transform = String(child.getAttribute('transform') || '').trim();
+          if (!transform) return { x: 0, y: 0, explicit: false };
+          const translated = transform.match(
+            /(?:^|\s)translate\(\s*([-+]?(?:\d+(?:[.]\d*)?|[.]\d+))(?:\s*,\s*|\s+)([-+]?(?:\d+(?:[.]\d*)?|[.]\d+))\s*\)/u
+          );
+          if (!translated) return null;
+          return {
+            x: Number.parseFloat(translated[1]),
+            y: Number.parseFloat(translated[2]),
+            explicit: true
+          };
+        };
+        const positions = children.map(translatedPosition);
+        if (positions.some((position) => !position || !Number.isFinite(position.x) ||
+          !Number.isFinite(position.y))) { state.invalid = true; return ''; }
+        const baseCandidates = positions.map((position, index) => ({ position, index }))
+          .filter(({ position, index }) => Math.abs(position.y) < 1e-9 &&
+            children[index].hasAttribute('data-mml-node'));
+        if (baseCandidates.length !== 1) { state.invalid = true; return ''; }
+        const baseIndex = baseCandidates[0].index;
+        const baseX = baseCandidates[0].position.x;
+        const outputs = children.map(visit);
+        if (state.invalid) return '';
+        const descriptor = {
+          base: mathJaxSvgAgreementKey(outputs[baseIndex]),
+          preSub: '', preSup: '', postSub: '', postSup: ''
+        };
+        if (!descriptor.base) { state.invalid = true; return ''; }
+        for (let index = 0; index < children.length; index += 1) {
+          if (index === baseIndex) continue;
+          const position = positions[index];
+          if (!position.explicit || Math.abs(position.y) < 1e-9 ||
+              Math.abs(position.x - baseX) < 1e-9) { state.invalid = true; return ''; }
+          const side = position.x < baseX ? 'pre' : 'post';
+          const vertical = position.y < 0 ? 'Sub' : 'Sup';
+          const slot = side + vertical;
+          const key = mathJaxSvgAgreementKey(outputs[index]);
+          if (!key || descriptor[slot]) { state.invalid = true; return ''; }
+          descriptor[slot] = key;
+        }
+        state.multiscripts.push(descriptor);
+        return outputs.join('');
+      }
+      if (name === 'mfrac') {
+        const meaningful = children.filter((child) => (child.localName || '').toLowerCase() !== 'rect');
+        if (meaningful.length !== 2) { state.invalid = true; return ''; }
+        // MathJax paints a zero-line stack (notably \binom) without a rule.
+        // Its surrounding fence glyphs remain ordinary siblings, so emit only
+        // the two painted operands here. Readability punctuation is added only
+        // after the independently visible topology has authenticated source.
+        if (!children.some((child) => (child.localName || '').toLowerCase() === 'rect')) {
+          return visit(meaningful[0]) + visit(meaningful[1]);
+        }
+        return '(' + visit(meaningful[0]) + ')/(' + visit(meaningful[1]) + ')';
+      }
+      if (name === 'msqrt') {
+        const meaningful = children.filter((child) => (child.localName || '').toLowerCase() !== 'rect');
+        if (meaningful.length < 2) { state.invalid = true; return ''; }
+        return visit(meaningful[0]) + '(' + meaningful.slice(1).map(visit).join('') + ')';
+      }
+      if (name === 'mroot') {
+        const meaningful = children.filter((child) => (child.localName || '').toLowerCase() !== 'rect');
+        if (meaningful.length < 3) { state.invalid = true; return ''; }
+        return visit(meaningful[1]) + visit(meaningful[0]) + '(' + meaningful.slice(2).map(visit).join('') + ')';
+      }
+      if (name === 'mtable') {
+        if (!children.length || children.some((child) =>
+          String(child.getAttribute('data-mml-node') || '').toLowerCase() !== 'mtr')) {
+          state.invalid = true;
+          return '';
+        }
+        const rows = [];
+        const paintedRows = [];
+        for (const row of children) {
+          const cells = Array.from(row.children || []);
+          if (!cells.length || cells.some((cell) =>
+            String(cell.getAttribute('data-mml-node') || '').toLowerCase() !== 'mtd')) {
+            state.invalid = true;
+            return '';
+          }
+          const paintedCells = cells.map(visit);
+          if (state.invalid) return '';
+          rows.push(paintedCells.map(mathJaxSvgAgreementKey));
+          paintedRows.push(paintedCells.join(''));
+        }
+        state.tables.push({ rows });
+        return paintedRows.join('');
+      }
+      return children.map(visit).join('');
+    };
+    const text = visit(top);
+    if (state.invalid || !state.glyphs || !state.drawable || !text) return null;
+    return {
+      text,
+      glyphs: state.glyphs,
+      tables: state.tables,
+      multiscripts: state.multiscripts
+    };
+  }
+
+  function mathJaxSvgDescriptor(root) {
+    const cache = ACTIVE_COPY_MATHJAX_SVG_CACHE;
+    if (cache && root && cache.has(root)) return cache.get(root);
+    const reject = () => {
+      if (cache && root) cache.set(root, null);
+      return null;
+    };
+    if (!root || !root.matches ||
+        !root.matches('mjx-container.MathJax[jax="SVG" i]') ||
+        !root.isConnected ||
+        !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return reject();
+    const children = Array.from(root.children || []);
+    const svgs = children.filter((child) => (child.localName || '').toLowerCase() === 'svg');
+    if (!svgs.length || children.some((child) => {
+      const tag = (child.localName || '').toLowerCase();
+      return tag !== 'svg' && tag !== 'mjx-break' && !isVisuallyHiddenElement(child);
+    })) return reject();
+    let rootComputed;
+    try { rootComputed = root.ownerDocument.defaultView.getComputedStyle(root); } catch (_error) { return reject(); }
+    if (isVisuallyHiddenElement(root) || computedStyleHasUnsafeVisibleLayout(rootComputed, false) ||
+        !cssStackMathPositiveRect(root) ||
+        svgs.some((svg) => !embeddedMathSurfaceIsVisible({ root, surface: svg }))) return reject();
+
+    let source = '';
+    let rawSource = '';
+    let totalSourceCharacters = 0;
+    let glyphText = '';
+    let glyphs = 0;
+    const visibleTopology = { tables: [], multiscripts: [] };
+    const structuralEntries = [];
+    const structuralIds = new Set();
+    for (const svg of svgs) {
+      if (svg.querySelector('foreignObject,script,style,image') ||
+          Array.from(svg.querySelectorAll('use')).some((node) => {
+            const href = node.getAttribute('href') || node.getAttribute('xlink:href') || '';
+            return href && !href.startsWith('#');
+          })) return reject();
+      const topCandidates = Array.from(svg.querySelectorAll('g[data-mml-node="math"][data-latex]'))
+        .filter((candidate) => {
+          const parent = candidate.parentElement;
+          return parent === svg || (parent && (parent.localName || '').toLowerCase() === 'g' &&
+            parent.parentElement === svg);
+        });
+      if (topCandidates.length !== 1) return reject();
+      const top = topCandidates[0];
+      const untrimmedSource = String(top.getAttribute('data-latex') || '');
+      totalSourceCharacters += untrimmedSource.length;
+      if (!untrimmedSource || untrimmedSource.length > MAX_MATH_SOURCE_LENGTH ||
+          totalSourceCharacters > MAX_CLIPBOARD_MARKUP_LENGTH) return reject();
+      const candidateRawSource = untrimmedSource.trim();
+      if (!candidateRawSource) return reject();
+      if (!rawSource) {
+        rawSource = candidateRawSource;
+        source = normalizedEmbeddedTex(candidateRawSource);
+        if (!source) return reject();
+      } else if (candidateRawSource !== rawSource) {
+        // MathJax v4 line breaking clones the exact top-level source into
+        // every line SVG. Exact equality avoids reparsing dozens of identical
+        // 50k metadata strings and rejects stale/mixed renderer fragments.
+        return reject();
+      }
+      for (const node of Array.from(top.querySelectorAll('[data-mml-node]'))) {
+        const name = String(node.getAttribute('data-mml-node') || '').toLowerCase();
+        const semanticId = String(node.getAttribute('data-semantic-id') || '');
+        const idKey = semanticId ? name + ':' + semanticId : '';
+        if (idKey && structuralIds.has(idKey)) continue;
+        if (idKey) structuralIds.add(idKey);
+        if (MATHJAX_SVG_STRUCTURAL_NAMES.has(name)) structuralEntries.push({ node, top });
+      }
+      const walker = root.ownerDocument.createTreeWalker(svg, 4);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (!String(node.nodeValue || '').trim()) continue;
+        const parent = node.parentElement;
+        const textOwner = parent && parent.closest && parent.closest('[data-mml-node="mtext"]');
+        if (!parent || (parent.localName || '').toLowerCase() !== 'text' ||
+            !nodeInside(top, parent) || !textOwner || !nodeInside(top, textOwner)) return reject();
+      }
+      const projection = mathJaxSvgVisibleProjection(top, svg);
+      if (!projection) return reject();
+      glyphText += projection.text;
+      glyphs += projection.glyphs;
+      visibleTopology.tables.push(...projection.tables);
+      visibleTopology.multiscripts.push(...projection.multiscripts);
+      if (glyphs > MAX_MATHML_NODES || glyphText.length > MAX_SELECTION_KEY_LENGTH) return reject();
+    }
+    if (!source || !glyphs) return reject();
+    const structure = latexStructuralSignature(source, false, null);
+    if (!structure || structure.invalid) return reject();
+    const expectedTopology = { tables: [], multiscripts: [] };
+    const expectedText = latexToVisibleAgreement(source, expectedTopology);
+    if (!expectedText ||
+        JSON.stringify(expectedTopology.tables) !== JSON.stringify(visibleTopology.tables) ||
+        JSON.stringify(expectedTopology.multiscripts) !== JSON.stringify(visibleTopology.multiscripts)) {
+      return reject();
+    }
+    const expected = semanticVisibleAnchorSignature(expectedText);
+    const visible = semanticVisibleAnchorSignature(glyphText);
+    if (expected.overBudget || visible.overBudget || expected.identifiers !== visible.identifiers ||
+        expected.accents !== visible.accents || expected.glyphs !== visible.glyphs) return reject();
+    if (!expected.uncertainOperators && !visible.uncertainOperators &&
+        expected.operators !== visible.operators) return reject();
+    const actualStructure = mathJaxSvgStructuralSignature(structuralEntries);
+    if (actualStructure.invalid) return reject();
+    for (const key of ['sup', 'sub', 'fraction', 'squareRoot', 'indexedRoot', 'over', 'under', 'table']) {
+      const exact = actualStructure[key] === structure[key];
+      const repeatedAcrossLines = svgs.length > 1 && structure[key] > 0 &&
+        actualStructure[key] >= structure[key];
+      if (!exact && !repeatedAcrossLines) return reject();
+    }
+    const expectedKey = mathJaxSvgAgreementKey(expectedText);
+    const visibleKey = mathJaxSvgAgreementKey(glyphText);
+    if (!expectedKey || expectedKey !== visibleKey) return reject();
+    const descriptor = { root, source, svgs, glyphText };
+    if (cache) cache.set(root, descriptor);
+    return descriptor;
+  }
+
   function getMathSource(root, pageWindow) {
     if (!root || root.nodeType !== 1 || !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return '';
     const bounded = (value) => {
       const source = typeof value === 'string' ? value : '';
       return source && source.length <= MAX_MATH_SOURCE_LENGTH ? stripLatexDelimiters(source) : '';
     };
+    const svgDescriptor = mathJaxSvgDescriptor(root);
+    if (svgDescriptor) return svgDescriptor.source;
+    const embedded = embeddedMathDescriptor(root);
+    if (embedded && embedded.source) return embedded.source;
     const attributeNames = ['data-latex', 'data-tex', 'data-math-source', 'data-original-tex', 'alttext'];
     for (const name of attributeNames) {
       const value = root.getAttribute && root.getAttribute(name);
@@ -5290,9 +6369,11 @@
     if (!root || root.nodeType !== 1) return null;
     if (root.matches && root.matches('math')) return root;
     if (root.querySelector) {
-      return root.querySelector('.katex-mathml math, mjx-assistive-mml math, math');
+      const semantic = root.querySelector('.katex-mathml math, mjx-assistive-mml math, math');
+      if (semantic) return semantic;
     }
-    return null;
+    const embedded = embeddedMathDescriptor(root);
+    return embedded && embedded.math || null;
   }
 
   function fallbackMathText(root) {
@@ -5601,9 +6682,9 @@
           if (/^[―‾¯]+$/u.test(visible)) {
             visible = scripted.localName === 'mjx-munder' ? '\u0332' : '\u0305';
           } else if (/^⏞+$/u.test(visible) && scripted.localName === 'mjx-mover') {
-            visible = '\u0305';
+            visible = '⏞';
           } else if (/^⏟+$/u.test(visible) && scripted.localName === 'mjx-munder') {
-            visible = '\u0332';
+            visible = '⏟';
           } else if (/^[−-]*→$/u.test(visible) && scripted.localName === 'mjx-mover') {
             visible = '\u20d7';
           } else if (/^←[−-]*$/u.test(visible) && scripted.localName === 'mjx-mover') {
@@ -6234,6 +7315,10 @@
   }
 
   function sourceOnlyMathAgreesWithVisible(root, pageWindow) {
+    const embedded = embeddedMathDescriptor(root);
+    if (embedded && !embedded.math && embedded.source) return true;
+    const svgDescriptor = mathJaxSvgDescriptor(root);
+    if (svgDescriptor) return true;
     const source = getMathSource(root, pageWindow);
     const visible = independentVisibleMathText(root);
     if (!source) return true;
@@ -6391,6 +7476,10 @@
 
   function isMathRoot(element) {
     if (!element || element.nodeType !== 1 || !element.matches) return false;
+    if (rendererInternalSourceAttributeNode(element)) return false;
+    if (element.matches('[data-mathml],[data-equation-content]')) {
+      return Boolean(embeddedMathOwnerShape(element));
+    }
     if (element.matches([
       '.katex-display', '.katex', 'mjx-container', '.MathJax_Display',
       '.MathJax_SVG_Display', '.MathJax_CHTML', '.MathJax_SVG', '.MathJax',
@@ -6408,7 +7497,7 @@
     const nestedRenderer = element.querySelector([
       '.katex', 'mjx-container', '.MathJax_Display', '.MathJax_CHTML', '.MathJax_SVG',
       '.MathJax', '.mwe-math-element', '[role="math"]', '[data-latex]',
-      '[data-tex]', '[data-math-source]'
+      '[data-tex]', '[data-math-source]', '[data-mathml]', '[data-equation-content]'
     ].join(','));
     if (nestedRenderer && nestedRenderer !== element) return false;
     return Boolean(
@@ -6416,6 +7505,8 @@
       element.getAttribute('data-latex') ||
       element.getAttribute('data-tex') ||
       element.getAttribute('data-math-source') ||
+      element.getAttribute('data-mathml') ||
+      element.getAttribute('data-equation-content') ||
       element.getAttribute('role') === 'math'
     );
   }
@@ -6443,11 +7534,27 @@
   }
 
   function mathElementCount(element, context) {
-    if (!element || !element.querySelectorAll) return 0;
+    if (!element || element.nodeType !== 1) return 0;
     const cache = context && context.mathCounts;
     if (cache && cache.has(element)) return cache.get(element);
-    const count = (element.matches && element.matches('math') ? 1 : 0) +
-      element.querySelectorAll('math').length;
+    let count = element.matches && element.matches('math') ? 1 : 0;
+    const stack = [];
+    let inspected = 0;
+    const queueChildren = (parent) => {
+      for (let child = parent.lastChild; child; child = child.previousSibling) {
+        inspected += 1;
+        if (inspected > MAX_MATH_DISCOVERY_CANDIDATES + MAX_MATHML_NODES) return false;
+        stack.push(child);
+      }
+      return true;
+    };
+    if (!queueChildren(element)) count = 2;
+    while (stack.length && count < 2) {
+      const node = stack.pop();
+      if (!node || node.nodeType !== 1) continue;
+      if ((node.localName || '').toLowerCase() === 'math') count += 1;
+      if (count < 2 && !queueChildren(node)) count = 2;
+    }
     if (cache) cache.set(element, count);
     return count;
   }
@@ -6535,24 +7642,57 @@
     });
   }
 
-  function canonicalMathRootDiscovery(container, contextInput) {
+  function canonicalMathRootDiscovery(container, contextInput, selectedRange) {
     if (!container) return { roots: [], overBudget: false };
     const context = contextInput || createMathDiscoveryContext();
     const base = container.nodeType === 1 ? container : container.parentElement || container;
     if (!base) return { roots: [], overBudget: false };
+    const rangeCoversBase = selectedRange && selectedRange.startContainer === base &&
+      selectedRange.startOffset === 0 && selectedRange.endContainer === base &&
+      selectedRange.endOffset === base.childNodes.length;
+    const restrictedRange = rangeCoversBase ? null : selectedRange;
     const candidates = new Set();
     if (isMathRootCached(base, context)) candidates.add(base);
-    if (base.querySelectorAll) {
-      const discovered = base.querySelectorAll(MATH_DISCOVERY_SELECTOR);
-      if (discovered.length > MAX_MATH_DISCOVERY_CANDIDATES) {
-        return { roots: [], overBudget: true };
-      }
-      for (const candidate of discovered) {
-        if (isMathRootCached(candidate, context)) candidates.add(candidate);
-        if ((candidate.localName || '').toLowerCase() === 'math') {
-          const promoted = rendererContainerForMath(candidate, context);
-          if (promoted) candidates.add(promoted);
+    if (base.lastElementChild) {
+      const stack = [];
+      let inspected = 0;
+      let scanned = 0;
+      const queueChildren = (element) => {
+        for (let child = element.lastChild; child; child = child.previousSibling) {
+          scanned += 1;
+          // Count every sibling considered, including non-elements and
+          // unselected subtree roots. querySelectorAll would first materialize
+          // the entire descendant result before the former limits ran, which
+          // let an unrelated document-sized branch stall an ordinary copy.
+          if (scanned > MAX_MATH_DISCOVERY_CANDIDATES + MAX_MATHML_NODES) return false;
+          if (child.nodeType === 1 && (!restrictedRange || rangeIntersects(restrictedRange, child))) {
+            stack.push(child);
+          }
         }
+        return true;
+      };
+      if (!queueChildren(base)) return { roots: [], overBudget: true };
+      while (stack.length) {
+        const candidate = stack.pop();
+        let matches = false;
+        try { matches = candidate.matches(MATH_DISCOVERY_SELECTOR); }
+        catch (_error) { return { roots: [], overBudget: true }; }
+        if (matches) {
+        // MathJax 4 legitimately places data-latex on many internal SVG
+        // nodes, so those nodes do not consume the root-candidate budget.
+        // They still consume a separate traversal budget so a forged page
+        // cannot make discovery walk an unbounded attribute forest.
+          if (!rendererInternalSourceAttributeNode(candidate)) {
+            inspected += 1;
+            if (inspected > MAX_MATH_DISCOVERY_CANDIDATES) return { roots: [], overBudget: true };
+            if (isMathRootCached(candidate, context)) candidates.add(candidate);
+            if ((candidate.localName || '').toLowerCase() === 'math') {
+              const promoted = rendererContainerForMath(candidate, context);
+              if (promoted) candidates.add(promoted);
+            }
+          }
+        }
+        if (!queueChildren(candidate)) return { roots: [], overBudget: true };
       }
     }
     // A Set removes promoted/root duplicates. Walking ancestors against that
@@ -6586,18 +7726,94 @@
     }
   }
 
+  function rangeTraversalRoot(range) {
+    const common = range && range.commonAncestorContainer;
+    if (!common) return null;
+    // A composed selection can legitimately be bounded by an open
+    // ShadowRoot. Treat that DocumentFragment as a traversal container rather
+    // than asking for parentElement (which is null at a shadow boundary).
+    if (common.nodeType === 1 || common.nodeType === 11) return common;
+    return common.parentElement || null;
+  }
+
   function mathRootDiscoveryForRange(range) {
     if (!range || !range.commonAncestorContainer) return { roots: [], overBudget: false };
     const context = createMathDiscoveryContext();
-    const container = range.commonAncestorContainer.nodeType === 1
-      ? range.commonAncestorContainer
-      : range.commonAncestorContainer.parentElement;
-    const canonical = canonicalMathRootDiscovery(container, context);
+    const container = rangeTraversalRoot(range);
+    const canonical = canonicalMathRootDiscovery(container, context, range);
     if (canonical.overBudget) return canonical;
     const rootSet = new Set(canonical.roots.filter((root) => rangeIntersects(range, root)));
     for (const boundaryNode of [range.startContainer, range.endContainer]) {
       const ancestor = outermostMathAncestor(boundaryNode, context);
       if (ancestor) rootSet.add(ancestor);
+    }
+    // A renderer-ish class or ARIA role must not preempt a formula that is
+    // independently authenticated by the bounded visual-stack parser. Limit
+    // this extra work to the exact two/three-row candidate shape: ordinary
+    // role=math content must retain the stricter source/visible agreement
+    // path, and large selections must not pay for geometry on every root.
+    const cssDescriptorContext = createCssStackMathDescriptorContext();
+    const independentSemanticSelector = [
+      'math', '[data-latex]', '[data-tex]', '[data-math-source]', '[data-mathml]',
+      '[data-equation-content]', 'annotation[encoding*="tex" i]', 'script[type^="math/tex"]'
+    ].join(',');
+    const hasIndependentSemantics = (rendererRoot) => {
+      const stack = [rendererRoot];
+      let inspected = 0;
+      while (stack.length) {
+        const element = stack.pop();
+        if (!element || element.nodeType !== 1) continue;
+        inspected += 1;
+        // An over-budget source-bearing renderer stays on the stricter native
+        // renderer path. Never delete it merely because the bounded audit
+        // could not prove the absence of independent semantics.
+        if (inspected > MAX_POSITIONED_DISCOVERY_NODES) return true;
+        try {
+          if (element.matches(independentSemanticSelector)) return true;
+        } catch (_error) {
+          return true;
+        }
+        for (let child = element.lastElementChild; child; child = child.previousElementSibling) {
+          stack.push(child);
+        }
+      }
+      return false;
+    };
+    const authenticatedCssStackWithin = (rendererRoot) => {
+      const authenticate = (element) => Boolean(
+        element && element.nodeType === 1 && cssStackMathCandidateShape(element) &&
+        cssStackMathRootDescriptor(element, element.ownerDocument, 0, cssDescriptorContext)
+      );
+      // Exact inner selections should not scan a large role=math wrapper just
+      // to reach the already-known endpoint ancestry.
+      for (const endpoint of [range.startContainer, range.endContainer]) {
+        let element = endpoint && endpoint.nodeType === 1 ? endpoint : endpoint && endpoint.parentElement;
+        const path = [];
+        for (let depth = 0; element && depth <= MAX_RICH_SELECTION_DEPTH; depth += 1) {
+          path.push(element);
+          if (element === rendererRoot) {
+            if (path.some(authenticate)) return true;
+            break;
+          }
+          element = element.parentElement;
+        }
+      }
+      const stack = [rendererRoot];
+      let inspected = 0;
+      while (stack.length) {
+        const element = stack.pop();
+        if (!element || element.nodeType !== 1 || !rangeIntersects(range, element)) continue;
+        inspected += 1;
+        if (inspected > MAX_POSITIONED_DISCOVERY_NODES) return false;
+        if (authenticate(element)) return true;
+        for (let child = element.lastElementChild; child; child = child.previousElementSibling) {
+          stack.push(child);
+        }
+      }
+      return false;
+    };
+    for (const root of Array.from(rootSet)) {
+      if (!hasIndependentSemantics(root) && authenticatedCssStackWithin(root)) rootSet.delete(root);
     }
     if (rootSet.size > MAX_MATH_ROOTS_PER_SELECTION) return { roots: [], overBudget: true };
     const roots = [];
@@ -6617,8 +7833,14 @@
   }
 
   function rootsForRange(range) {
-    const discovery = mathRootDiscoveryForRange(range);
-    return discovery.overBudget ? [] : discovery.roots;
+    const previousMathJaxSvgCache = ACTIVE_COPY_MATHJAX_SVG_CACHE;
+    if (!previousMathJaxSvgCache) ACTIVE_COPY_MATHJAX_SVG_CACHE = new WeakMap();
+    try {
+      const discovery = mathRootDiscoveryForRange(range);
+      return discovery.overBudget ? [] : discovery.roots;
+    } finally {
+      ACTIVE_COPY_MATHJAX_SVG_CACHE = previousMathJaxSvgCache;
+    }
   }
 
   function expandedMathRange(range, roots) {
@@ -7456,6 +8678,8 @@
   }
 
   function semanticMathRootAgreesWithVisible(root, math) {
+    const embedded = embeddedMathDescriptor(root);
+    if (embedded && embedded.math === math) return true;
     if (!wikipediaMathAgreesWithFallback(root, math)) return false;
     if (!root || !math || !root.querySelector) return true;
     const katexVisual = root.matches && root.matches('.katex-html')
@@ -7469,7 +8693,20 @@
     const math = getMathElement(root);
     const selectedText = cleanClipboardText(range.toString());
     const selectedKey = mathSelectionKey(selectedText);
-    if (!selectedKey || selectedKey.length > MAX_SELECTION_KEY_LENGTH) return { kind: 'unmatched' };
+    if (!selectedKey) {
+      const embedded = embeddedMathDescriptor(root);
+      const svgDescriptor = mathJaxSvgDescriptor(root);
+      const exactRoot = range.startContainer === root && range.startOffset === 0 &&
+        range.endContainer === root && range.endOffset === root.childNodes.length;
+      const exactSingleSvg = svgDescriptor && svgDescriptor.svgs.length === 1 &&
+        range.startContainer === svgDescriptor.svgs[0] && range.startOffset === 0 &&
+        range.endContainer === svgDescriptor.svgs[0] &&
+        range.endOffset === svgDescriptor.svgs[0].childNodes.length;
+      return (embedded && exactRoot) || (svgDescriptor && (exactRoot || exactSingleSvg))
+        ? { kind: 'whole' }
+        : { kind: 'unmatched' };
+    }
+    if (selectedKey.length > MAX_SELECTION_KEY_LENGTH) return { kind: 'unmatched' };
     if (!math) {
       const visibleKey = mathSelectionKey(independentVisibleMathText(root));
       // Source-only SVG/CHTML renderers still support a typical mouse drag
@@ -7565,6 +8802,7 @@
   }
 
   function wholeMathRootPayload(root, settings, pageWindow) {
+    const embedded = embeddedMathDescriptor(root);
     const sourceMath = getMathElement(root);
     if (!sourceMath && !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return null;
     const sourceText = sourceMath ? '' : getMathSource(root, pageWindow);
@@ -7575,19 +8813,21 @@
     if (sourceMath && !semanticMathRootAgreesWithVisible(root, sourceMath)) return null;
     const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
     if (sourceMath && !safeMath) return null;
-    const text = settings.outputMode === 'faithful' && safeMath
+    const text = embedded && safeMath
+      ? mathMLFragmentText(safeMath, settings.outputMode)
+      : (settings.outputMode === 'faithful' && safeMath
       ? faithfulRenderedMathText(root, safeMath, pageWindow)
       : (settings.outputMode === 'calculator' && safeMath
         ? calculatorRenderedMathText(root, safeMath, pageWindow)
         : (safeMath && settings.outputMode !== 'latex'
           ? mathMLFragmentText(safeMath, settings.outputMode)
-          : extractMathText(root, settings.outputMode, pageWindow)));
+          : extractMathText(root, settings.outputMode, pageWindow))));
     if (!text || !text.trim()) return null;
     const documentObject = root.ownerDocument;
     const richFragment = documentObject.createDocumentFragment();
     richFragment.appendChild(safeMath
       ? richMathNodeForElement(safeMath, null, documentObject)
-      : richMathNode(root, documentObject));
+      : semanticTextRichFragment(text, settings.outputMode, documentObject));
     return {
       text: finalizeRewrittenText(text),
       html: sanitizeRichFragment(richFragment),
@@ -7965,6 +9205,7 @@
       MAX_ORDINARY_SELECTION_MARKUP_LENGTH
     )) return null;
     const values = originalRoots.map((root) => {
+      const embedded = embeddedMathDescriptor(root);
       const sourceMath = getMathElement(root);
       const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
       const sourceText = sourceMath ? '' : getMathSource(root, pageWindow);
@@ -7974,13 +9215,15 @@
       return {
         text: !sourceAgreement || (sourceMath && !safeMath)
           ? ''
-          : (settings.outputMode === 'faithful' && safeMath
+          : (embedded && safeMath
+            ? mathMLFragmentText(safeMath, settings.outputMode)
+            : (settings.outputMode === 'faithful' && safeMath
             ? faithfulRenderedMathText(root, safeMath, pageWindow)
             : (settings.outputMode === 'calculator' && safeMath
               ? calculatorRenderedMathText(root, safeMath, pageWindow)
               : (safeMath && settings.outputMode !== 'latex'
                 ? mathMLFragmentText(safeMath, settings.outputMode)
-                : extractMathText(root, settings.outputMode, pageWindow)))),
+                : extractMathText(root, settings.outputMode, pageWindow))))),
         display: isDisplayMath(root),
         root,
         safeMath,
@@ -8017,7 +9260,11 @@
       const value = values[index];
       root.replaceWith(value && value.safeMath
         ? richMathNodeForElement(value.safeMath, null, root.ownerDocument)
-        : richMathNode(value && value.root || root, root.ownerDocument));
+        : semanticTextRichFragment(
+          value && value.text || '',
+          settings.outputMode,
+          root.ownerDocument
+        ));
     });
     const html = sanitizeRichFragment(richFragment);
     const onlyMath = values.length === 1 && text.trim() === values[0].text.trim();
@@ -8228,9 +9475,33 @@
     const host = String(pageWindow && pageWindow.location && pageWindow.location.hostname || '').toLowerCase();
     if (/(?:^|\.)(?:officeapps\.live\.com|office\.com|microsoft365\.com|cloud\.microsoft)$/.test(host) ||
         host === 'word.cloud.microsoft') return true;
-    return Boolean(documentObject && documentObject.querySelector && documentObject.querySelector(
-      '#WACViewPanel_EditingElement, #WACViewPanel_ClipboardElement, .WACPageImg'
-    ));
+    return documentHasMicrosoftOfficeEditorMarker(documentObject);
+  }
+
+  function documentHasMicrosoftOfficeEditorMarker(documentObject) {
+    if (!documentObject) return false;
+    try {
+      if (documentObject.getElementById && (
+        documentObject.getElementById('WACViewPanel_EditingElement') ||
+        documentObject.getElementById('WACViewPanel_ClipboardElement')
+      )) return true;
+      const pageImages = documentObject.getElementsByClassName &&
+        documentObject.getElementsByClassName('WACPageImg');
+      return Boolean(pageImages && pageImages.length);
+    } catch (_error) {
+      // A cross-realm or partially initialized Office document is safer left
+      // on its native clipboard path.
+      return true;
+    }
+  }
+
+  function isMicrosoftOfficeEditorSurface(documentObject, target, selection) {
+    const selector = '#WACViewPanel_EditingElement, #WACViewPanel_ClipboardElement, .WACPageImg';
+    for (const endpoint of [target, selection && selection.anchorNode, selection && selection.focusNode]) {
+      const element = endpoint && endpoint.nodeType === 1 ? endpoint : endpoint && endpoint.parentElement;
+      if (element && element.closest && element.closest(selector)) return true;
+    }
+    return documentHasMicrosoftOfficeEditorMarker(documentObject);
   }
 
   function isGoogleDocsPage(pageWindow) {
@@ -8621,10 +9892,56 @@
     if (tag === 'sup') return 'sup';
     if (tag === 'sub') return 'sub';
     const style = String(element.getAttribute && element.getAttribute('style') || '');
+    let computed;
+    let computedAttempted = false;
+    const computedStyle = () => {
+      if (computedAttempted) return computed;
+      computedAttempted = true;
+      try {
+        const view = element.ownerDocument && element.ownerDocument.defaultView;
+        computed = view && view.getComputedStyle && view.getComputedStyle(element);
+      } catch (_error) {
+        computed = null;
+      }
+      return computed;
+    };
+    const verticalAlignmentApplies = () => {
+      const resolved = computedStyle();
+      let display = String(resolved && resolved.display || '').trim().toLowerCase();
+      if (!display) {
+        const authored = style.match(/(?:^|;)\s*display\s*:\s*([^;!]+)/i);
+        display = String(authored && authored[1] || '').trim().toLowerCase();
+      }
+      // CSS vertical-align only raises an inline-level box. On a block it is
+      // ignored, and on a table cell it aligns cell contents rather than
+      // denoting a mathematical script. Semantic <sup>/<sub> tags above stay
+      // authoritative regardless of authored display overrides.
+      if (display) return /^inline(?:$|-)/u.test(display);
+      return !BLOCK_TAGS.has(tag) && !['table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th'].includes(tag);
+    };
     const vertical = style.match(/(?:^|;)\s*vertical-align\s*:\s*(super|sub)\s*(?:!important\s*)?(?:;|$)/i);
-    if (vertical) return vertical[1].toLowerCase() === 'super' ? 'sup' : 'sub';
+    if (vertical && verticalAlignmentApplies()) {
+      return vertical[1].toLowerCase() === 'super' ? 'sup' : 'sub';
+    }
     const variant = style.match(/(?:^|;)\s*font-variant-position\s*:\s*(super|sub)\s*(?:!important\s*)?(?:;|$)/i);
-    return variant ? (variant[1].toLowerCase() === 'super' ? 'sup' : 'sub') : '';
+    if (variant) return variant[1].toLowerCase() === 'super' ? 'sup' : 'sub';
+    try {
+      const resolved = computedStyle();
+      const computedVertical = String(resolved && resolved.verticalAlign || '').trim().toLowerCase();
+      if ((computedVertical === 'super' || computedVertical === 'sub') && verticalAlignmentApplies()) {
+        return computedVertical === 'super' ? 'sup' : 'sub';
+      }
+      const computedVariant = String(resolved && (resolved.fontVariantPosition ||
+        resolved.getPropertyValue && resolved.getPropertyValue('font-variant-position')) || '')
+        .trim().toLowerCase();
+      if (computedVariant === 'super' || computedVariant === 'sub') {
+        return computedVariant === 'super' ? 'sup' : 'sub';
+      }
+    } catch (_error) {
+      // Inline semantics above remain available in engines that cannot
+      // compute styles for a detached clipboard document.
+    }
+    return '';
   }
 
   function richScriptClipboardPayloadFromMarkup(markup, settingsInput, documentObject) {
@@ -8635,7 +9952,11 @@
     // arbitrary nodes into the live page can upgrade custom elements or trigger
     // page-owned behavior even when the imported fragment is never attached.
     const fragment = parsedBody;
-    const originalText = finalizeRewrittenText(serializeOrdinaryFragment(fragment).text);
+    const originalText = finalizeRewrittenText(serializeOrdinaryFragment(
+      fragment,
+      'faithful',
+      { semanticScripts: false }
+    ).text);
     if (!originalText.trim()) return null;
     const candidates = Array.from(fragment.querySelectorAll ? fragment.querySelectorAll('sup, sub, [style]') : [])
       .filter((element) => clipboardInlineScriptKind(element));
@@ -8663,7 +9984,11 @@
       const kind = clipboardInlineScriptKind(element);
       // Reuse the bounded ordinary serializer so executable/hidden descendants
       // inside untrusted clipboard HTML can never become newly visible text.
-      const raw = finalizeRewrittenText(serializeOrdinaryFragment(element).text);
+      const raw = finalizeRewrittenText(serializeOrdinaryFragment(
+        element,
+        'faithful',
+        { semanticScripts: false }
+      ).text);
       if (!kind || !raw.trim() || raw.length > MAX_MATH_SOURCE_LENGTH) continue;
       const replacement = parsed.createElement('span');
       let scriptText = officeScriptText(raw, kind, settings.outputMode);
@@ -8687,7 +10012,11 @@
       scripts += 1;
     }
     if (!scripts) return null;
-    let text = finalizeRewrittenText(serializeOrdinaryFragment(fragment).text);
+    let text = finalizeRewrittenText(serializeOrdinaryFragment(
+      fragment,
+      'faithful',
+      { semanticScripts: false }
+    ).text);
     if (!text.trim() || text === originalText) return null;
     if (looksLikeStandaloneUnicodeMath(text)) {
       if (settings.outputMode === 'faithful') text = formatFaithfulMathText(text);
@@ -8972,9 +10301,7 @@
       }
       try {
         const contents = range.cloneContents();
-        const common = range.commonAncestorContainer && range.commonAncestorContainer.nodeType === 1
-          ? range.commonAncestorContainer
-          : range.commonAncestorContainer && range.commonAncestorContainer.parentElement;
+        const common = rangeTraversalRoot(range);
         const tag = common && (common.localName || '').toLowerCase();
         if (common && tag && !['html', 'body'].includes(tag)) {
           const context = common.cloneNode(false);
@@ -9199,11 +10526,75 @@
     return rangeIntersects(range, child);
   }
 
-  function cssStackMathDomSource(root, range) {
+  function cssStackMathElementTagIsSafe(element, root = false) {
+    if (!element || element.nodeType !== 1) return false;
+    const tag = (element.localName || '').toLowerCase();
+    if (tag === 'wbr') return true;
+    if (root && ['body', 'html', 'sub', 'sup'].includes(tag)) return false;
+    const namespace = String(element.namespaceURI || 'http://www.w3.org/1999/xhtml').toLowerCase();
+    return namespace === 'http://www.w3.org/1999/xhtml' &&
+      /^[a-z][a-z0-9._-]*$/u.test(tag) && !CSS_STACK_MATH_UNSAFE_TAGS.has(tag);
+  }
+
+  function cssStackMathStructuralChildren(element) {
+    const children = [];
+    let inspected = 0;
+    for (let child = element && element.firstElementChild; child; child = child.nextElementSibling) {
+      inspected += 1;
+      if (inspected > MAX_CSS_STACK_MATH_NODES) return [element, element, element, element];
+      if ((child.localName || '').toLowerCase() === 'wbr') continue;
+      children.push(child);
+      // A visual stack can have only two rows, or two rows plus one rule.
+      // Keep a fourth sentinel element so callers reject wider shapes without
+      // first materializing an attacker-controlled HTMLCollection.
+      if (children.length > 3) break;
+    }
+    return children;
+  }
+
+  function cssStackMathBoundedDirectNodes(element) {
+    const nodes = [];
+    for (let child = element && element.firstChild; child; child = child.nextSibling) {
+      nodes.push(child);
+      if (nodes.length > MAX_CSS_STACK_MATH_NODES) return null;
+    }
+    return nodes;
+  }
+
+  function cssStackMathStackParts(element) {
+    let container = element;
+    const wrappers = [];
+    let parts = cssStackMathStructuralChildren(container);
+    for (let depth = 0;
+      depth < Math.min(MAX_RICH_SELECTION_DEPTH, MAX_CSS_STACK_MATH_NODES) && parts.length === 1;
+      depth += 1) {
+      const wrapper = parts[0];
+      const directNodes = cssStackMathBoundedDirectNodes(wrapper);
+      if (!directNodes) return { container, parts: [], wrappers, overBudget: true };
+      const directText = directNodes.some((child) =>
+        child.nodeType === 3 && cleanOrdinaryCharacters(child.nodeValue || '').trim());
+      if (directText || !cssStackMathElementTagIsSafe(wrapper, true)) break;
+      const nested = cssStackMathStructuralChildren(wrapper);
+      if (!nested.length) break;
+      wrappers.push(wrapper);
+      container = wrapper;
+      parts = nested;
+    }
+    return { container, parts, wrappers, overBudget: false };
+  }
+
+  function createCssStackMathDescriptorContext() {
+    return { descriptorCache: new WeakMap() };
+  }
+
+  function cssStackMathDomSource(root, range, nestedDepth = 0, contextInput) {
+    if (nestedDepth > MAX_MATHML_DEPTH) return '';
+    const descriptorContext = contextInput || createCssStackMathDescriptorContext();
     let nodes = 0;
+    let scannedChildren = 0;
     let characters = 0;
     let invalid = false;
-    const visit = (node) => {
+    const visit = (node, isRoot = false) => {
       if (!node || invalid) return '';
       nodes += 1;
       if (nodes > MAX_CSS_STACK_MATH_NODES) {
@@ -9233,15 +10624,58 @@
       if (node.nodeType !== 1 && node.nodeType !== 11) return '';
       if (node.nodeType === 1) {
         const tag = (node.localName || '').toLowerCase();
-        if (!CSS_STACK_MATH_INLINE_TAGS.has(tag) || isVisuallyHiddenElement(node)) {
+        if (tag === 'wbr') return '';
+        if (!cssStackMathElementTagIsSafe(node, false) || isVisuallyHiddenElement(node)) {
           invalid = true;
           return '';
         }
+        if (cssStackMathCandidateShape(node)) {
+          const nested = cssStackMathRootDescriptor(
+            node,
+            node.ownerDocument,
+            nestedDepth + 1,
+            descriptorContext
+          );
+          if (nested) {
+            const selected = range
+              ? cssStackMathSelectedDescriptorSource(
+                nested,
+                range,
+                nestedDepth + 1,
+                descriptorContext
+              )
+              : { selectedSemanticSource: nested.source };
+            if (selected === CSS_STACK_MATH_DOM_UNREPRESENTABLE) {
+              invalid = true;
+              return '';
+            }
+            const nestedSource = selected && selected.selectedSemanticSource || '';
+            if (!nestedSource) return '';
+            characters += nestedSource.length;
+            if (characters > MAX_CSS_STACK_MATH_CHARACTERS) {
+              invalid = true;
+              return '';
+            }
+            return nestedSource;
+          }
+          // A visibly stacked descendant that failed authentication must not
+          // be concatenated into a different formula by its parent.
+          if (cssStackMathPlausibleVisualRoot(node, node.ownerDocument, true)) {
+            invalid = true;
+            return '';
+          }
+        }
       }
       let value = '';
-      Array.from(node.childNodes || []).forEach((child, index) => {
-        if (cssStackMathChildIsSelected(range, node, child, index)) value += visit(child);
-      });
+      let index = 0;
+      for (let child = node.firstChild; child && !invalid; child = child.nextSibling, index += 1) {
+        scannedChildren += 1;
+        if (scannedChildren > MAX_CSS_STACK_MATH_NODES) {
+          invalid = true;
+          break;
+        }
+        if (cssStackMathChildIsSelected(range, node, child, index)) value += visit(child, false);
+      }
       if (node.nodeType === 1) {
         const tag = (node.localName || '').toLowerCase();
         if ((tag === 'sup' || tag === 'sub') && value.trim()) {
@@ -9250,17 +10684,34 @@
       }
       return value;
     };
-    const source = visit(root).replace(/[\t\n\f\r ]+/g, ' ').trim();
-    return invalid || source.length > MAX_CSS_STACK_MATH_CHARACTERS ? '' : source;
+    const source = visit(root, true).replace(/[\t\n\f\r ]+/g, ' ').trim();
+    return invalid || source.length > MAX_CSS_STACK_MATH_CHARACTERS
+      ? CSS_STACK_MATH_DOM_UNREPRESENTABLE
+      : source;
   }
 
-  function cssStackMathBorderIsFractionRule(computed) {
-    const style = String(computed && computed.borderBottomStyle || '').trim().toLowerCase();
-    const width = String(computed && computed.borderBottomWidth || '').trim().toLowerCase();
-    const color = String(computed && computed.borderBottomColor || '').trim().toLowerCase();
+  function cssStackMathBorderIsFractionRule(computed, edge = 'bottom') {
+    const prefix = edge === 'top' ? 'borderTop' : 'borderBottom';
+    const style = String(computed && computed[prefix + 'Style'] || '').trim().toLowerCase();
+    const width = String(computed && computed[prefix + 'Width'] || '').trim().toLowerCase();
+    const color = String(computed && computed[prefix + 'Color'] || '').trim().toLowerCase();
     if (style !== 'solid' || cssColorIsFullyTransparent(color)) return false;
     const amount = Number.parseFloat(width);
     return (Number.isFinite(amount) && amount > 0) || ['thin', 'medium', 'thick'].includes(width);
+  }
+
+  function cssStackMathDedicatedRule(element, computed, rect, topRect, bottomRect) {
+    if (!element || !computed || !rect || !topRect || !bottomRect ||
+        cleanOrdinaryCharacters(element.textContent || '').trim()) return false;
+    const horizontalOverlap = Math.min(rect.right, topRect.right, bottomRect.right) -
+      Math.max(rect.left, topRect.left, bottomRect.left);
+    const maximumHeight = Math.max(4, Math.min(topRect.height, bottomRect.height) * 0.25);
+    if (horizontalOverlap <= 0 || rect.height > maximumHeight ||
+        rect.top < topRect.bottom - 1.5 || rect.bottom > bottomRect.top + 1.5) return false;
+    if (cssStackMathBorderIsFractionRule(computed, 'top') ||
+        cssStackMathBorderIsFractionRule(computed, 'bottom')) return true;
+    const background = String(computed.backgroundColor || '').trim().toLowerCase();
+    return Boolean(background && !cssColorIsFullyTransparent(background));
   }
 
   function cssStackMathPositiveRect(element) {
@@ -9305,14 +10756,41 @@
       inner.right <= outer.right + tolerance && inner.bottom <= outer.bottom + tolerance;
   }
 
-  function cssStackMathSourceAnalysis(source) {
+  function cssStackMathPunctuationIsSafe(source) {
+    const characters = Array.from(String(source || ''));
+    const operand = (value) => /[\p{L}\p{N}\p{M})\]}′″‴⁗!'"’]/u.test(value || '');
+    for (let index = 0; index < characters.length; index += 1) {
+      const character = characters[index];
+      if (/[?“”‘]/u.test(character)) return false;
+      if (/[!'"’]/u.test(character) && !operand(characters[index - 1])) return false;
+      if (character === ':' || character === ';') {
+        let next = index + 1;
+        while (next < characters.length && /\s/u.test(characters[next])) next += 1;
+        if (character === ':' && characters[next] === '=') next += 1;
+        while (next < characters.length && /\s/u.test(characters[next])) next += 1;
+        if (!operand(characters[index - 1]) ||
+            !/[\p{L}\p{N}(\[√∛∜+\-−]/u.test(characters[next] || '')) return false;
+      }
+    }
+    return true;
+  }
+
+  function cssStackMathSourceAnalysis(source, explicitSemantics = false) {
     let value = String(source || '');
+    // Backslashes in authored row text are escaped to private markers before
+    // this point. A real TeX command therefore comes only from an already
+    // authenticated nested visual stack and can be safely linearized for the
+    // prose-vs-math grammar check.
+    if (/\\(?:frac|lim|liminf|limsup|sum|prod|coprod|int|iint|iiint|oint)(?:\s|[_^{])/u.test(value)) {
+      const linear = latexToFaithful(value);
+      if (linear && !linear.includes('\\')) value = linear;
+    }
     // NFKC turns letter scripts such as `ᵢ` into ordinary adjacent letters
     // (`xi`), which would falsely look like an unknown prose word. Preserve
     // the script boundary structurally before compatibility normalization.
     value = decodeUnicodeScripts(value);
     try { value = value.normalize('NFKC'); } catch (_error) {}
-    if (!value || /[!?;:"'“”‘’]/u.test(value) || /\.$/u.test(value)) {
+    if (!value || !cssStackMathPunctuationIsSafe(value) || /\.$/u.test(value)) {
       return { valid: false, signal: false, numericOnly: false };
     }
     const words = Array.from(value.matchAll(/\p{L}+/gu), (match) => match[0]);
@@ -9326,17 +10804,26 @@
       // supplies explicit math semantics.
       const singleVariable = length <= 2 || /^[dⅆ][\p{L}]$/u.test(word);
       const known = CSS_STACK_MATH_WORDS.has(lower);
-      if (!singleVariable && !known && !/^[α-ωΑ-Ω]+$/u.test(word)) {
+      if (!singleVariable && !known && !/^[α-ωΑ-Ω]+$/u.test(word) && !explicitSemantics) {
         return { valid: false, signal: false, numericOnly: false };
       }
-      wordSignal = wordSignal || singleVariable || /^[α-ωΑ-Ω]+$/u.test(word);
+      wordSignal = wordSignal || singleVariable || explicitSemantics || /^[α-ωΑ-Ω]+$/u.test(word);
       proseLikeWord = proseLikeWord || (length > 2 && !CALCULATOR_FUNCTIONS.has(lower) &&
-        !/^(?:beta|gamma|rho|phi|chi)$/u.test(lower));
+        lower !== 'lim' && !/^(?:beta|gamma|rho|phi|chi)$/u.test(lower));
     }
     const structuralSignal = /[\p{N}^_+\-−×÷·⋅∗/*=<>≤≥≠≈≃≅≡∝∞∂∇∑∏∫±∓%√∛∜]/u.test(value);
     const numericOnly = /\p{N}/u.test(value) && !/\p{L}/u.test(value) &&
-      /^[\p{N}\p{M}\s.,+\-−–—×÷·⋅∗/*=<>≤≥≠≈±∓%()[\]_{}]+$/u.test(value);
-    const spacedTokens = /[\p{L}\p{N})\]]\s+[\p{L}\p{N}([]/u.test(value);
+      /^[\p{N}\p{M}\s.,+\-−–—×÷·⋅∗/*=<>≤≥≠≈±∓%()[\]_{}\ue200-\ue206]+$/u.test(value);
+    // A trusted nested bounded operator is a single mathematical head even
+    // though its readable form contains spaces inside the bound and before
+    // its body (`lim_(x → 0) f(x)`, `∑_(i = 1) a_i`). Raw page backslashes
+    // were escaped before this analysis, so these commands can only have come
+    // from an independently authenticated nested visual stack.
+    const spacingValue = value.replace(
+      /(?:\blim|[∑∏∫])(?:_\{[^{}]*\}|_\([^()]*\))?(?:\^\{[^{}]*\}|\^\([^()]*\))?\s*/gu,
+      'Ω'
+    );
+    const spacedTokens = /[\p{L}\p{N})\]]\s+[\p{L}\p{N}([]/u.test(spacingValue);
     const longWords = words.filter((word) => Array.from(word).length > 2);
     const functionExpression = longWords.length > 0 &&
       longWords.every((word) => CALCULATOR_FUNCTIONS.has(word.toLowerCase()));
@@ -9352,6 +10839,9 @@
 
   function cssStackMathPlainTailHasUnambiguousGrammar(source) {
     let value = String(source || '');
+    // Preserve the boundary between an identifier and a Unicode letter
+    // script before NFKC turns `aᵢ` into the unrelated two-letter word `ai`.
+    value = decodeUnicodeScripts(value);
     try { value = value.normalize('NFKC'); } catch (_error) {}
     const words = Array.from(value.matchAll(/\p{L}+/gu), (match) => match[0]);
     return words.every((word) => {
@@ -9363,33 +10853,51 @@
   }
 
   function cssStackMathSourceLooksLikeUiValue(source) {
-    let value = String(source || '').trim();
+    const authored = String(source || '').trim();
+    let value = authored;
     try { value = value.normalize('NFKC'); } catch (_error) {}
     value = value.replace(/\s+/gu, '');
-    return /^(?:v\d+(?:\.\d+)+|\d+(?:st|nd|rd|th)|[+\-\u2212]?(?:\d+(?:\.\d*)?|\.\d+)(?:kg|km|cm|mm|ms|hz|rpm|px|pt|em|rem))$/iu.test(value);
+    const authoredCompact = authored.replace(/\s+/gu, '');
+    return /^(?:v\d+(?:\.\d+)*|\d+(?:st|nd|rd|th)|[+\-\u2212]?(?:\d+(?:\.\d*)?|\.\d+)(?:kg|km|cm|mm|ms|hz|rpm|px|pt|em|rem))$/iu.test(value) ||
+      /^(?:am|pm|ok|no|yes|on|off|up|dn|down|go|us|eu|uk|kg|lb)$/iu.test(authoredCompact) ||
+      /^(?:[A-Z]{2,3}|[A-Z]\d+)$/u.test(authoredCompact);
   }
 
-  function cssStackMathHasNumericFractionSemantics(element) {
-    for (let current = element, depth = 0; current && depth < 5; current = current.parentElement, depth += 1) {
+  function cssStackMathHasNumericFractionSemantics(element, trustedElements) {
+    const candidates = [];
+    const seen = new Set();
+    const add = (candidate) => {
+      if (candidate && candidate.nodeType === 1 && !seen.has(candidate)) {
+        seen.add(candidate);
+        candidates.push(candidate);
+      }
+    };
+    // Keep the small outside-ancestor allowance for a source-less role=math
+    // label around a stack. Separately include every wrapper already audited
+    // by cssStackMathStackParts, regardless of neutral wrapper depth.
+    for (let current = element, depth = 0; current && depth < 5;
+      current = composedParentElement(current), depth += 1) {
+      add(current);
+    }
+    for (const candidate of trustedElements || []) add(candidate);
+    for (const current of candidates) {
       const role = String(current.getAttribute && current.getAttribute('role') || '').trim().toLowerCase();
-      if (role === 'math') return true;
-      if (current !== element) continue;
-      const classes = Array.from(element.classList || [], (value) => String(value).toLowerCase());
-      // `intbl` is the long-standing Math Is Fun inline-table fraction
-      // renderer. Generic names such as `fraction` are deliberately not
-      // trusted: dashboards and calendars commonly use them for numeric UI.
-      if (classes.includes('intbl')) return true;
+      const roleDescription = String(
+        current.getAttribute && current.getAttribute('aria-roledescription') || ''
+      ).trim().toLowerCase();
+      if (role === 'math' || /^(?:equation|formula|math|mathematics)$/u.test(roleDescription)) return true;
+      const classes = Array.from(current.classList || [], (value) => String(value).toLowerCase());
       if (classes.some((value) => /^(?:math-fraction|mathfrac|mfrac|stacked-math|stacked-fraction)$/u.test(value))) {
         return true;
       }
       for (const name of ['data-math', 'data-formula', 'data-equation']) {
-        const value = String(element.getAttribute && element.getAttribute(name) || '').trim().toLowerCase();
+        const value = String(current.getAttribute && current.getAttribute(name) || '').trim().toLowerCase();
         if (/^(?:1|true|math|formula|equation)$/u.test(value)) return true;
       }
-      for (const name of ['data-latex', 'data-tex']) {
-        const value = String(element.getAttribute && element.getAttribute(name) || '').trim();
-        if (value && value.length <= MAX_CSS_STACK_MATH_CHARACTERS && looksLikeLatex(value)) return true;
-      }
+      // Source-bearing data-latex/data-mathml nodes take the independent
+      // semantic-renderer path, where their source must agree with the visible
+      // formula. Merely having unrelated source text on an ancestor is not
+      // enough to authenticate an otherwise ambiguous numeric UI stack.
     }
     return false;
   }
@@ -9420,6 +10928,51 @@
       computed.getPropertyValue('unicode-bidi')) || '').trim().toLowerCase();
     return (!direction || direction === 'ltr') &&
       (!unicodeBidi || unicodeBidi === 'normal' || unicodeBidi === 'isolate');
+  }
+
+  function cssStackMathLinearRowLayoutIsSafe(row, computed, view, nestedDepth, descriptorContext) {
+    const display = String(computed && computed.display || '').trim().toLowerCase();
+    const directNodes = cssStackMathBoundedDirectNodes(row);
+    if (!directNodes) return false;
+    const meaningful = directNodes.filter((child) => {
+      if (child.nodeType === 8) return false;
+      if (child.nodeType === 3) return Boolean(cleanOrdinaryCharacters(child.nodeValue || '').trim());
+      return child.nodeType === 1 && (child.localName || '').toLowerCase() !== 'wbr';
+    });
+    if (/^(?:flex|inline-flex)$/u.test(display)) {
+      const direction = String(computed.flexDirection || '').trim().toLowerCase();
+      const wrap = String(computed.flexWrap || '').trim().toLowerCase();
+      if (direction && direction !== 'row' || wrap && wrap !== 'nowrap') return false;
+    } else if (/^(?:grid|inline-grid)$/u.test(display) && meaningful.length > 1) {
+      // Grid placement can reorder siblings independently of DOM order. A
+      // single transparent child is safe; multiple grid items need geometry
+      // semantics this linear serializer deliberately does not guess.
+      return false;
+    }
+    for (const child of meaningful) {
+      if (child.nodeType !== 1) continue;
+      if (cssStackMathCandidateShape(child) &&
+          cssStackMathRootDescriptor(
+            child,
+            child.ownerDocument,
+            nestedDepth + 1,
+            descriptorContext
+          )) continue;
+      let childComputed;
+      try { childComputed = view.getComputedStyle(child); } catch (_error) { return false; }
+      const childDisplay = String(childComputed.display || '').trim().toLowerCase();
+      const position = String(childComputed.position || '').trim().toLowerCase();
+      const order = Number.parseFloat(String(childComputed.order || '0'));
+      const gridColumn = String(childComputed.gridColumn || childComputed.getPropertyValue &&
+        childComputed.getPropertyValue('grid-column') || '').trim().toLowerCase();
+      const gridRow = String(childComputed.gridRow || childComputed.getPropertyValue &&
+        childComputed.getPropertyValue('grid-row') || '').trim().toLowerCase();
+      if (!['inline', 'inline-block', 'contents'].includes(childDisplay) ||
+          /^(?:relative|sticky|absolute|fixed)$/u.test(position) ||
+          (Number.isFinite(order) && order !== 0) ||
+          (gridColumn && gridColumn !== 'auto') || (gridRow && gridRow !== 'auto')) return false;
+    }
+    return true;
   }
 
   function cssStackMathSourceDelimitersBalanced(source) {
@@ -9459,7 +11012,7 @@
   }
 
   function cssStackMathAncestorLayoutIsSafe(element, view) {
-    for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) {
+    for (let ancestor = element; ancestor; ancestor = composedParentElement(ancestor)) {
       const editable = String(ancestor.getAttribute && ancestor.getAttribute('contenteditable') || '').toLowerCase();
       if (ancestor.isContentEditable === true || (ancestor.hasAttribute &&
           ancestor.hasAttribute('contenteditable') && editable !== 'false')) return false;
@@ -9501,7 +11054,7 @@
   }
 
   function cssStackMathClippingAncestorsExpose(element, visualRect, view) {
-    for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) {
+    for (let ancestor = element; ancestor; ancestor = composedParentElement(ancestor)) {
       let computed;
       try { computed = view.getComputedStyle(ancestor); } catch (_error) { return false; }
       const value = (name, property) => String(
@@ -9516,40 +11069,110 @@
     return true;
   }
 
-  function cssStackMathRootDescriptor(element, documentObject) {
-    if (!element || element.nodeType !== 1 || !documentObject) return null;
-    const rootTag = (element.localName || '').toLowerCase();
-    if (!['span', 'div', 'var'].includes(rootTag) || element.children.length !== 2 ||
-        element.hasAttribute('contenteditable')) return null;
-    for (const child of Array.from(element.childNodes || [])) {
-      if (child.nodeType === 3 && cleanOrdinaryCharacters(child.nodeValue || '').trim()) return null;
-      if (child.nodeType !== 1 && child.nodeType !== 3) return null;
+  function cssStackMathRootDescriptor(element, documentObject, nestedDepth = 0, contextInput) {
+    if (!element || element.nodeType !== 1 || !documentObject || nestedDepth > MAX_MATHML_DEPTH) return null;
+    const descriptorContext = contextInput || createCssStackMathDescriptorContext();
+    const cache = descriptorContext.descriptorCache;
+    if (cache.has(element)) {
+      const cached = cache.get(element);
+      return cached === CSS_STACK_MATH_DESCRIPTOR_PENDING ? null : cached;
     }
-    const rows = Array.from(element.children || []);
-    if (rows.some((row) => !CSS_STACK_MATH_INLINE_TAGS.has((row.localName || '').toLowerCase()))) return null;
+    cache.set(element, CSS_STACK_MATH_DESCRIPTOR_PENDING);
+    try {
+      const descriptor = cssStackMathRootDescriptorUncached(
+        element,
+        documentObject,
+        nestedDepth,
+        descriptorContext
+      );
+      cache.set(element, descriptor || null);
+      return descriptor;
+    } catch (error) {
+      cache.delete(element);
+      throw error;
+    }
+  }
+
+  function cssStackMathRootDescriptorUncached(element, documentObject, nestedDepth, descriptorContext) {
+    if (!element || element.nodeType !== 1 || !documentObject || nestedDepth > MAX_MATHML_DEPTH) return null;
+    if (!cssStackMathElementTagIsSafe(element, true) || element.hasAttribute('contenteditable')) return null;
+    const directNodes = cssStackMathBoundedDirectNodes(element);
+    if (!directNodes) return null;
+    for (const child of directNodes) {
+      if (child.nodeType === 3 && cleanOrdinaryCharacters(child.nodeValue || '').trim()) return null;
+      if (![1, 3, 8].includes(child.nodeType)) return null;
+    }
+    const stackShape = cssStackMathStackParts(element);
+    if (stackShape.overBudget) return null;
+    const parts = stackShape.parts;
+    if (![2, 3].includes(parts.length)) return null;
+    const emptyParts = parts.filter((part) => !cleanOrdinaryCharacters(part.textContent || '').trim());
+    const ruleElement = parts.length === 3 && emptyParts.length === 1 ? emptyParts[0] : null;
+    if (parts.length === 3 && !ruleElement) return null;
+    if (ruleElement && !cssStackMathElementTagIsSafe(ruleElement, false)) return null;
+    let rows = ruleElement ? parts.filter((part) => part !== ruleElement) : parts;
+    if (rows.some((row) => !cssStackMathElementTagIsSafe(row, false))) return null;
     const view = documentObject.defaultView;
     if (!view || typeof view.getComputedStyle !== 'function') return null;
     if (!cssStackMathAncestorLayoutIsSafe(element, view)) return null;
 
     let rootComputed;
-    const rowComputed = [];
+    let rowEntries = [];
+    let ruleComputed = null;
+    let ruleRect = null;
     try {
       rootComputed = view.getComputedStyle(element);
-      if (!['inline-table', 'table'].includes(String(rootComputed.display || '').toLowerCase()) ||
+      if (!CSS_STACK_MATH_LAYOUT_DISPLAYS.has(String(rootComputed.display || '').toLowerCase()) ||
           computedStyleHasUnsafeVisibleLayout(rootComputed, false) ||
           !cssStackMathDirectionIsSafe(rootComputed) ||
           !cssStackMathGeneratedContentIsSafe(element, view)) return null;
       for (const row of rows) {
         const computed = view.getComputedStyle(row);
-        if (String(computed.display || '').toLowerCase() !== 'table-row' ||
+        const display = String(computed.display || '').toLowerCase();
+        if (!CSS_STACK_MATH_LAYOUT_DISPLAYS.has(display) ||
             computedStyleHasUnsafeVisibleLayout(computed, false) ||
             !cssStackMathDirectionIsSafe(computed) ||
             !cssStackMathGeneratedContentIsSafe(row, view)) return null;
-        rowComputed.push(computed);
+        const rect = cssStackMathPositiveRect(row);
+        if (!rect) return null;
+        rowEntries.push({ row, computed, rect });
+      }
+      if (ruleElement) {
+        ruleComputed = view.getComputedStyle(ruleElement);
+        ruleRect = cssStackMathPositiveRect(ruleElement);
+        if (!ruleRect || computedStyleHasUnsafeVisibleLayout(ruleComputed, false) ||
+            !cssStackMathDirectionIsSafe(ruleComputed) ||
+            !cssStackMathGeneratedContentIsSafe(ruleElement, view)) return null;
+      }
+      for (const wrapper of stackShape.wrappers) {
+        const computed = view.getComputedStyle(wrapper);
+        const display = String(computed.display || '').toLowerCase();
+        if (!CSS_STACK_MATH_LAYOUT_DISPLAYS.has(display) ||
+            computedStyleHasUnsafeVisibleLayout(computed, false) ||
+            !cssStackMathDirectionIsSafe(computed) ||
+            !cssStackMathGeneratedContentIsSafe(wrapper, view)) return null;
       }
     } catch (_error) {
       return null;
     }
+
+    rowEntries.sort((left, right) =>
+      (left.rect.top + left.rect.height / 2) - (right.rect.top + right.rect.height / 2));
+    rows = rowEntries.map((entry) => entry.row);
+    const rowComputed = rowEntries.map((entry) => entry.computed);
+    const topRect = rowEntries[0].rect;
+    const bottomRect = rowEntries[1].rect;
+    const overlap = Math.min(topRect.right, bottomRect.right) - Math.max(topRect.left, bottomRect.left);
+    const rowOverlapTolerance = Math.min(1.5, Math.min(topRect.height, bottomRect.height) * 0.08);
+    if (overlap <= 0 || bottomRect.top < topRect.bottom - rowOverlapTolerance) return null;
+    if (!rows.every((row, index) =>
+      cssStackMathLinearRowLayoutIsSafe(
+        row,
+        rowComputed[index],
+        view,
+        nestedDepth,
+        descriptorContext
+      ))) return null;
 
     let visited = 0;
     const stack = [...rows];
@@ -9558,13 +11181,19 @@
       visited += 1;
       if (visited > MAX_CSS_STACK_MATH_NODES) return null;
       if (!current || current.nodeType !== 1) return null;
-      const tag = (current.localName || '').toLowerCase();
-      if (!CSS_STACK_MATH_INLINE_TAGS.has(tag) || current.hasAttribute('hidden') ||
+      if (!cssStackMathElementTagIsSafe(current, false) || current.hasAttribute('hidden') ||
           current.hasAttribute('contenteditable') || current.getAttribute('aria-hidden') === 'true' ||
           current.querySelector && current.querySelector('a,button,input,select,textarea,details,summary,[contenteditable]')) {
         return null;
       }
       if (current !== rows[0] && current !== rows[1]) {
+        if (cssStackMathCandidateShape(current) &&
+            cssStackMathRootDescriptor(
+              current,
+              documentObject,
+              nestedDepth + 1,
+              descriptorContext
+            )) continue;
         try {
           const computed = view.getComputedStyle(current);
           const display = String(computed && computed.display || '').toLowerCase();
@@ -9579,20 +11208,34 @@
       for (let child = current.lastElementChild; child; child = child.previousElementSibling) stack.push(child);
     }
 
-    const topSource = cssStackMathDomSource(rows[0]);
-    const bottomSource = cssStackMathDomSource(rows[1]);
-    const linearSource = cssStackMathDomSource(element);
-    if (!topSource || !bottomSource || !linearSource ||
+    const topSource = cssStackMathDomSource(rows[0], null, nestedDepth, descriptorContext);
+    const bottomSource = cssStackMathDomSource(rows[1], null, nestedDepth, descriptorContext);
+    if (topSource === CSS_STACK_MATH_DOM_UNREPRESENTABLE ||
+        bottomSource === CSS_STACK_MATH_DOM_UNREPRESENTABLE) return null;
+    const linearSource = topSource + bottomSource;
+    if (!topSource || !bottomSource ||
         !cssStackMathSourceDelimitersBalanced(topSource) ||
         !cssStackMathSourceDelimitersBalanced(bottomSource)) return null;
-    const fraction = cssStackMathBorderIsFractionRule(rowComputed[0]);
+    const dedicatedRule = ruleElement && cssStackMathDedicatedRule(
+      ruleElement, ruleComputed, ruleRect, topRect, bottomRect
+    );
+    if (ruleElement && !dedicatedRule) return null;
+    const fraction = cssStackMathBorderIsFractionRule(rowComputed[0], 'bottom') ||
+      cssStackMathBorderIsFractionRule(rowComputed[1], 'top') || Boolean(dedicatedRule);
     if (fraction && (!cssStackMathSourceHasCompleteOperands(topSource) ||
         !cssStackMathSourceHasCompleteOperands(bottomSource))) return null;
-    const topAnalysis = cssStackMathSourceAnalysis(topSource);
-    const bottomAnalysis = cssStackMathSourceAnalysis(bottomSource);
+    // A neutral host wrapper and its innermost visual owner describe the same
+    // two rows. Semantic attributes commonly live on that inner owner, so an
+    // arbitrary outer tag must neither erase nor invent their authentication.
+    const explicitSemantics = cssStackMathHasNumericFractionSemantics(
+      stackShape.container,
+      [element, ...stackShape.wrappers]
+    );
+    const explicitFractionSemantics = fraction && explicitSemantics;
+    const topAnalysis = cssStackMathSourceAnalysis(topSource, explicitSemantics);
+    const bottomAnalysis = cssStackMathSourceAnalysis(bottomSource, explicitSemantics);
     if (!topAnalysis.valid || !bottomAnalysis.valid) return null;
     if (fraction ? (!topAnalysis.signal || !bottomAnalysis.signal) : !bottomAnalysis.signal) return null;
-    const explicitFractionSemantics = fraction && cssStackMathHasNumericFractionSemantics(element);
     if (fraction && !explicitFractionSemantics && (
       cssStackMathSourceLooksLikeUiValue(topSource) || cssStackMathSourceLooksLikeUiValue(bottomSource)
     )) return null;
@@ -9607,15 +11250,6 @@
     const operator = CSS_STACK_MATH_OPERATORS.get(operatorKey);
     if (!fraction && !operator) return null;
 
-    const topRect = cssStackMathPositiveRect(rows[0]);
-    const bottomRect = cssStackMathPositiveRect(rows[1]);
-    if (!topRect || !bottomRect) return null;
-    const overlap = Math.min(topRect.right, bottomRect.right) - Math.max(topRect.left, bottomRect.left);
-    const topCenter = topRect.top + topRect.height / 2;
-    const bottomCenter = bottomRect.top + bottomRect.height / 2;
-    const rowOverlapTolerance = Math.min(1.5, Math.min(topRect.height, bottomRect.height) * 0.08);
-    if (overlap <= 0 || bottomCenter <= topCenter ||
-        bottomRect.top < topRect.bottom - rowOverlapTolerance) return null;
     const visualRect = cssStackMathUnionRect(topRect, bottomRect);
     if (!visualRect || !cssStackMathClippingAncestorsExpose(element, visualRect, view)) return null;
 
@@ -9629,36 +11263,61 @@
       topSource,
       bottomSource,
       linearSource,
+      ruleElement,
+      layoutDepth: stackShape.wrappers.length,
       operator: operator || '',
+      explicitSemantics,
+      nestedBoundedOperator: fraction && /\\(?:lim|sum|prod|int)_\{/u.test(linearSource),
       visualRect
     };
   }
 
   function cssStackMathCandidateShape(element) {
-    if (!element || element.nodeType !== 1 || element.children.length !== 2) return false;
-    for (const child of Array.from(element.childNodes || [])) {
+    if (!element || element.nodeType !== 1 || !cssStackMathElementTagIsSafe(element, true)) return false;
+    const stackShape = cssStackMathStackParts(element);
+    if (stackShape.overBudget) return false;
+    const parts = stackShape.parts;
+    if (![2, 3].includes(parts.length)) return false;
+    const directNodes = cssStackMathBoundedDirectNodes(element);
+    if (!directNodes) return false;
+    for (const child of directNodes) {
       if (child.nodeType === 3 && cleanOrdinaryCharacters(child.nodeValue || '').trim()) return false;
-      if (child.nodeType !== 1 && child.nodeType !== 3) return false;
+      if (![1, 3, 8].includes(child.nodeType)) return false;
     }
+    if (parts.length === 3 && parts.filter((part) =>
+      !cleanOrdinaryCharacters(part.textContent || '').trim()).length !== 1) return false;
     return true;
   }
 
-  function cssStackMathPlausibleVisualRoot(element, documentObject) {
-    if (!element || !documentObject || !cssStackMathCandidateShape(element) ||
-        !['span', 'div', 'var'].includes((element.localName || '').toLowerCase())) return false;
-    const rows = Array.from(element.children || []);
+  function cssStackMathPlausibleVisualRoot(element, documentObject, allowUnruledNestedStack = false) {
+    if (!element || !documentObject || !cssStackMathCandidateShape(element)) return false;
+    const parts = cssStackMathStackParts(element).parts;
+    const emptyParts = parts.filter((part) => !cleanOrdinaryCharacters(part.textContent || '').trim());
+    const ruleElement = parts.length === 3 && emptyParts.length === 1 ? emptyParts[0] : null;
+    if (parts.length === 3 && !ruleElement) return false;
+    const rows = ruleElement ? parts.filter((part) => part !== ruleElement) : parts;
     const view = documentObject.defaultView;
     if (!view || typeof view.getComputedStyle !== 'function') return false;
     try {
-      const rootComputed = view.getComputedStyle(element);
       const rowComputed = rows.map((row) => view.getComputedStyle(row));
-      if (!['inline-table', 'table'].includes(String(rootComputed.display || '').toLowerCase()) ||
-          rowComputed.some((computed) => String(computed.display || '').toLowerCase() !== 'table-row')) return false;
-      const topText = cleanOrdinaryCharacters(rows[0].textContent || '').replace(/\s+/g, '').toLowerCase();
-      if (!cssStackMathBorderIsFractionRule(rowComputed[0]) && topText !== 'lim') return false;
-      const topRect = cssStackMathPositiveRect(rows[0]);
-      const bottomRect = cssStackMathPositiveRect(rows[1]);
+      const entries = rows.map((row, index) => ({
+        row,
+        computed: rowComputed[index],
+        rect: cssStackMathPositiveRect(row)
+      })).sort((left, right) => left.rect && right.rect
+        ? (left.rect.top + left.rect.height / 2) - (right.rect.top + right.rect.height / 2)
+        : 0);
+      const topRect = entries[0].rect;
+      const bottomRect = entries[1].rect;
       if (!topRect || !bottomRect) return false;
+      const topText = cleanOrdinaryCharacters(entries[0].row.textContent || '')
+        .replace(/\s+/g, '').toLowerCase();
+      const ruleComputed = ruleElement ? view.getComputedStyle(ruleElement) : null;
+      const ruleRect = ruleElement ? cssStackMathPositiveRect(ruleElement) : null;
+      const fractionRule = cssStackMathBorderIsFractionRule(entries[0].computed, 'bottom') ||
+        cssStackMathBorderIsFractionRule(entries[1].computed, 'top') ||
+        (ruleElement && cssStackMathDedicatedRule(ruleElement, ruleComputed, ruleRect, topRect, bottomRect));
+      if (!fractionRule && !CSS_STACK_MATH_OPERATORS.has(topText) && !allowUnruledNestedStack) return false;
       const horizontalOverlap = Math.min(topRect.right, bottomRect.right) - Math.max(topRect.left, bottomRect.left);
       return horizontalOverlap > 0 && bottomRect.top >= topRect.bottom - 1.5;
     } catch (_error) {
@@ -9666,16 +11325,80 @@
     }
   }
 
+  function cssStackMathSelectedDescriptorSource(descriptor, range, nestedDepth = 0, contextInput) {
+    if (!descriptor || !range || nestedDepth > MAX_MATHML_DEPTH) {
+      return CSS_STACK_MATH_DOM_UNREPRESENTABLE;
+    }
+    const descriptorContext = contextInput || createCssStackMathDescriptorContext();
+    const selectedTopSource = cssStackMathDomSource(
+      descriptor.rows[0],
+      range,
+      nestedDepth,
+      descriptorContext
+    );
+    const selectedBottomSource = cssStackMathDomSource(
+      descriptor.rows[1],
+      range,
+      nestedDepth,
+      descriptorContext
+    );
+    if (selectedTopSource === CSS_STACK_MATH_DOM_UNREPRESENTABLE ||
+        selectedBottomSource === CSS_STACK_MATH_DOM_UNREPRESENTABLE) {
+      return CSS_STACK_MATH_DOM_UNREPRESENTABLE;
+    }
+    const selectedSource = selectedTopSource + selectedBottomSource;
+    if (!selectedSource) return {
+      selectedSource: '', selectedTopSource: '', selectedBottomSource: '', selectedSemanticSource: ''
+    };
+    const crossRowSelection = Boolean(selectedTopSource && selectedBottomSource);
+    for (const selectedPart of [selectedTopSource, selectedBottomSource]) {
+      if (!selectedPart) continue;
+      const unicodeScriptCharacters = new Set([
+        ...Object.values(SUPERSCRIPTS), ...Object.values(SUBSCRIPTS),
+        'ₔ', 'ᵦ', 'ᵧ', 'ᵨ', 'ᵩ', 'ᵪ'
+      ]);
+      const isolatedScript = !crossRowSelection && (
+        /^[\^_]\{[^{}]+\}$/u.test(selectedPart) ||
+        (Array.from(selectedPart).length > 0 &&
+          Array.from(selectedPart).every((character) => unicodeScriptCharacters.has(character)))
+      );
+      if (!cssStackMathSourceDelimitersBalanced(selectedPart) ||
+          (!isolatedScript && (!cssStackMathSourceHasCompleteOperands(selectedPart) ||
+            cssStackMathHasDanglingScript(cssStackMathUnicodeScriptsToLatex(selectedPart))))) {
+        return CSS_STACK_MATH_DOM_UNREPRESENTABLE;
+      }
+    }
+    let selectedSemanticSource = '';
+    if (selectedTopSource && selectedBottomSource) {
+      if (descriptor.kind === 'fraction') {
+        selectedSemanticSource = '\\frac{' + selectedTopSource + '}{' + selectedBottomSource + '}';
+      } else if (selectedTopSource === descriptor.topSource) {
+        selectedSemanticSource = descriptor.operator + '_{' + selectedBottomSource + '}';
+      }
+    } else if (selectedTopSource) {
+      selectedSemanticSource = descriptor.kind === 'operator-under' &&
+        selectedTopSource === descriptor.topSource
+        ? descriptor.operator
+        : selectedTopSource;
+    } else selectedSemanticSource = selectedBottomSource;
+    if (!selectedSemanticSource) return CSS_STACK_MATH_DOM_UNREPRESENTABLE;
+    return { selectedSource, selectedTopSource, selectedBottomSource, selectedSemanticSource };
+  }
+
   function cssStackMathDiscoveryForRange(range, documentObject) {
     if (!range || !documentObject || !range.commonAncestorContainer) {
       return { values: [], overBudget: false };
     }
-    const common = range.commonAncestorContainer.nodeType === 1
-      ? range.commonAncestorContainer
-      : range.commonAncestorContainer.parentElement;
+    const common = rangeTraversalRoot(range);
     if (!common) return { values: [], overBudget: false };
     const candidates = new Set();
-    const stack = [{ element: common, depth: 0 }];
+    const stack = [];
+    if (common.nodeType === 1) stack.push({ element: common, depth: 0 });
+    else {
+      for (let child = common.lastElementChild; child; child = child.previousElementSibling) {
+        stack.push({ element: child, depth: 0 });
+      }
+    }
     let inspected = 0;
     while (stack.length) {
       const current = stack.pop();
@@ -9701,59 +11424,57 @@
       }
     }
     if (candidates.size > MAX_CSS_STACK_MATH_ROOTS) return { values: [], overBudget: true };
+    const descriptorContext = createCssStackMathDescriptorContext();
     const descriptors = new Map();
-    let rejectedVisualStack = false;
+    const rejectedVisualStacks = [];
     for (const candidate of candidates) {
-      const descriptor = cssStackMathRootDescriptor(candidate, documentObject);
+      const descriptor = cssStackMathRootDescriptor(candidate, documentObject, 0, descriptorContext);
       if (!descriptor) {
-        rejectedVisualStack = rejectedVisualStack || cssStackMathPlausibleVisualRoot(candidate, documentObject);
+        if (cssStackMathPlausibleVisualRoot(candidate, documentObject)) rejectedVisualStacks.push(candidate);
         continue;
       }
-      const selectedSource = cssStackMathDomSource(candidate, range);
-      if (!selectedSource) continue;
-      const selectedTopSource = cssStackMathDomSource(descriptor.rows[0], range);
-      const selectedBottomSource = cssStackMathDomSource(descriptor.rows[1], range);
-      const crossRowSelection = Boolean(selectedTopSource && selectedBottomSource);
-      for (const selectedPart of [selectedTopSource, selectedBottomSource]) {
-        if (!selectedPart) continue;
-        const unicodeScriptCharacters = new Set([
-          ...Object.values(SUPERSCRIPTS), ...Object.values(SUBSCRIPTS),
-          'ₔ', 'ᵦ', 'ᵧ', 'ᵨ', 'ᵩ', 'ᵪ'
-        ]);
-        const isolatedScript = !crossRowSelection && (
-          /^[\^_]\{[^{}]+\}$/u.test(selectedPart) ||
-          (Array.from(selectedPart).length > 0 &&
-            Array.from(selectedPart).every((character) => unicodeScriptCharacters.has(character)))
-        );
-        if (!cssStackMathSourceDelimitersBalanced(selectedPart) ||
-            (!isolatedScript && (!cssStackMathSourceHasCompleteOperands(selectedPart) ||
-              cssStackMathHasDanglingScript(cssStackMathUnicodeScriptsToLatex(selectedPart))))) {
-          return { values: [], overBudget: false, failed: true };
-        }
+      const selected = cssStackMathSelectedDescriptorSource(descriptor, range, 0, descriptorContext);
+      if (selected === CSS_STACK_MATH_DOM_UNREPRESENTABLE) {
+        return { values: [], overBudget: false, failed: true };
       }
-      let selectedSemanticSource = '';
-      if (selectedTopSource && selectedBottomSource) {
-        if (descriptor.kind === 'fraction') {
-          selectedSemanticSource = '\\frac{' + selectedTopSource + '}{' + selectedBottomSource + '}';
-        } else if (selectedTopSource === descriptor.topSource) {
-          selectedSemanticSource = descriptor.operator + '_{' + selectedBottomSource + '}';
-        }
-      } else if (selectedTopSource) {
-        selectedSemanticSource = descriptor.kind === 'operator-under' &&
-          selectedTopSource === descriptor.topSource
-          ? descriptor.operator
-          : selectedTopSource;
-      } else selectedSemanticSource = selectedBottomSource;
-      if (!selectedSemanticSource) return { values: [], overBudget: false, failed: true };
-      descriptors.set(candidate, {
+      const { selectedSource, selectedTopSource, selectedBottomSource, selectedSemanticSource } = selected;
+      if (!selectedSource) continue;
+      const value = {
         ...descriptor,
+        aliases: [candidate],
         selectedSource,
         selectedTopSource,
         selectedBottomSource,
         selectedSemanticSource
-      });
+      };
+      const duplicate = Array.from(descriptors.entries()).find(([, existing]) =>
+        existing.rows[0] === descriptor.rows[0] && existing.rows[1] === descriptor.rows[1]);
+      if (duplicate) {
+        // Keep the innermost element that actually owns the rows as the
+        // replacement root, but remember every independently authenticated
+        // wrapper as a layout alias. Replacing a semantic wrapper such as a
+        // table cell would create invalid rich HTML; merely exempting its
+        // already-audited layout preserves that surrounding structure.
+        if ((duplicate[1].layoutDepth || 0) <= (descriptor.layoutDepth || 0)) {
+          duplicate[1].aliases.push(candidate);
+          continue;
+        }
+        value.aliases.push(...(duplicate[1].aliases || [duplicate[0]]));
+        descriptors.delete(duplicate[0]);
+      }
+      descriptors.set(candidate, value);
     }
-    if (rejectedVisualStack) return { values: [], overBudget: false, failed: true };
+    const rejectedIsAuthenticatedAlias = (candidate) => {
+      const parts = cssStackMathStackParts(candidate).parts;
+      const emptyParts = parts.filter((part) => !cleanOrdinaryCharacters(part.textContent || '').trim());
+      const ruleElement = parts.length === 3 && emptyParts.length === 1 ? emptyParts[0] : null;
+      const rows = ruleElement ? parts.filter((part) => part !== ruleElement) : parts;
+      return rows.length === 2 && Array.from(descriptors.values()).some((descriptor) =>
+        descriptor.rows.length === 2 && rows.every((row) => descriptor.rows.includes(row)));
+    };
+    if (rejectedVisualStacks.some((candidate) => !rejectedIsAuthenticatedAlias(candidate))) {
+      return { values: [], overBudget: false, failed: true };
+    }
     const roots = sortMathRoots(Array.from(descriptors.keys()));
     return { values: roots.map((root) => descriptors.get(root)), overBudget: false };
   }
@@ -9765,14 +11486,26 @@
   }
 
   function cssStackMathRootsAreAdjacent(left, right) {
-    if (!left || !right || left.parentNode !== right.parentNode) return false;
-    for (let node = left.nextSibling; node && node !== right; node = node.nextSibling) {
-      if (node.nodeType === 8) continue;
-      if (node.nodeType === 3 && !cleanOrdinaryCharacters(node.nodeValue || '').trim()) continue;
-      if (node.nodeType === 1 && (node.localName || '').toLowerCase() === 'wbr') continue;
+    if (!left || !right || !left.compareDocumentPosition ||
+        !(left.compareDocumentPosition(right) & 4)) return false;
+    const documentObject = left.ownerDocument;
+    if (!documentObject || documentObject !== right.ownerDocument || !documentObject.createRange) return false;
+    try {
+      const between = documentObject.createRange();
+      between.setStartAfter(left);
+      between.setEndBefore(right);
+      if (cleanOrdinaryCharacters(between.toString()).trim()) return false;
+      const fragment = between.cloneContents();
+      for (const element of Array.from(fragment.querySelectorAll ? fragment.querySelectorAll('*') : [])) {
+        const tag = (element.localName || '').toLowerCase();
+        if (tag === 'wbr') continue;
+        if (!cssStackMathElementTagIsSafe(element, true) ||
+            element.matches('a,button,input,select,textarea,details,summary,[contenteditable],br,hr')) return false;
+      }
+      return true;
+    } catch (_error) {
       return false;
     }
-    return Boolean(left.compareDocumentPosition(right) & 4);
   }
 
   function cssStackMathRootsShareVisualLine(left, right) {
@@ -10084,7 +11817,7 @@
         while (commandStart > 0 && /[A-Za-z]/u.test(source[commandStart - 1])) commandStart -= 1;
         if (commandStart > 0 && source[commandStart - 1] === '\\') {
           const command = source.slice(commandStart, previousEnd);
-          if (!['lim', 'sum', 'prod', 'int'].includes(command)) return true;
+          if (!CSS_STACK_MATH_OPERATOR_COMMANDS.has(command)) return true;
         }
       }
     }
@@ -10101,31 +11834,101 @@
       // expression. Native copy preserves the visible bound instead of
       // silently reducing `lim_(x→1)` to the unrelated identifier `lim`.
       if (options && options.incompleteBoundedOperator) return '';
-      return latexToCalculator(latex);
+      if (options && options.nestedBoundedOperator) return '';
+      return latexToCalculator(latex, {
+        preserveLongIdentifiers: Boolean(options && options.preserveLongIdentifiers)
+      });
     }
     return latexToFaithful(latex);
   }
 
+  function cssStackMathIgnoredFollowingNode(node, range) {
+    if (!node || node.nodeType === 8) return true;
+    if (node.nodeType === 1 && (node.localName || '').toLowerCase() === 'wbr') return true;
+    return node.nodeType === 3 && !cssStackMathTextSlice(node, range).trim();
+  }
+
+  function cssStackMathMeaningfulWrapperChildren(element, range) {
+    const meaningful = [];
+    let inspected = 0;
+    for (let child = element && element.firstChild; child; child = child.nextSibling) {
+      inspected += 1;
+      if (inspected > MAX_CSS_STACK_MATH_NODES) return [null, null];
+      if (cssStackMathIgnoredFollowingNode(child, range)) continue;
+      meaningful.push(child);
+      if (meaningful.length > 1) break;
+    }
+    return meaningful;
+  }
+
+  function cssStackMathTransparentWrapper(element, range) {
+    if (!element || element.nodeType !== 1 || !cssStackMathElementTagIsSafe(element, true) ||
+        ['sub', 'sup'].includes((element.localName || '').toLowerCase()) ||
+        element.matches('a,button,input,select,textarea,details,summary,[contenteditable],br,hr') ||
+        isVisuallyHiddenElement(element) ||
+        cssStackMathMeaningfulWrapperChildren(element, range).length !== 1) return false;
+    try {
+      const view = element.ownerDocument && element.ownerDocument.defaultView;
+      const computed = view && view.getComputedStyle && view.getComputedStyle(element);
+      const display = String(computed && computed.display || '').trim().toLowerCase();
+      return !display || ['inline', 'inline-block', 'contents'].includes(display);
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function cssStackMathFollowingLeaf(anchor, range) {
+    let current = anchor;
+    const boundary = range && range.commonAncestorContainer;
+    for (let depth = 0; current && depth < 16; depth += 1) {
+      const separators = [];
+      let candidate = current.nextSibling;
+      while (candidate && cssStackMathIgnoredFollowingNode(candidate, range)) {
+        separators.push(candidate);
+        candidate = candidate.nextSibling;
+      }
+      if (candidate) {
+        const wrappers = [];
+        let leaf = candidate;
+        while (leaf && leaf.nodeType === 1 && cssStackMathTransparentWrapper(leaf, range)) {
+          wrappers.push(leaf);
+          leaf = cssStackMathMeaningfulWrapperChildren(leaf, range)[0] || null;
+        }
+        if (!leaf || (range && !rangeIntersects(range, leaf))) return null;
+        const consumed = wrappers.length ? wrappers[0] : leaf;
+        return {
+          leaf,
+          resume: consumed,
+          nodes: [...separators, consumed]
+        };
+      }
+      const parent = current.parentNode;
+      if (!parent || parent === boundary || parent.nodeType !== 1 ||
+          !cssStackMathTransparentWrapper(parent, range)) return null;
+      current = parent;
+    }
+    return null;
+  }
+
   function cssStackMathSelectedFollowingScripts(root, range) {
     const nodes = [];
-    let pendingSeparators = [];
     let source = '';
     const kinds = new Set();
-    for (let node = root && root.nextSibling; node;) {
-      if (node.nodeType === 8 || (node.nodeType === 1 && (node.localName || '').toLowerCase() === 'wbr')) {
-        pendingSeparators.push(node);
-        node = node.nextSibling;
-        continue;
-      }
-      if (node.nodeType === 3 && !cssStackMathTextSlice(node, range).trim()) {
-        pendingSeparators.push(node);
-        node = node.nextSibling;
-        continue;
-      }
+    let anchor = root;
+    while (anchor) {
+      const following = cssStackMathFollowingLeaf(anchor, range);
+      if (!following) break;
+      const node = following.leaf;
       if (node.nodeType !== 1 || !['sup', 'sub'].includes((node.localName || '').toLowerCase())) break;
       const selected = cssStackMathDomSource(node, range);
+      if (selected === CSS_STACK_MATH_DOM_UNREPRESENTABLE) {
+        return { invalid: true, nodes: [], source: '' };
+      }
       if (!selected) break;
       const full = cssStackMathDomSource(node);
+      if (full === CSS_STACK_MATH_DOM_UNREPRESENTABLE) {
+        return { invalid: true, nodes: [], source: '' };
+      }
       if (!full || selected !== full) return { invalid: true, nodes: [], source: '' };
       const kind = (node.localName || '').toLowerCase();
       const wrapper = full.match(/^([\^_])\{([\s\S]*)\}$/u);
@@ -10135,11 +11938,9 @@
           !cssStackMathSourceHasCompleteOperands(inner)) break;
       if (kinds.has(kind)) return { invalid: true, nodes: [], source: '' };
       kinds.add(kind);
-      nodes.push(...pendingSeparators);
-      pendingSeparators = [];
-      nodes.push(node);
+      nodes.push(...following.nodes);
       source += full;
-      node = node.nextSibling;
+      anchor = following.resume;
     }
     return { invalid: false, nodes, source };
   }
@@ -10149,14 +11950,8 @@
   }
 
   function cssStackMathSelectedFollowingProduct(anchor, range) {
-    let node = anchor && anchor.nextSibling;
-    const separators = [];
-    while (node && (node.nodeType === 8 ||
-      (node.nodeType === 1 && (node.localName || '').toLowerCase() === 'wbr') ||
-      (node.nodeType === 3 && !cssStackMathTextSlice(node, range).trim()))) {
-      separators.push(node);
-      node = node.nextSibling;
-    }
+    const following = cssStackMathFollowingLeaf(anchor, range);
+    const node = following && following.leaf;
     if (!node || node.nodeType !== 3) return { invalid: false, node: null, nodes: [], source: '' };
     const selected = cssStackMathTextSlice(node, range);
     const trimmed = selected.trim();
@@ -10181,16 +11976,15 @@
       CALCULATOR_FUNCTIONS.has(name.toLowerCase()) ? '\\' + name.toLowerCase() + ' ' : value);
     return {
       invalid: false,
-      node,
-      nodes: [...separators, node],
+      node: following.resume,
+      nodes: following.nodes,
       source: (match ? match[1] : '') + canonicalOperand
     };
   }
 
   function cssStackMathSelectedFollowingLimitBody(anchor, range) {
-    let node = anchor && anchor.nextSibling;
-    while (node && (node.nodeType === 8 ||
-      (node.nodeType === 1 && (node.localName || '').toLowerCase() === 'wbr'))) node = node.nextSibling;
+    const following = cssStackMathFollowingLeaf(anchor, range);
+    const node = following && following.leaf;
     if (!node || node.nodeType !== 3) return { invalid: false, node: null, source: '' };
     const selected = cssStackMathTextSlice(node, range).trim();
     if (!selected || /^[=<>≤≥≠≈≃≅≡∝→←↔⇒⇐⇔↦∈∉⊂⊆⊃⊇]/u.test(selected)) {
@@ -10232,7 +12026,13 @@
     if (!valid) return { invalid: true, node: null, source: '' };
     const canonicalSource = source.replace(/^([A-Za-z]+)(?=\s*(?:\(|[\p{L}\p{N}√∛∜]))/u, (match, name) =>
       CALCULATOR_FUNCTIONS.has(name.toLowerCase()) ? '\\' + name.toLowerCase() + ' ' : match);
-    return { invalid: false, node, source: canonicalSource, suffix: suffix ? ' ' + suffix : '' };
+    return {
+      invalid: false,
+      node: following.resume,
+      nodes: following.nodes,
+      source: canonicalSource,
+      suffix: suffix ? ' ' + suffix : ''
+    };
   }
 
   function cssStackMathReplacementMap(values, range, settings) {
@@ -10254,7 +12054,10 @@
       );
       if (product.invalid) return null;
       const source = left.source + cssStackMathSourceWithScripts(right.source, scripts) + product.source;
-      const text = cssStackMathSourceText(source, settings.outputMode);
+      const text = cssStackMathSourceText(source, settings.outputMode, {
+        preserveLongIdentifiers: Boolean(left.explicitSemantics || right.explicitSemantics),
+        nestedBoundedOperator: Boolean(left.nestedBoundedOperator || right.nestedBoundedOperator)
+      });
       if (!text) return null;
       const group = {
         primary: true,
@@ -10305,7 +12108,10 @@
       if (product.invalid) return null;
       const source = sequence.slice(0, -1).map((value) => value.source).join('') +
         cssStackMathSourceWithScripts(sequence[sequence.length - 1].source, scripts) + product.source;
-      const text = cssStackMathSourceText(source, settings.outputMode);
+      const text = cssStackMathSourceText(source, settings.outputMode, {
+        preserveLongIdentifiers: sequence.some((value) => value.explicitSemantics),
+        nestedBoundedOperator: sequence.some((value) => value.nestedBoundedOperator)
+      });
       if (!text) return null;
       const roots = [
         ...sequence.map((value) => value.root),
@@ -10329,6 +12135,7 @@
         ? cssStackMathSelectedFollowingLimitBody(scripts.nodes[scripts.nodes.length - 1] || value.root, range)
         : { invalid: false, node: null, source: '' };
       if (body.invalid) return null;
+      const bodyNodes = body.nodes || (body.node ? [body.node] : []);
       const product = cssStackMathSelectedFollowingProduct(
         body.node || scripts.nodes[scripts.nodes.length - 1] || value.root,
         range
@@ -10339,6 +12146,8 @@
         ? baseSource + '{' + body.source + '}' + (body.suffix || '') + product.source
         : baseSource + product.source;
       const text = cssStackMathSourceText(source, settings.outputMode, {
+        preserveLongIdentifiers: Boolean(value.explicitSemantics),
+        nestedBoundedOperator: Boolean(value.nestedBoundedOperator),
         incompleteBoundedOperator: value.kind === 'operator-under' &&
           Boolean(value.selectedTopSource && value.selectedBottomSource) && !body.node
       });
@@ -10348,7 +12157,7 @@
         roots: [
           value.root,
           ...scripts.nodes,
-          ...(body.node ? [body.node] : []),
+          ...bodyNodes,
           ...product.nodes
         ],
         source,
@@ -10358,7 +12167,7 @@
       });
       const group = replacements.get(value.root);
       for (const node of scripts.nodes) replacements.set(node, { primary: false, group });
-      if (body.node) replacements.set(body.node, { primary: false, group });
+      for (const node of bodyNodes) replacements.set(node, { primary: false, group });
       for (const node of product.nodes) replacements.set(node, { primary: false, group });
     }
     return replacements;
@@ -10489,7 +12298,6 @@
 
   function cssStackMathSelectionPayload(ranges, settings, documentObject, selection, target, pageWindow) {
     if (!ranges || !ranges.length || !documentObject || isTextControl(target) ||
-        isMicrosoftOfficeWebPage(documentObject, pageWindow) ||
         isContentEditableSelection(documentObject, target, selection) ||
         isRawLatexProtected(target, selection, true, ranges)) return null;
     const discoveries = [];
@@ -10515,7 +12323,7 @@
         richFragments.push(fragment);
         continue;
       }
-      const replaceableRoots = new Set(values.map((value) => value.root));
+      const replaceableRoots = new Set(values.flatMap((value) => value.aliases || [value.root]));
       const whollyInsideAuthenticatedRoot = values.some((value) =>
         nodeInside(value.root, range.startContainer) && nodeInside(value.root, range.endContainer));
       if (!whollyInsideAuthenticatedRoot &&
@@ -10546,11 +12354,14 @@
   function ordinaryComputedLayoutRisk(range, documentObject, replaceableMathRoots) {
     const view = documentObject && documentObject.defaultView;
     if (!range || !view || typeof view.getComputedStyle !== 'function') return true;
-    const root = range.commonAncestorContainer && range.commonAncestorContainer.nodeType === 1
-      ? range.commonAncestorContainer
-      : range.commonAncestorContainer && range.commonAncestorContainer.parentElement;
+    const root = rangeTraversalRoot(range);
     if (!root) return true;
-    const stack = [root];
+    const stack = [];
+    if (root.nodeType === 1) stack.push(root);
+    else {
+      for (let child = root.lastElementChild; child; child = child.previousElementSibling) stack.push(child);
+    }
+    const cssDescriptorContext = createCssStackMathDescriptorContext();
     let inspected = 0;
     while (stack.length) {
       const element = stack.pop();
@@ -10615,6 +12426,18 @@
         if ((textSecurity && textSecurity !== 'none') ||
             (fontVariant && fontVariant !== 'normal' && fontVariant !== 'none') ||
             (fontVariantCaps && fontVariantCaps !== 'normal')) return true;
+
+        // A generic CSS-math root has already authenticated its visible
+        // geometry, row order, rule, text, clipping, and computed layout.
+        // Its implementation may intentionally change a <section>/<span>
+        // into flex, grid, block, or table layout; ordinary prose modeling
+        // must not reject that renderer-specific display choice afterward.
+        if (replaceableMathRoot && cssStackMathRootDescriptor(
+          element,
+          documentObject,
+          0,
+          cssDescriptorContext
+        )) continue;
 
         const whiteSpace = String(computed && computed.whiteSpace || '').toLowerCase();
         const computedMode = /^(?:pre|pre-wrap|break-spaces)$/.test(whiteSpace)
@@ -10687,9 +12510,7 @@
     } catch (_error) {
       return null;
     }
-    const common = range.commonAncestorContainer && range.commonAncestorContainer.nodeType === 1
-      ? range.commonAncestorContainer
-      : range.commonAncestorContainer && range.commonAncestorContainer.parentElement;
+    const common = rangeTraversalRoot(range);
     const tag = common && (common.localName || '').toLowerCase();
     if (!common || !tag || ['html', 'body'].includes(tag)) return contents;
     try {
@@ -10786,7 +12607,9 @@
     return String(value);
   }
 
-  function serializeOrdinaryFragment(fragment) {
+  function serializeOrdinaryFragment(fragment, outputMode = 'faithful', optionsInput) {
+    const serializerOptions = optionsInput && typeof optionsInput === 'object' ? optionsInput : {};
+    const convertSemanticScripts = serializerOptions.semanticScripts !== false;
     let output = '';
     let pendingSpace = false;
     let pendingBlockBreak = 0;
@@ -10795,6 +12618,8 @@
       artifacts: false,
       collapsibleWhitespace: false,
       hiddenOrAlternate: false,
+      semanticScripts: false,
+      semanticScriptUnrepresentable: false,
       structure: false
     };
 
@@ -10872,6 +12697,64 @@
 
     const visitChildren = (node, context) => {
       for (const child of Array.from(node.childNodes || [])) visit(child, context);
+    };
+    const semanticScriptBody = (element, depth = 0, budget = { nodes: 0, characters: 0 }) => {
+      if (!element || depth > MAX_MATHML_DEPTH) return null;
+      let text = '';
+      let nested = false;
+      const append = (value) => {
+        const cleaned = cleanOrdinaryCharacters(value).replace(/[\t\n\f\r ]+/g, ' ');
+        budget.characters += cleaned.length;
+        if (budget.characters > MAX_CSS_STACK_MATH_CHARACTERS) return false;
+        text += cleaned;
+        return true;
+      };
+      for (const child of Array.from(element.childNodes || [])) {
+        budget.nodes += 1;
+        if (budget.nodes > MAX_CSS_STACK_MATH_NODES) return null;
+        if (child.nodeType === 3) {
+          if (!append(child.nodeValue || '')) return null;
+          continue;
+        }
+        if (child.nodeType !== 1) continue;
+        const tag = (child.localName || '').toLowerCase();
+        if (isVisuallyHiddenElement(child)) {
+          evidence.hiddenOrAlternate = true;
+          continue;
+        }
+        if (tag === 'img' || tag === 'area') {
+          const alt = String(child.getAttribute && child.getAttribute('alt') || '');
+          if (!alt || !append(alt)) return null;
+          continue;
+        }
+        if (['script', 'style', 'noscript', 'template'].includes(tag)) {
+          evidence.hiddenOrAlternate = true;
+          continue;
+        }
+        if (ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag) ||
+            ['br', 'hr', 'input', 'select', 'textarea', 'button', 'meter', 'progress'].includes(tag)) {
+          return null;
+        }
+        const kind = convertSemanticScripts ? clipboardInlineScriptKind(child) : '';
+        if (kind) {
+          const body = semanticScriptBody(child, depth + 1, budget);
+          if (!body || !body.text) return null;
+          const marker = kind === 'sub' ? '_' : '^';
+          if (outputMode === 'calculator') text += marker + '(' + body.text + ')';
+          else if (outputMode === 'latex') text += marker + '{' + body.text + '}';
+          else {
+            const atomic = !body.nested && Array.from(body.text).length === 1;
+            text += marker + (atomic ? body.text : '(' + body.text + ')');
+          }
+          nested = true;
+          continue;
+        }
+        const body = semanticScriptBody(child, depth + 1, budget);
+        if (!body) return null;
+        text += body.text;
+        nested = nested || body.nested;
+      }
+      return { text: text.trim(), nested };
     };
     const visitList = (element, context, tag) => {
       evidence.structure = true;
@@ -10992,6 +12875,30 @@
       }
       if (ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag) || isVisuallyHiddenElement(element)) {
         evidence.hiddenOrAlternate = true;
+        return;
+      }
+      const semanticScriptKind = convertSemanticScripts ? clipboardInlineScriptKind(element) : '';
+      if (semanticScriptKind) {
+        evidence.semanticScripts = true;
+        const body = semanticScriptBody(element);
+        const raw = body && body.text || '';
+        if (!raw || raw.length > MAX_CSS_STACK_MATH_CHARACTERS) {
+          evidence.semanticScriptUnrepresentable = true;
+          return;
+        }
+        const citation = semanticScriptKind === 'sup' && !body.nested &&
+          /^(?:\[\s*\d+(?:\s*[,;–-]\s*\d+)*\s*\]|\(\s*\d+\s*\))$/u.test(raw);
+        let scriptText = raw;
+        if (!citation) {
+          const marker = semanticScriptKind === 'sub' ? '_' : '^';
+          if (body.nested) {
+            scriptText = outputMode === 'latex'
+              ? marker + '{' + raw + '}'
+              : marker + '(' + raw + ')';
+          } else scriptText = officeScriptText(raw, semanticScriptKind, outputMode);
+        }
+        appendGenerated(scriptText);
+        evidence.structure = true;
         return;
       }
       if (tag === 'img' || tag === 'area') {
@@ -11156,18 +13063,19 @@
     return '<!--StartFragment-->' + wrapper.innerHTML + '<!--EndFragment-->';
   }
 
-  function ordinarySelectionPayload(documentObject, selection, pageWindow, target, capturedRanges) {
+  function ordinarySelectionPayload(documentObject, selection, pageWindow, target, capturedRanges, settingsInput) {
     if (!documentObject || !selection || selection.isCollapsed || isTextControl(target)) return null;
     const suppliedRanges = Array.isArray(capturedRanges) ? capturedRanges : null;
     const rangeCount = suppliedRanges ? suppliedRanges.length : boundedSelectionRangeCount(selection);
     if (rangeCount <= 0 || rangeCount > MAX_SELECTION_RANGES) return null;
-    if (isMicrosoftOfficeWebPage(documentObject, pageWindow) ||
+    if (isMicrosoftOfficeEditorSurface(documentObject, target, selection) ||
         isContentEditableSelection(documentObject, target, selection) ||
         isRawLatexProtected(target, selection, false)) return null;
     const ranges = suppliedRanges || selectionRanges(documentObject, selection, rangeCount);
     if (!ranges.length) return null;
     const nativeText = ranges.map((range) => range.toString()).join('\n');
     if (!nativeText) return null;
+    const settings = normalizeSettings(settingsInput);
 
     const values = [];
     for (const range of ranges) {
@@ -11180,9 +13088,22 @@
         // saw. Leave the clipboard completely native in every such case.
         return null;
       }
-      const serialized = serializeOrdinaryFragment(fragment);
+      const serialized = serializeOrdinaryFragment(fragment, settings.outputMode);
+      if (serialized.evidence.semanticScriptUnrepresentable) return null;
       values.push({ fragment, ...serialized });
     }
+    if (settings.outputMode !== 'faithful' && values.some((value) => {
+      if (!value.evidence.semanticScripts) return false;
+      const source = String(value.text || '');
+      for (let index = 0; index + 1 < source.length; index += 1) {
+        if (!['^', '_'].includes(source[index]) || !['(', '{'].includes(source[index + 1])) continue;
+        let previous = index;
+        while (previous > 0 && /\s/u.test(source[previous - 1])) previous -= 1;
+        const character = Array.from(source.slice(0, previous)).pop() || '';
+        if (!/[\p{L}\p{N}\p{M})\]}|∣❘‖∥⟩⌉⌋∞∂∇ℏℓ′″‴⁗!%]/u.test(character)) return true;
+      }
+      return false;
+    })) return null;
     let repairedRendererLayout = false;
     for (const value of values) {
       const repaired = repairFlattenedRendererText(value.text);
@@ -11206,6 +13127,15 @@
         if (line) fragment.appendChild(documentObject.createTextNode(line));
       });
       html = sanitizeRichFragment(fragment);
+    } else if (values.some((value) => value.evidence.semanticScripts)) {
+      // Faithful rich output can retain the sanitized authored <sup>/<sub>
+      // structure (and surrounding emphasis/links) because it expresses the
+      // same meaning as the Unicode-or-caret plain text. Calculator/LaTeX
+      // modes use explicit text so native HTML scripts cannot visually
+      // disagree with ^(...) / ^{...} syntax.
+      html = settings.outputMode === 'faithful'
+        ? safeOrdinaryRichHTML(values.map((value) => value.fragment), documentObject)
+        : semanticTextClipboardHTML(text, settings.outputMode);
     } else html = safeOrdinaryRichHTML(values.map((value) => value.fragment), documentObject);
     return {
       text,
@@ -11216,6 +13146,41 @@
         : (onlyInvisibleArtifacts ? 'invisible-artifacts' : 'ordinary-text-cleanup'),
       mathRanges: 0
     };
+  }
+
+  function selectionContainsSemanticHtmlScript(ranges) {
+    const selector = 'sup,sub,[style*="vertical-align" i],[style*="font-variant-position" i],[class]';
+    let inspectedCandidates = 0;
+    let scanned = 0;
+    for (const range of ranges || []) {
+      const common = rangeTraversalRoot(range);
+      if (!common) continue;
+      scanned += 1;
+      if (scanned > MAX_MATH_DISCOVERY_CANDIDATES + MAX_MATHML_NODES) return true;
+      const stack = [common];
+      while (stack.length) {
+        const node = stack.pop();
+        if (!node) continue;
+        // An over-budget subtree must not fall through to the flat Unicode
+        // detector, which could misread an uninspected visual superscript as
+        // an ordinary adjacent digit. The bounded ordinary path will then
+        // either model the range safely or leave native copy untouched.
+        if (scanned > MAX_MATH_DISCOVERY_CANDIDATES + MAX_MATHML_NODES) return true;
+        if (node.nodeType === 1 && node.matches && node.matches(selector)) {
+          inspectedCandidates += 1;
+          if (inspectedCandidates > MAX_RICH_SELECTION_NODES) return true;
+          if (clipboardInlineScriptKind(node)) return true;
+        }
+        for (let child = node.lastChild; child; child = child.previousSibling) {
+          scanned += 1;
+          if (scanned > MAX_MATH_DISCOVERY_CANDIDATES + MAX_MATHML_NODES) return true;
+          if (child.nodeType === 1 && rangeIntersects(range, child)) {
+            stack.push(child);
+          }
+        }
+      }
+    }
+    return false;
   }
 
   function positionedStyleNumber(element, property) {
@@ -11282,9 +13247,7 @@
   }
 
   function positionedTokenElementsForRange(range, documentObject) {
-    const container = range && range.commonAncestorContainer && range.commonAncestorContainer.nodeType === 1
-      ? range.commonAncestorContainer
-      : range && range.commonAncestorContainer && range.commonAncestorContainer.parentElement;
+    const container = rangeTraversalRoot(range);
     if (!container || !container.matches) return [];
     const contextSelector = '.react-pdf__Page, .react-pdf__Page__textContent.textLayer, .textLayer';
     const inPositionedContext = container.matches(contextSelector) ||
@@ -12258,23 +14221,37 @@
       }
     }
     for (const range of ranges) {
-      const common = range.commonAncestorContainer && range.commonAncestorContainer.nodeType === 1
-        ? range.commonAncestorContainer
-        : range.commonAncestorContainer && range.commonAncestorContainer.parentElement;
-      if (!common || !common.querySelectorAll) continue;
-      try {
-        if (common.matches && common.matches(selector) && rangeIntersects(range, common)) return true;
-        for (const protectedNode of common.querySelectorAll(selector)) {
-          if (rangeIntersects(range, protectedNode)) return true;
+      const common = rangeTraversalRoot(range);
+      if (!common) continue;
+      const stack = [common];
+      let inspected = 1;
+      while (stack.length) {
+        const node = stack.pop();
+        if (!node) continue;
+        if (inspected > MAX_MATH_DISCOVERY_CANDIDATES + MAX_MATHML_NODES) return true;
+        try {
+          if (node.nodeType === 1 && node.matches && node.matches(selector)) return true;
+        } catch (_error) {
+          return true;
         }
-      } catch (_error) {
-        return true;
+        for (let child = node.lastChild; child; child = child.previousSibling) {
+          inspected += 1;
+          if (inspected > MAX_MATH_DISCOVERY_CANDIDATES + MAX_MATHML_NODES) return true;
+          if (child.nodeType === 1 && rangeIntersects(range, child)) {
+            stack.push(child);
+          }
+        }
       }
     }
     return false;
   }
 
   function getCopyPayload(documentObject, selection, settingsInput, pageWindow, target, allowDeferredPdf) {
+    const previousMathJaxSvgCache = ACTIVE_COPY_MATHJAX_SVG_CACHE;
+    const previousEmbeddedMathCache = ACTIVE_COPY_EMBEDDED_MATH_CACHE;
+    ACTIVE_COPY_MATHJAX_SVG_CACHE = new WeakMap();
+    ACTIVE_COPY_EMBEDDED_MATH_CACHE = new WeakMap();
+    try {
     const settings = normalizeSettings(settingsInput);
     // Native mode is a hard opt-out. Do not even inspect the selection: sites
     // can expose stateful ranges or clipboard projections, and the contract of
@@ -12356,15 +14333,25 @@
       const finalized = finalizeRewrittenText(converted.text);
       if (converted.converted > 0 && finalized.trim()) return { text: finalized, reason: 'delimited-latex', mathRanges: 0 };
     }
-    const shouldDeferStandaloneMath = isMicrosoftOfficeWebPage(documentObject, pageWindow) ||
+    if (selectionContainsSemanticHtmlScript(ranges)) {
+      const semanticScripts = ordinarySelectionPayload(
+        documentObject, selection, pageWindow, target, ranges, settings
+      );
+      if (semanticScripts) return { ...semanticScripts, reason: 'semantic-html-scripts' };
+    }
+    const shouldDeferStandaloneMath = isMicrosoftOfficeEditorSurface(documentObject, target, selection) ||
       isContentEditableSelection(documentObject, target, selection);
     if (!shouldDeferStandaloneMath && !rawLatexProtected) {
       const unicodeMath = standaloneUnicodeMathPayload(nativeText, ranges, settings, documentObject);
       if (unicodeMath) return unicodeMath;
     }
-    const ordinary = ordinarySelectionPayload(documentObject, selection, pageWindow, target, ranges);
+    const ordinary = ordinarySelectionPayload(documentObject, selection, pageWindow, target, ranges, settings);
     if (ordinary) return ordinary;
     return null;
+    } finally {
+      ACTIVE_COPY_MATHJAX_SVG_CACHE = previousMathJaxSvgCache;
+      ACTIVE_COPY_EMBEDDED_MATH_CACHE = previousEmbeddedMathCache;
+    }
   }
 
   function readUserscriptResourceText(name) {
@@ -12489,8 +14476,15 @@
     requestedUrl.hash = '';
     pageUrl.hash = '';
     const localFile = requestedUrl.protocol === 'file:' && pageUrl.protocol === 'file:';
-    if ((!['http:', 'https:'].includes(requestedUrl.protocol) || requestedUrl.origin !== pageUrl.origin) &&
-        !localFile) {
+    const sameOriginNetwork = ['http:', 'https:'].includes(requestedUrl.protocol) &&
+      requestedUrl.origin === pageUrl.origin;
+    // Browser-created and browser-opened PDFs commonly have a blob: URL.
+    // URL#origin preserves the creator origin for nonopaque blobs, so those
+    // are as safe to request as the current same-origin HTTP document. Never
+    // accept blob:null, which has no origin boundary to authenticate.
+    const sameOriginBlob = requestedUrl.protocol === 'blob:' && requestedUrl.origin !== 'null' &&
+      requestedUrl.origin === pageUrl.origin;
+    if (!sameOriginNetwork && !sameOriginBlob && !localFile) {
       throw invalidPdfResponse('The current PDF request crossed an origin boundary.');
     }
     const AbortControllerConstructor = pageWindow.AbortController || global.AbortController;
@@ -12502,7 +14496,7 @@
     const timeout = controller ? schedule(() => controller.abort(), 120000) : null;
     try {
       const response = await Promise.resolve(Reflect.apply(fetchFunction, pageWindow, [requestedUrl.href, {
-        credentials: 'include',
+        credentials: sameOriginBlob ? 'omit' : 'include',
         redirect: 'follow',
         signal: controller ? controller.signal : undefined,
         headers: { Accept: 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.1' }
@@ -12516,7 +14510,10 @@
         catch (_error) { throw invalidPdfResponse('The PDF request returned an invalid final URL.'); }
         const safeFinal = localFile
           ? finalUrl.protocol === 'file:'
-          : ['http:', 'https:'].includes(finalUrl.protocol) && finalUrl.origin === requestedUrl.origin;
+          : (sameOriginBlob
+            ? finalUrl.protocol === 'blob:' && finalUrl.origin !== 'null' &&
+              finalUrl.href === requestedUrl.href
+            : ['http:', 'https:'].includes(finalUrl.protocol) && finalUrl.origin === requestedUrl.origin);
         if (!safeFinal || finalUrl.username || finalUrl.password) {
           throw invalidPdfResponse('The PDF request redirected across an origin boundary.');
         }
@@ -15953,6 +17950,7 @@
     ordinarySelectionPayload,
     ommlToMathML,
     positionedOfficePayload,
+    requestCurrentPdfBytes,
     registerTrustedPdfViewerRoot,
     richScriptClipboardPayloadFromMarkup,
     rootsForRange,

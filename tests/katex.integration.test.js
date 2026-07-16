@@ -263,11 +263,25 @@ test('real KaTeX DOM: faithful mode recognizes renderer accent glyphs without lo
     [String.raw`\acute x`, 'x́'], [String.raw`\grave x`, 'x̀'],
     [String.raw`\breve x`, 'x̆'], [String.raw`\check x`, 'x̌'],
     [String.raw`\mathring x`, 'x̊'], [String.raw`\underline x`, 'x̲'],
-    [String.raw`\overbrace{x}`, 'overset(⏞, x)'],
-    [String.raw`\underbrace{x}`, 'underset(⏟, x)']
+    [String.raw`\overbrace{x}`, 'overbrace(x)'],
+    [String.raw`\underbrace{x}`, 'underbrace(x)'],
+    [String.raw`\overbrace{x+y}^{n}`, 'overbrace(x + y)ⁿ'],
+    [String.raw`\underbrace{x+y}_{n}`, 'underbrace(x + y)ₙ']
   ]);
   for (const [source, expected] of cases) {
     assert.equal(copyVisibleKaTeX(source, 'faithful').text, expected, source);
+  }
+});
+
+test('real KaTeX DOM: calculator mode drops brace labels but preserves base grouping', () => {
+  const cases = new Map([
+    [String.raw`\overbrace{x+y}^{n}`, 'x+y'],
+    [String.raw`\underbrace{x+y}_{n}`, 'x+y'],
+    [String.raw`\overbrace{x+y}z`, '(x+y)*z'],
+    [String.raw`2\underbrace{x+y}`, '2*(x+y)']
+  ]);
+  for (const [source, expected] of cases) {
+    assert.equal(copyVisibleKaTeX(source, 'calculator').text, expected, source);
   }
 });
 

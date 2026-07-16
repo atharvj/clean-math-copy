@@ -690,3 +690,96 @@ test('page-authored PDF metadata is ignored unless the viewer root is internally
     forged
   ), null);
 });
+
+test('direct PDF loading accepts only same-origin nonopaque blob URLs', async () => {
+  const pdfBytes = new Uint8Array([
+    0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37, 0x0a
+  ]).buffer;
+  const headers = {
+    get(name) {
+      const key = String(name || '').toLowerCase();
+      if (key === 'content-length') return String(pdfBytes.byteLength);
+      if (key === 'content-type') return 'application/pdf';
+      return null;
+    }
+  };
+  const requested = [];
+  const blobUrl = 'blob:https://documents.example/52e4bb80-2a38-4bc3-b941-70a193d63344';
+  const pageWindow = {
+    location: { href: blobUrl },
+    fetch(url, options) {
+      requested.push({ url, options });
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        url: blobUrl,
+        headers,
+        body: null,
+        arrayBuffer: () => Promise.resolve(pdfBytes)
+      });
+    }
+  };
+  const loaded = await cleanCopy.requestCurrentPdfBytes(blobUrl, pageWindow);
+  assert.equal(loaded.byteLength, pdfBytes.byteLength);
+  assert.equal(requested.length, 1);
+  assert.equal(requested[0].url, blobUrl);
+  assert.equal(requested[0].options.credentials, 'omit',
+    'blob URLs never need ambient HTTP credentials');
+
+  const rejectingWindow = {
+    location: { href: 'https://documents.example/viewer' },
+    fetch() {
+      throw new Error('an unauthenticated blob URL must be rejected before fetch');
+    }
+  };
+  await assert.rejects(
+    cleanCopy.requestCurrentPdfBytes('blob:https://attacker.example/file', rejectingWindow),
+    /origin boundary/u
+  );
+  await assert.rejects(
+    cleanCopy.requestCurrentPdfBytes('blob:null/opaque-file', {
+      ...rejectingWindow,
+      location: { href: 'blob:null/opaque-viewer' }
+    }),
+    /origin boundary/u
+  );
+
+  await assert.rejects(cleanCopy.requestCurrentPdfBytes(blobUrl, {
+    ...pageWindow,
+    fetch() {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        url: 'blob:https://documents.example/different-object',
+        headers,
+        body: null,
+        arrayBuffer: () => Promise.resolve(pdfBytes)
+      });
+    }
+  }), /redirected across an origin boundary/u,
+  'a blob response cannot silently substitute a different object URL');
+
+  const httpsRequests = [];
+  const httpsUrl = 'https://documents.example/notes.pdf';
+  await cleanCopy.requestCurrentPdfBytes(httpsUrl, {
+    location: { href: httpsUrl + '#page=2' },
+    fetch(url, options) {
+      httpsRequests.push({ url, options });
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        url: httpsUrl,
+        headers,
+        body: null,
+        arrayBuffer: () => Promise.resolve(pdfBytes)
+      });
+    }
+  });
+  assert.equal(httpsRequests[0].url, httpsUrl);
+  assert.equal(httpsRequests[0].options.credentials, 'include',
+    'ordinary same-origin PDF requests retain authenticated-site support');
+  await assert.rejects(cleanCopy.requestCurrentPdfBytes(
+    'https://attacker.example/file.pdf',
+    { ...rejectingWindow, location: { href: httpsUrl } }
+  ), /origin boundary/u);
+});
