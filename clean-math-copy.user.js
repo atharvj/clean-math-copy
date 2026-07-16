@@ -3,7 +3,7 @@
 // @namespace    https://github.com/atharvj/clean-math-copy
 // @version      2.6.0
 // @description  Accurately copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
-// @author       Atharv Joshi
+// @author       Intellectual07
 // @license      MIT
 // @homepageURL  https://github.com/atharvj/clean-math-copy
 // @supportURL   https://github.com/atharvj/clean-math-copy/issues
