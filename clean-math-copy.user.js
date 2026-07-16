@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.6.0
+// @version      2.6.1
 // @description  Accurately copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Intellectual07
 // @license      MIT
@@ -79,6 +79,9 @@
   const MAX_RICH_SELECTION_NODES = 1000;
   const MAX_RICH_SELECTION_DEPTH = 128;
   const MAX_ORDINARY_SELECTION_MARKUP_LENGTH = 1024 * 1024;
+  const MAX_ORDINARY_IMAGE_ALT_SOURCE_LENGTH = 2048;
+  const MAX_ORDINARY_IMAGE_ALT_CHARACTERS = 256;
+  const MAX_ORDINARY_IMAGE_ALT_WORDS = 32;
   const MAX_SELECTION_KEY_LENGTH = 50000;
   const MAX_MATH_SOURCE_LENGTH = 50000;
   const MAX_MATH_ROOTS_PER_SELECTION = 128;
@@ -150,6 +153,12 @@
   // several-thousand-node SVG each time is wasteful. Persistent caching would
   // be unsafe because pages can mutate renderer metadata or visibility.
   let ACTIVE_COPY_MATHJAX_SVG_CACHE = null;
+  // MathJax CHTML exposes a semantic custom-element tree even when a page
+  // omits TeX metadata and Assistive MathML. Projecting that tree is bounded
+  // but nontrivial, so reuse the authenticated projection only within the
+  // synchronous copy operation that observed it. Page mutations must be
+  // visible to the next copy just as they are for SVG and embedded metadata.
+  let ACTIVE_COPY_MATHJAX_CHTML_CACHE = null;
   const MATH_ROOT_SELECTOR = [
     '.katex-display',
     '.katex',
@@ -407,9 +416,15 @@
     return text;
   }
 
+  function isDegreeScript(text) {
+    const compact = String(text == null ? '' : text).replace(/\s+/gu, '');
+    return compact === '∘' || compact === '°';
+  }
+
   function toScript(text, map, fallbackMarker) {
     const source = String(text).trim();
     if (!source) return '';
+    if (fallbackMarker === '^' && isDegreeScript(source)) return '°';
     let converted = '';
     for (const character of source) {
       if (!Object.prototype.hasOwnProperty.call(map, character)) {
@@ -423,6 +438,7 @@
   function toFaithfulScript(text, map, fallbackMarker) {
     const source = String(text == null ? '' : text).trim();
     if (!source) return '';
+    if (fallbackMarker === '^' && isDegreeScript(source)) return '°';
     if (fallbackMarker === '^' && /^[′″‴']+$/u.test(source)) {
       return source.replace(/'/g, '′');
     }
@@ -2986,6 +3002,13 @@
       if (operatorName) return calculatorResult(operatorName + (lower ? '_(' + lower + ')' : '') +
         (upper ? '^(' + upper + ')' : ''), 'bounded', { operatorName, lower, upper });
       const base = serializeMathMLCalculatorNode(children[0]);
+      if (upper && isDegreeScript(upper)) {
+        const degreeBase = base.text + (lower ? '_(' + lower + ')' : '');
+        const safeDegreeBase = calculatorSimpleTerm(degreeBase)
+          ? degreeBase
+          : '(' + degreeBase + ')';
+        return calculatorResult(safeDegreeBase + '*degrees', 'operand');
+      }
       const scriptSuffix = (lower ? '_(' + lower + ')' : '') + (upper ? '^(' + upper + ')' : '');
       if (base.kind === 'bar') return { ...base, scriptSuffix };
       if (base.kind === 'open' || base.kind === 'close') return { ...base, text: base.text + scriptSuffix };
@@ -4663,7 +4686,7 @@
         '≤': String.raw`\le `, '≥': String.raw`\ge `, '≠': String.raw`\ne `, '≈': String.raw`\approx `,
         '∑': String.raw`\sum `, '∏': String.raw`\prod `, '∫': String.raw`\int `,
         '→': String.raw`\to `, '⇒': String.raw`\Rightarrow `, '∞': String.raw`\infty `,
-        '∣': '|', '❘': '|', '‖': String.raw`\Vert `, '∥': String.raw`\Vert `
+        '∘': String.raw`\circ `, '∣': '|', '❘': '|', '‖': String.raw`\Vert `, '∥': String.raw`\Vert `
       };
       return operators[token] || token;
     }
@@ -4671,9 +4694,19 @@
     if (name === 'mfrac') return '\\frac{' + child(0) + '}{' + child(1) + '}';
     if (name === 'msqrt') return '\\sqrt{' + all() + '}';
     if (name === 'mroot') return '\\sqrt[' + child(1) + ']{' + child(0) + '}';
-    if (name === 'msup') return '{' + child(0) + '}^{' + child(1) + '}';
+    if (name === 'msup') {
+      const upper = isDegreeScript(children[1] && children[1].textContent)
+        ? String.raw`\circ`
+        : child(1);
+      return '{' + child(0) + '}^{' + upper + '}';
+    }
     if (name === 'msub') return '{' + child(0) + '}_{' + child(1) + '}';
-    if (name === 'msubsup') return '{' + child(0) + '}_{' + child(1) + '}^{' + child(2) + '}';
+    if (name === 'msubsup') {
+      const upper = isDegreeScript(children[2] && children[2].textContent)
+        ? String.raw`\circ`
+        : child(2);
+      return '{' + child(0) + '}_{' + child(1) + '}^{' + upper + '}';
+    }
     if (name === 'mover') return '\\overset{' + child(1) + '}{' + child(0) + '}';
     if (name === 'munder') return '\\underset{' + child(1) + '}{' + child(0) + '}';
     if (name === 'munderover') return '\\overset{' + child(2) + '}{\\underset{' + child(1) + '}{' + child(0) + '}}';
@@ -6660,6 +6693,411 @@
     return cleanClipboardText(independentlyVisibleText(root));
   }
 
+  const SOURCELESS_CHTML_STRUCTURAL_TAGS = new Set([
+    'mjx-msup', 'mjx-msub', 'mjx-msubsup', 'mjx-mfrac', 'mjx-msqrt',
+    'mjx-mroot', 'mjx-mover', 'mjx-munder', 'mjx-munderover', 'mjx-mtable',
+    'mjx-mfenced'
+  ]);
+  const SOURCELESS_CHTML_TRANSPARENT_TAGS = new Set([
+    'mjx-math', 'mjx-mrow', 'mjx-texatom', 'mjx-row', 'mjx-base',
+    'mjx-script', 'mjx-over', 'mjx-under', 'mjx-box', 'mjx-sqrt', 'mjx-frac',
+    'mjx-num', 'mjx-den', 'mjx-table', 'mjx-itable', 'mjx-dbox', 'mjx-dtable',
+    'mjx-mtr', 'mjx-mtd', 'mjx-label', 'mjx-labels', 'mjx-root', 'mjx-sub',
+    'mjx-sup', 'mjx-utext'
+  ]);
+  const SOURCELESS_CHTML_EMPTY_LAYOUT_TAGS = new Set([
+    'mjx-strut', 'mjx-nstrut', 'mjx-dstrut', 'mjx-line', 'mjx-spacer'
+  ]);
+  const SOURCELESS_CHTML_TOKEN_TAGS = new Map([
+    ['mjx-mi', 'mi'], ['mjx-mn', 'mn'], ['mjx-mo', 'mo'],
+    ['mjx-mtext', 'mtext'], ['mjx-ms', 'ms']
+  ]);
+
+  function sourceLessMathJaxChtmlTextIsVisible(textNode, visualMath) {
+    if (!textNode || textNode.nodeType !== 3 || !visualMath) return false;
+    const documentObject = visualMath.ownerDocument;
+    const view = documentObject && documentObject.defaultView;
+    if (!view || typeof view.getComputedStyle !== 'function') return false;
+    for (let element = textNode.parentElement; element; element = element.parentElement) {
+      if (isVisuallyHiddenElement(element)) return false;
+      // MathJax deliberately marks its complete painted CHTML branch as
+      // aria-hidden when a separate speech/assistive branch exists. A hidden
+      // descendant, however, is an alternate representation and cannot be
+      // allowed to contribute selected glyphs.
+      if (element !== visualMath && element.getAttribute &&
+          element.getAttribute('aria-hidden') === 'true') return false;
+      let computed;
+      try { computed = view.getComputedStyle(element); } catch (_error) { return false; }
+      const display = String(computed && computed.display || '').toLowerCase();
+      const visibility = String(computed && computed.visibility || '').toLowerCase();
+      const contentVisibility = String(computed && computed.contentVisibility || '').toLowerCase();
+      const opacity = Number.parseFloat(String(computed && computed.opacity || '1'));
+      const fontSize = Number.parseFloat(String(computed && computed.fontSize || ''));
+      const color = String(computed && computed.color || '').replace(/\s+/g, '').toLowerCase();
+      const textFill = String(computed && (computed.webkitTextFillColor || computed.getPropertyValue &&
+        computed.getPropertyValue('-webkit-text-fill-color')) || '').replace(/\s+/g, '').toLowerCase();
+      if (display === 'none' || contentVisibility === 'hidden' ||
+          visibility === 'hidden' || visibility === 'collapse' ||
+          (Number.isFinite(opacity) && opacity <= 0) ||
+          (Number.isFinite(fontSize) && fontSize <= 0) ||
+          color === 'transparent' || /rgba\([^)]*,0(?:\.0+)?\)$/u.test(color) ||
+          textFill === 'transparent' || /rgba\([^)]*,0(?:\.0+)?\)$/u.test(textFill)) return false;
+      const clip = String(computed && computed.clip || '').trim().toLowerCase();
+      const clipPath = String(computed && (computed.clipPath || computed.webkitClipPath) || '').trim().toLowerCase();
+      if (clip && clip !== 'auto') return false;
+      if (clipPath && clipPath !== 'none' && !cssPolygonHasVisibleArea(clipPath)) return false;
+      const mask = String(computed && (computed.maskImage || computed.webkitMaskImage ||
+        computed.getPropertyValue && (computed.getPropertyValue('mask-image') ||
+          computed.getPropertyValue('-webkit-mask-image'))) || '').trim().toLowerCase();
+      if (mask && mask !== 'none') return false;
+      const transform = String(computed && computed.transform || '').replace(/\s+/g, '').toLowerCase();
+      if (/scale(?:x|y)?\(0(?:\.0+)?\)|matrix\(0(?:\.0+)?,0(?:\.0+)?,0(?:\.0+)?,0(?:\.0+)?,/u.test(transform)) {
+        return false;
+      }
+      if (element === visualMath) return true;
+    }
+    return false;
+  }
+
+  function sourceLessMathJaxChtmlDescriptor(root, pageWindow) {
+    const cache = ACTIVE_COPY_MATHJAX_CHTML_CACHE;
+    if (cache && cache.has(root)) return cache.get(root);
+    const finish = (value) => {
+      if (cache && root && (typeof root === 'object' || typeof root === 'function')) cache.set(root, value);
+      return value;
+    };
+    if (!root || root.nodeType !== 1 || !root.matches || !root.matches('mjx-container.MathJax') ||
+        !root.isConnected || !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) {
+      return finish(null);
+    }
+    const rawJax = String(root.getAttribute('jax') || '');
+    if (rawJax.length > 32) return finish(null);
+    const jax = rawJax.trim().toLowerCase();
+    if (jax && jax !== 'chtml') return finish(null);
+    // Independent MathML or TeX is authoritative. This projection is solely
+    // for genuine CHTML surfaces whose semantic custom-element tree is the
+    // only exact representation available to the copy event.
+    if ((root.querySelector && root.querySelector('math')) || getMathSource(root, pageWindow)) return finish(null);
+    const directMath = elementChildren(root).filter((child) =>
+      (child.localName || '').toLowerCase() === 'mjx-math');
+    if (directMath.length !== 1) return finish(null);
+    const visualMath = directMath[0];
+    for (const sibling of elementChildren(root)) {
+      if (sibling === visualMath) continue;
+      const name = (sibling.localName || '').toLowerCase();
+      if (!['mjx-speech', 'mjx-assistive-mml'].includes(name)) return finish(null);
+    }
+
+    const documentObject = root.ownerDocument;
+    if (!documentObject || typeof documentObject.createElementNS !== 'function') return finish(null);
+    const state = {
+      nodes: 0,
+      characters: 0,
+      structural: 0,
+      consumedText: new Set(),
+      semanticIds: new Set(),
+      invalid: false
+    };
+    const make = (name, textValue) => {
+      const element = documentObject.createElementNS(MATHML_NAMESPACE, name);
+      if (textValue != null) element.textContent = textValue;
+      return element;
+    };
+    const rowFrom = (values) => {
+      const items = values.filter(Boolean);
+      if (!items.length) return make('mrow');
+      if (items.length === 1) return items[0];
+      const row = make('mrow');
+      for (const item of items) row.appendChild(item);
+      return row;
+    };
+    const markText = (owner) => {
+      if (!owner) return '';
+      const walker = documentObject.createTreeWalker(owner, 4);
+      let value = '';
+      for (let textNode = walker.nextNode(); textNode; textNode = walker.nextNode()) {
+        const raw = String(textNode.nodeValue || '');
+        if (!raw) continue;
+        state.characters += raw.length;
+        if (state.characters > MAX_MATH_SOURCE_LENGTH ||
+            (!/^\s*$/u.test(raw) && !sourceLessMathJaxChtmlTextIsVisible(textNode, visualMath))) {
+          state.invalid = true;
+          return '';
+        }
+        state.consumedText.add(textNode);
+        value += raw;
+      }
+      return cleanClipboardText(value).replace(/[\t\n\f\r ]+/g, ' ').trim();
+    };
+    const ownedDescendants = (owner, wanted) => {
+      const values = [];
+      const stack = [];
+      for (let child = owner.lastElementChild; child; child = child.previousElementSibling) stack.push(child);
+      while (stack.length) {
+        const element = stack.pop();
+        const name = (element.localName || '').toLowerCase();
+        if (wanted.has(name)) {
+          values.push(element);
+          continue;
+        }
+        if (SOURCELESS_CHTML_STRUCTURAL_TAGS.has(name)) continue;
+        for (let child = element.lastElementChild; child; child = child.previousElementSibling) stack.push(child);
+      }
+      return values;
+    };
+    const directSemanticChildren = (owner) => elementChildren(owner).filter((child) => {
+      const name = (child.localName || '').toLowerCase();
+      return !SOURCELESS_CHTML_EMPTY_LAYOUT_TAGS.has(name);
+    });
+    const canonicalOverAccent = (value) => {
+      const textValue = cleanClipboardText(value).replace(/\s+/gu, '');
+      if (/^(?:⃗|→|[−-]*→)$/u.test(textValue)) return '\u20d7';
+      if (/^(?:⃖|←|←[−-]*)$/u.test(textValue)) return '\u20d6';
+      if (/^(?:\^|ˆ|̂)$/u.test(textValue)) return '\u0302';
+      if (/^(?:~|˜|̃)$/u.test(textValue)) return '\u0303';
+      if (/^(?:¯|‾|ˉ|̅|―+)$/u.test(textValue)) return '\u0305';
+      if (/^(?:˙|̇)$/u.test(textValue)) return '\u0307';
+      if (/^(?:¨|̈)$/u.test(textValue)) return '\u0308';
+      if (/^(?:ˊ|́)$/u.test(textValue)) return '\u0301';
+      if (/^(?:ˋ|̀)$/u.test(textValue)) return '\u0300';
+      if (/^(?:˘|̆)$/u.test(textValue)) return '\u0306';
+      if (/^(?:ˇ|̌)$/u.test(textValue)) return '\u030c';
+      if (/^(?:˚|̊)$/u.test(textValue)) return '\u030a';
+      if (textValue === '⏞') return '⏞';
+      return '';
+    };
+    const canonicalUnderAccent = (value) => {
+      const textValue = cleanClipboardText(value).replace(/\s+/gu, '');
+      if (/^(?:¯|‾|ˉ|̅|̲|―+)$/u.test(textValue)) return '\u0332';
+      if (textValue === '⏟') return '⏟';
+      return '';
+    };
+
+    const convert = (node, depth = 0) => {
+      if (!node || state.invalid || depth > MAX_MATHML_DEPTH) {
+        state.invalid = true;
+        return null;
+      }
+      state.nodes += 1;
+      if (state.nodes > MAX_MATHML_NODES || node.nodeType !== 1) {
+        state.invalid = true;
+        return null;
+      }
+      const name = (node.localName || '').toLowerCase();
+      const tokenName = SOURCELESS_CHTML_TOKEN_TAGS.get(name);
+      if (tokenName) {
+        const nestedTokens = Array.from(node.querySelectorAll ? node.querySelectorAll(
+          Array.from(SOURCELESS_CHTML_TOKEN_TAGS.keys()).join(',')
+        ) : []);
+        if (nestedTokens.length) {
+          state.invalid = true;
+          return null;
+        }
+        const id = String(node.getAttribute('data-semantic-id') || '');
+        if (id) {
+          if (id.length > 16 || !/^\d+$/u.test(id) || state.semanticIds.has(id)) {
+            state.invalid = true;
+            return null;
+          }
+          state.semanticIds.add(id);
+        }
+        const value = normalizeOfficeGlyphs(markText(node));
+        if (!value) {
+          state.invalid = true;
+          return null;
+        }
+        return make(tokenName, value);
+      }
+      if (SOURCELESS_CHTML_EMPTY_LAYOUT_TAGS.has(name)) {
+        if (markText(node)) state.invalid = true;
+        return null;
+      }
+      if (name === 'mjx-surd') {
+        // The radical glyph is renderer scaffolding; the enclosing msqrt or
+        // mroot supplies its semantics. It must still be visible and bounded.
+        if (!markText(node)) state.invalid = true;
+        return null;
+      }
+      if (name === 'mjx-msub' || name === 'mjx-msup') {
+        state.structural += 1;
+        const children = directSemanticChildren(node);
+        const scriptWrapper = children.find((child) =>
+          (child.localName || '').toLowerCase() === 'mjx-script');
+        const baseCandidates = children.filter((child) => child !== scriptWrapper);
+        const baseOwner = baseCandidates.find((child) =>
+          (child.localName || '').toLowerCase() === 'mjx-base') || baseCandidates[0];
+        const scriptOwners = scriptWrapper ? directSemanticChildren(scriptWrapper) : baseCandidates.slice(1);
+        if (!baseOwner || baseCandidates.length > (scriptWrapper ? 1 : 2) || scriptOwners.length !== 1) {
+          state.invalid = true;
+          return null;
+        }
+        const base = convert(baseOwner, depth + 1);
+        const script = convert(scriptOwners[0], depth + 1);
+        if (!base || !script) { state.invalid = true; return null; }
+        const result = make(name === 'mjx-msub' ? 'msub' : 'msup');
+        result.append(base, script);
+        return result;
+      }
+      if (name === 'mjx-msubsup') {
+        state.structural += 1;
+        const children = directSemanticChildren(node);
+        const scriptWrapper = children.find((child) =>
+          (child.localName || '').toLowerCase() === 'mjx-script');
+        const baseCandidates = children.filter((child) => child !== scriptWrapper);
+        const baseOwner = baseCandidates.find((child) =>
+          (child.localName || '').toLowerCase() === 'mjx-base') || baseCandidates[0];
+        const scriptChildren = scriptWrapper ? directSemanticChildren(scriptWrapper) : baseCandidates.slice(1);
+        const lower = scriptChildren.filter((child) =>
+          (child.localName || '').toLowerCase() === 'mjx-sub');
+        const upper = scriptChildren.filter((child) =>
+          (child.localName || '').toLowerCase() === 'mjx-sup');
+        // Bare children have renderer-specific visual order. Without named
+        // roles or source metadata, assigning them would be an unsafe guess.
+        if (!baseOwner || baseCandidates.length > (scriptWrapper ? 1 : 3) ||
+            lower.length !== 1 || upper.length !== 1 || scriptChildren.length !== 2) {
+          state.invalid = true;
+          return null;
+        }
+        const base = convert(baseOwner, depth + 1);
+        const sub = convert(lower[0], depth + 1);
+        const sup = convert(upper[0], depth + 1);
+        if (!base || !sub || !sup) { state.invalid = true; return null; }
+        const result = make('msubsup'); result.append(base, sub, sup); return result;
+      }
+      if (name === 'mjx-mover' || name === 'mjx-munder') {
+        state.structural += 1;
+        const children = directSemanticChildren(node);
+        const roleName = name === 'mjx-mover' ? 'mjx-over' : 'mjx-under';
+        const role = children.filter((child) => (child.localName || '').toLowerCase() === roleName);
+        const baseRole = children.filter((child) => (child.localName || '').toLowerCase() === 'mjx-base');
+        const other = children.filter((child) => !role.includes(child) && !baseRole.includes(child));
+        const baseOwner = baseRole[0] || (other.length === 1 ? other[0] : null);
+        if (role.length !== 1 || baseRole.length > 1 || !baseOwner || other.length > (baseRole.length ? 0 : 1)) {
+          state.invalid = true;
+          return null;
+        }
+        const base = convert(baseOwner, depth + 1);
+        const annotation = convert(role[0], depth + 1);
+        if (!base || !annotation) { state.invalid = true; return null; }
+        const raw = annotation.textContent || '';
+        const canonical = name === 'mjx-mover' ? canonicalOverAccent(raw) : canonicalUnderAccent(raw);
+        const result = make(name === 'mjx-mover' ? 'mover' : 'munder');
+        result.setAttribute(name === 'mjx-mover' ? 'accent' : 'accentunder', canonical ? 'true' : 'false');
+        if (canonical) annotation.textContent = canonical;
+        result.append(base, annotation);
+        return result;
+      }
+      if (name === 'mjx-munderover') {
+        state.structural += 1;
+        const roles = ownedDescendants(node, new Set(['mjx-base', 'mjx-under', 'mjx-over']));
+        const bases = roles.filter((item) => (item.localName || '').toLowerCase() === 'mjx-base');
+        const lowers = roles.filter((item) => (item.localName || '').toLowerCase() === 'mjx-under');
+        const uppers = roles.filter((item) => (item.localName || '').toLowerCase() === 'mjx-over');
+        if (bases.length !== 1 || lowers.length !== 1 || uppers.length !== 1) {
+          state.invalid = true;
+          return null;
+        }
+        const base = convert(bases[0], depth + 1);
+        const lower = convert(lowers[0], depth + 1);
+        const upper = convert(uppers[0], depth + 1);
+        if (!base || !lower || !upper) { state.invalid = true; return null; }
+        const result = make('munderover'); result.append(base, lower, upper); return result;
+      }
+      if (name === 'mjx-mfrac') {
+        state.structural += 1;
+        const roles = ownedDescendants(node, new Set(['mjx-num', 'mjx-den']));
+        const numerators = roles.filter((item) => (item.localName || '').toLowerCase() === 'mjx-num');
+        const denominators = roles.filter((item) => (item.localName || '').toLowerCase() === 'mjx-den');
+        if (numerators.length !== 1 || denominators.length !== 1) {
+          state.invalid = true;
+          return null;
+        }
+        const numerator = convert(numerators[0], depth + 1);
+        const denominator = convert(denominators[0], depth + 1);
+        if (!numerator || !denominator) { state.invalid = true; return null; }
+        const result = make('mfrac'); result.append(numerator, denominator); return result;
+      }
+      if (name === 'mjx-msqrt' || name === 'mjx-mroot') {
+        state.structural += 1;
+        const boxes = ownedDescendants(node, new Set(['mjx-box']));
+        if (boxes.length !== 1) { state.invalid = true; return null; }
+        const surds = ownedDescendants(node, new Set(['mjx-surd']));
+        if (surds.length > 1) { state.invalid = true; return null; }
+        for (const surd of surds) if (!markText(surd)) { state.invalid = true; return null; }
+        const radicand = convert(boxes[0], depth + 1);
+        if (!radicand) { state.invalid = true; return null; }
+        if (name === 'mjx-msqrt') {
+          const result = make('msqrt'); result.appendChild(radicand); return result;
+        }
+        const roots = ownedDescendants(node, new Set(['mjx-root']));
+        if (roots.length !== 1) { state.invalid = true; return null; }
+        const degree = convert(roots[0], depth + 1);
+        if (!degree) { state.invalid = true; return null; }
+        const result = make('mroot'); result.append(radicand, degree); return result;
+      }
+      if (name === 'mjx-mtable') {
+        state.structural += 1;
+        const rows = ownedDescendants(node, new Set(['mjx-mtr']));
+        if (!rows.length || rows.length > MAX_MATHML_NODES) { state.invalid = true; return null; }
+        const table = make('mtable');
+        let columns = -1;
+        for (const sourceRow of rows) {
+          const cells = ownedDescendants(sourceRow, new Set(['mjx-mtd']));
+          if (!cells.length || (columns >= 0 && columns !== cells.length)) {
+            state.invalid = true;
+            return null;
+          }
+          columns = cells.length;
+          const row = make('mtr');
+          for (const sourceCell of cells) {
+            const value = convert(sourceCell, depth + 1);
+            if (!value) { state.invalid = true; return null; }
+            const cell = make('mtd'); cell.appendChild(value); row.appendChild(cell);
+          }
+          table.appendChild(row);
+        }
+        return table;
+      }
+      if (name === 'mjx-mfenced') {
+        // CHTML normally paints fences as explicit mjx-mo tokens. A bare
+        // mfenced attribute has no selected glyph with which to authenticate
+        // its open/close characters, so it is deliberately unsupported.
+        state.invalid = true;
+        return null;
+      }
+      if (!SOURCELESS_CHTML_TRANSPARENT_TAGS.has(name)) {
+        state.invalid = true;
+        return null;
+      }
+      const converted = [];
+      for (const child of directSemanticChildren(node)) {
+        const value = convert(child, depth + 1);
+        if (value) converted.push(value);
+      }
+      return rowFrom(converted);
+    };
+
+    const presentation = convert(visualMath);
+    if (state.invalid || !presentation || !state.structural) return finish(null);
+    const allText = documentObject.createTreeWalker(visualMath, 4);
+    let nativeVisibleText = '';
+    for (let textNode = allText.nextNode(); textNode; textNode = allText.nextNode()) {
+      const raw = String(textNode.nodeValue || '');
+      if (!raw || /^\s*$/u.test(raw)) continue;
+      if (!state.consumedText.has(textNode)) return finish(null);
+      nativeVisibleText += raw;
+    }
+    nativeVisibleText = cleanClipboardText(nativeVisibleText);
+    if (!nativeVisibleText || nativeVisibleText.length > MAX_SELECTION_KEY_LENGTH) return finish(null);
+    const math = make('math'); math.appendChild(presentation);
+    const safeMath = sanitizedMathMLClone(math);
+    if (!safeMath || !semanticMathAgreesWithVisibleText(safeMath, nativeVisibleText, false)) return finish(null);
+    const semanticPunctuation = canonicalVisiblePunctuationProfile(safeMath.textContent || '');
+    const visiblePunctuation = canonicalVisiblePunctuationProfile(nativeVisibleText);
+    if (!punctuationProfilesAgree(semanticPunctuation, visiblePunctuation)) return finish(null);
+    return finish({ root, visualMath, math: safeMath, nativeVisibleText });
+  }
+
   function semanticOrderedMathJaxVisibleText(root) {
     if (!root || !root.querySelectorAll) return '';
     const leaves = Array.from(root.querySelectorAll('[data-semantic-id]')).filter((element) =>
@@ -7834,12 +8272,15 @@
 
   function rootsForRange(range) {
     const previousMathJaxSvgCache = ACTIVE_COPY_MATHJAX_SVG_CACHE;
+    const previousMathJaxChtmlCache = ACTIVE_COPY_MATHJAX_CHTML_CACHE;
     if (!previousMathJaxSvgCache) ACTIVE_COPY_MATHJAX_SVG_CACHE = new WeakMap();
+    if (!previousMathJaxChtmlCache) ACTIVE_COPY_MATHJAX_CHTML_CACHE = new WeakMap();
     try {
       const discovery = mathRootDiscoveryForRange(range);
       return discovery.overBudget ? [] : discovery.roots;
     } finally {
       ACTIVE_COPY_MATHJAX_SVG_CACHE = previousMathJaxSvgCache;
+      ACTIVE_COPY_MATHJAX_CHTML_CACHE = previousMathJaxChtmlCache;
     }
   }
 
@@ -7872,6 +8313,43 @@
     const className = typeof element.className === 'string' ? element.className : '';
     return element.getAttribute('aria-hidden') === 'true' ||
       /(?:^|\s)(?:sr-only|visually-hidden|screen-reader-only|MJX_Assistive_MathML)(?:\s|$)/i.test(className);
+  }
+
+  function ordinaryImageAltProjection(element) {
+    if (!element || element.nodeType !== 1 || !element.getAttribute) {
+      return { text: '', suppressed: false };
+    }
+    const raw = String(element.getAttribute('alt') || '');
+    if (!raw) return { text: '', suppressed: false };
+    const tag = (element.localName || '').toLowerCase();
+    const role = String(element.getAttribute('role') || '').trim().toLowerCase();
+    const accessibilityHidden = String(element.getAttribute('aria-hidden') || '')
+      .trim().toLowerCase() === 'true';
+    // <area> is never rendered as selected text. Likewise, presentation-only
+    // and accessibility-hidden images do not expose their alt as a textual
+    // replacement. Renderer-owned math images are replaced by their
+    // authenticated semantic root before an ordinary fragment reaches here.
+    if (tag !== 'img' || accessibilityHidden || role === 'none' || role === 'presentation') {
+      return { text: '', suppressed: true };
+    }
+    // A normal page selection should retain compact inline replacements such
+    // as an icon, symbol, or image formula, but not append a hidden paragraph
+    // that merely describes a large diagram. Bound the raw attribute before
+    // normalization or Unicode/word scans so hostile markup cannot turn this
+    // distinction into unbounded clipboard work.
+    if (raw.length > MAX_ORDINARY_IMAGE_ALT_SOURCE_LENGTH) {
+      return { text: '', suppressed: true };
+    }
+    const text = cleanOrdinaryCharacters(raw).replace(/[\t\f ]+/gu, ' ').trim();
+    if (!text) return { text: '', suppressed: true };
+    if (/\n/u.test(text) || Array.from(text).length > MAX_ORDINARY_IMAGE_ALT_CHARACTERS) {
+      return { text: '', suppressed: true };
+    }
+    const words = text.match(/[\p{L}\p{N}][\p{L}\p{N}\p{M}'\u2019\u2013\u2014-]*/gu) || [];
+    if (words.length > MAX_ORDINARY_IMAGE_ALT_WORDS && !looksLikeStandaloneUnicodeMath(text)) {
+      return { text: '', suppressed: true };
+    }
+    return { text, suppressed: false };
   }
 
   function serializeDomFragment(fragment) {
@@ -7923,7 +8401,8 @@
         return;
       }
       if (tag === 'img' || tag === 'area') {
-        append(element.getAttribute('alt') || '', false);
+        const projection = ordinaryImageAltProjection(element);
+        if (projection.text) append(projection.text, false);
         return;
       }
       if (tag === 'wbr') return;
@@ -8193,8 +8672,10 @@
         continue;
       }
       if (tag === 'img' || tag === 'area') {
-        const alt = cleanOrdinaryCharacters(element.getAttribute('alt') || '');
-        if (alt) element.replaceWith(element.ownerDocument.createTextNode(alt));
+        const projection = ordinaryImageAltProjection(element);
+        if (projection.text) {
+          element.replaceWith(element.ownerDocument.createTextNode(projection.text));
+        }
         else element.remove();
         continue;
       }
@@ -8677,7 +9158,9 @@
     return Boolean(math && getMathElement(root) === math);
   }
 
-  function semanticMathRootAgreesWithVisible(root, math) {
+  function semanticMathRootAgreesWithVisible(root, math, pageWindow) {
+    const sourceLessChtml = sourceLessMathJaxChtmlDescriptor(root, pageWindow);
+    if (sourceLessChtml && sourceLessChtml.math === math) return true;
     const embedded = embeddedMathDescriptor(root);
     if (embedded && embedded.math === math) return true;
     if (!wikipediaMathAgreesWithFallback(root, math)) return false;
@@ -8690,7 +9173,9 @@
   }
 
   function semanticMathSelectionPayload(root, range, settings, pageWindow) {
-    const math = getMathElement(root);
+    const nativeMath = getMathElement(root);
+    const sourceLessChtml = nativeMath ? null : sourceLessMathJaxChtmlDescriptor(root, pageWindow);
+    const math = nativeMath || (sourceLessChtml && sourceLessChtml.math);
     const selectedText = cleanClipboardText(range.toString());
     const selectedKey = mathSelectionKey(selectedText);
     if (!selectedKey) {
@@ -8707,6 +9192,15 @@
         : { kind: 'unmatched' };
     }
     if (selectedKey.length > MAX_SELECTION_KEY_LENGTH) return { kind: 'unmatched' };
+    if (sourceLessChtml) {
+      // The CHTML projection is authenticated for the complete painted
+      // semantic tree. It intentionally has no source-to-offset map, so an
+      // inner drag may never be widened to the surrounding vector, script,
+      // fraction, or row. A complete native surface match is still safe.
+      return selectedKey === mathSelectionKey(sourceLessChtml.nativeVisibleText)
+        ? { kind: 'whole' }
+        : { kind: 'unmatched' };
+    }
     if (!math) {
       const visibleKey = mathSelectionKey(independentVisibleMathText(root));
       // Source-only SVG/CHTML renderers still support a typical mouse drag
@@ -8727,7 +9221,7 @@
     if (root === math && nativeMathMLPresentationLayoutIsRisky(math)) {
       return { kind: 'unmatched' };
     }
-    if (!semanticMathRootAgreesWithVisible(root, math)) return { kind: 'unmatched' };
+    if (!semanticMathRootAgreesWithVisible(root, math, pageWindow)) return { kind: 'unmatched' };
     const visualBranch = visibleMathBranchForRange(root, range);
     const selectsWholeVisualBranch = visualBranch && visualBranchRepresentsWholeMath(root, visualBranch) &&
       range.startContainer === visualBranch && range.startOffset === 0 &&
@@ -8803,17 +9297,28 @@
 
   function wholeMathRootPayload(root, settings, pageWindow) {
     const embedded = embeddedMathDescriptor(root);
-    const sourceMath = getMathElement(root);
+    const nativeMath = getMathElement(root);
+    const sourceLessChtml = nativeMath ? null : sourceLessMathJaxChtmlDescriptor(root, pageWindow);
+    const sourceMath = nativeMath || (sourceLessChtml && sourceLessChtml.math);
+    const rejectedSourceLessChtml = !nativeMath && !sourceLessChtml && root && root.matches &&
+      root.matches('mjx-container.MathJax') && root.querySelector && root.querySelector(':scope > mjx-math');
+    // A malformed or ambiguous CHTML semantic tree must not fall through to
+    // the older plain-text source-less fallback. That fallback would flatten
+    // a rejected x_2 surface to x2 and erase the very topology that failed
+    // authentication.
+    if (rejectedSourceLessChtml && !getMathSource(root, pageWindow)) return null;
     if (!sourceMath && !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return null;
     const sourceText = sourceMath ? '' : getMathSource(root, pageWindow);
     if (!sourceMath && (!sourceText
       ? !sourceOnlyFallbackLayoutIsSafe(root)
       : !sourceOnlyMathAgreesWithVisible(root, pageWindow))) return null;
     if (sourceMath && root === sourceMath && nativeMathMLPresentationLayoutIsRisky(sourceMath)) return null;
-    if (sourceMath && !semanticMathRootAgreesWithVisible(root, sourceMath)) return null;
+    if (sourceMath && !semanticMathRootAgreesWithVisible(root, sourceMath, pageWindow)) return null;
     const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
     if (sourceMath && !safeMath) return null;
-    const text = embedded && safeMath
+    const text = sourceLessChtml && safeMath
+      ? mathMLFragmentText(safeMath, settings.outputMode)
+      : (embedded && safeMath
       ? mathMLFragmentText(safeMath, settings.outputMode)
       : (settings.outputMode === 'faithful' && safeMath
       ? faithfulRenderedMathText(root, safeMath, pageWindow)
@@ -8821,7 +9326,7 @@
         ? calculatorRenderedMathText(root, safeMath, pageWindow)
         : (safeMath && settings.outputMode !== 'latex'
           ? mathMLFragmentText(safeMath, settings.outputMode)
-          : extractMathText(root, settings.outputMode, pageWindow))));
+          : extractMathText(root, settings.outputMode, pageWindow)))));
     if (!text || !text.trim()) return null;
     const documentObject = root.ownerDocument;
     const richFragment = documentObject.createDocumentFragment();
@@ -9206,16 +9711,20 @@
     )) return null;
     const values = originalRoots.map((root) => {
       const embedded = embeddedMathDescriptor(root);
-      const sourceMath = getMathElement(root);
+      const nativeMath = getMathElement(root);
+      const sourceLessChtml = nativeMath ? null : sourceLessMathJaxChtmlDescriptor(root, pageWindow);
+      const sourceMath = nativeMath || (sourceLessChtml && sourceLessChtml.math);
       const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
       const sourceText = sourceMath ? '' : getMathSource(root, pageWindow);
       const sourceAgreement = sourceMath
-        ? semanticMathRootAgreesWithVisible(root, sourceMath)
+        ? semanticMathRootAgreesWithVisible(root, sourceMath, pageWindow)
         : Boolean(sourceText) && sourceOnlyMathAgreesWithVisible(root, pageWindow);
       return {
         text: !sourceAgreement || (sourceMath && !safeMath)
           ? ''
-          : (embedded && safeMath
+          : (sourceLessChtml && safeMath
+            ? mathMLFragmentText(safeMath, settings.outputMode)
+            : (embedded && safeMath
             ? mathMLFragmentText(safeMath, settings.outputMode)
             : (settings.outputMode === 'faithful' && safeMath
             ? faithfulRenderedMathText(root, safeMath, pageWindow)
@@ -9223,7 +9732,7 @@
               ? calculatorRenderedMathText(root, safeMath, pageWindow)
               : (safeMath && settings.outputMode !== 'latex'
                 ? mathMLFragmentText(safeMath, settings.outputMode)
-                : extractMathText(root, settings.outputMode, pageWindow))))),
+                : extractMathText(root, settings.outputMode, pageWindow)))))),
         display: isDisplayMath(root),
         root,
         safeMath,
@@ -12618,6 +13127,7 @@
       artifacts: false,
       collapsibleWhitespace: false,
       hiddenOrAlternate: false,
+      suppressedImageDescription: false,
       semanticScripts: false,
       semanticScriptUnrepresentable: false,
       structure: false
@@ -12723,8 +13233,9 @@
           continue;
         }
         if (tag === 'img' || tag === 'area') {
-          const alt = String(child.getAttribute && child.getAttribute('alt') || '');
-          if (!alt || !append(alt)) return null;
+          const projection = ordinaryImageAltProjection(child);
+          if (projection.suppressed) evidence.suppressedImageDescription = true;
+          if (projection.text && !append(projection.text)) return null;
           continue;
         }
         if (['script', 'style', 'noscript', 'template'].includes(tag)) {
@@ -12902,8 +13413,9 @@
         return;
       }
       if (tag === 'img' || tag === 'area') {
-        const alt = element.getAttribute('alt') || '';
-        if (alt) appendNormal(alt);
+        const projection = ordinaryImageAltProjection(element);
+        if (projection.text) appendNormal(projection.text);
+        if (projection.suppressed) evidence.suppressedImageDescription = true;
         evidence.hiddenOrAlternate = true;
         return;
       }
@@ -13018,13 +13530,11 @@
       const tag = (node.localName || '').toLowerCase();
       if (ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag) || isVisuallyHiddenElement(node)) return null;
       if (tag === 'img' || tag === 'area') {
-        const rawAlt = cleanOrdinaryCharacters(node.getAttribute('alt') || '');
-        if (!rawAlt) return null;
-        let alt = rawAlt;
-        if (inheritedMode === 'pre-line') {
-          alt = rawAlt.split('\n').map((line) => line.replace(/[\t\f ]+/g, ' ')).join('\n');
-          state.lastCollapsibleSpace = / $/.test(alt);
-        } else if (inheritedMode !== 'preserve') alt = cleanNormalRichText(rawAlt);
+        const projection = ordinaryImageAltProjection(node);
+        if (!projection.text) return null;
+        const alt = inheritedMode === 'preserve'
+          ? projection.text
+          : cleanNormalRichText(projection.text);
         return alt ? documentObject.createTextNode(alt) : null;
       }
       const mode = ordinaryWhitespaceMode(node, inheritedMode);
@@ -13113,10 +13623,17 @@
       }
     }
     const text = values.map((value) => value.text).join('\n');
-    if (!text.trim() || text === nativeText) return null;
+    const suppressedImageDescription = values.some((value) =>
+      value.evidence.suppressedImageDescription);
+    // Range#toString normally omits loaded image alts even though a browser's
+    // native clipboard projection may add them. When we deliberately removed
+    // a long or non-textual alt, still take ownership of the copy even if the
+    // cleaned visible string happens to equal Range#toString().
+    if (!text.trim() || (text === nativeText && !suppressedImageDescription)) return null;
     const confidentlyBetter = values.some((value) =>
       value.evidence.artifacts || value.evidence.collapsibleWhitespace ||
-      value.evidence.hiddenOrAlternate || value.evidence.structure) || repairedRendererLayout;
+      value.evidence.hiddenOrAlternate || value.evidence.suppressedImageDescription ||
+      value.evidence.structure) || repairedRendererLayout;
     if (!confidentlyBetter) return null;
     const onlyInvisibleArtifacts = hasCleanableArtifacts(nativeText) && cleanOrdinaryCharacters(nativeText) === text;
     let html;
@@ -14248,8 +14765,10 @@
 
   function getCopyPayload(documentObject, selection, settingsInput, pageWindow, target, allowDeferredPdf) {
     const previousMathJaxSvgCache = ACTIVE_COPY_MATHJAX_SVG_CACHE;
+    const previousMathJaxChtmlCache = ACTIVE_COPY_MATHJAX_CHTML_CACHE;
     const previousEmbeddedMathCache = ACTIVE_COPY_EMBEDDED_MATH_CACHE;
     ACTIVE_COPY_MATHJAX_SVG_CACHE = new WeakMap();
+    ACTIVE_COPY_MATHJAX_CHTML_CACHE = new WeakMap();
     ACTIVE_COPY_EMBEDDED_MATH_CACHE = new WeakMap();
     try {
     const settings = normalizeSettings(settingsInput);
@@ -14350,6 +14869,7 @@
     return null;
     } finally {
       ACTIVE_COPY_MATHJAX_SVG_CACHE = previousMathJaxSvgCache;
+      ACTIVE_COPY_MATHJAX_CHTML_CACHE = previousMathJaxChtmlCache;
       ACTIVE_COPY_EMBEDDED_MATH_CACHE = previousEmbeddedMathCache;
     }
   }

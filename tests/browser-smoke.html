@@ -76,6 +76,11 @@
   <span id="ordinary-symbol-prose">Symbols in prose: α vs β.</span>
   <span id="comparative-prose">Plan A ≠ Plan B</span>
   <span id="ordinary-artifacts">alpha&#8203;&nbsp;beta</span>
+  <p id="hidden-diagram-alt">Before<img
+    src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2' height='2'%3E%3Crect width='2' height='2' fill='black'/%3E%3C/svg%3E"
+    alt="Three sequential phasor diagrams, labeled A, B, and C. Each phasor diagram has an unlabeled coordinate system and several labeled vectors. This hidden accessibility description continues with every vector direction, construction step, parallelogram guideline, color, magnitude, and final result even though none of those words are visible prose on the selected page.">After</p>
+  <span id="source-less-chtml"><mjx-container class="MathJax" jax="CHTML"><mjx-math aria-hidden="true"><mjx-mover><mjx-over><mjx-mo><mjx-c>⃗</mjx-c></mjx-mo></mjx-over><mjx-base><mjx-mi><mjx-c>𝑉</mjx-c></mjx-mi></mjx-base></mjx-mover><mjx-mo><mjx-c>=</mjx-c></mjx-mo><mjx-msub><mjx-base><mjx-mover><mjx-over><mjx-mo><mjx-c>⃗</mjx-c></mjx-mo></mjx-over><mjx-base><mjx-mi><mjx-c>𝑉</mjx-c></mjx-mi></mjx-base></mjx-mover></mjx-base><mjx-script><mjx-mi><mjx-c>𝑅</mjx-c></mjx-mi></mjx-script></mjx-msub><mjx-mo><mjx-c>+</mjx-c></mjx-mo><mjx-mo><mjx-c>(</mjx-c></mjx-mo><mjx-msub><mjx-base><mjx-mover><mjx-over><mjx-mo><mjx-c>⃗</mjx-c></mjx-mo></mjx-over><mjx-base><mjx-mi><mjx-c>𝑉</mjx-c></mjx-mi></mjx-base></mjx-mover></mjx-base><mjx-script><mjx-mi><mjx-c>𝐿</mjx-c></mjx-mi></mjx-script></mjx-msub><mjx-mo><mjx-c>+</mjx-c></mjx-mo><mjx-msub><mjx-base><mjx-mover><mjx-over><mjx-mo><mjx-c>⃗</mjx-c></mjx-mo></mjx-over><mjx-base><mjx-mi><mjx-c>𝑉</mjx-c></mjx-mi></mjx-base></mjx-mover></mjx-base><mjx-script><mjx-mi><mjx-c>𝐶</mjx-c></mjx-mi></mjx-script></mjx-msub><mjx-mo><mjx-c>)</mjx-c></mjx-mo></mjx-math><mjx-speech aria-label="vector equation" role="img"></mjx-speech></mjx-container></span>
+  <span id="source-less-chtml-degree"><mjx-container class="MathJax" jax="CHTML"><mjx-math aria-hidden="true"><mjx-msup><mjx-base><mjx-mn><mjx-c>180</mjx-c></mjx-mn></mjx-base><mjx-script><mjx-mo><mjx-c>∘</mjx-c></mjx-mo></mjx-script></mjx-msup></mjx-math><mjx-speech aria-label="180 degrees" role="img"></mjx-speech></mjx-container></span>
   <p id="flattened-vector">An infinitely long, straight, cylindrical wire of radius 𝑅 has a uniform current density <span><span style="display:block">⃗</span><span style="display:block">𝐽</span><span style="display:block">=𝐽⁢</span><span style="display:block">ˆ</span><span style="display:block">𝑧</span></span> in cylindrical coordinates.</p>
   <span id="raw-styled">$\mathrm{speed}=2\mathrm{time}$</span>
   <span id="rich-script-editor" contenteditable="true">x2 + H2O</span>
@@ -386,6 +391,16 @@
       const artifacts = copyRange(document.querySelector('#ordinary-artifacts'));
       assertEqual('ordinary artifact cleanup is handled', artifacts.prevented, true);
       assertEqual('ordinary artifact cleanup text', artifacts.plain, 'alpha beta');
+
+      const hiddenDiagram = copyContents(document.querySelector('#hidden-diagram-alt'));
+      assertEqual('loaded diagram description is suppressed', hiddenDiagram.prevented, true);
+      assertEqual('loaded diagram leaves only visible prose', hiddenDiagram.plain, 'BeforeAfter');
+      assertEqual('loaded diagram description stays out of rich copy', /Three sequential|<img\b/i.test(hiddenDiagram.html), false);
+
+      const sourceLessChtml = copyContents(document.querySelector('#source-less-chtml'));
+      assertEqual('source-less CHTML phasor equation', sourceLessChtml.plain, 'V⃗ = V⃗_R + (V⃗_L + V⃗_C)');
+      const sourceLessDegree = copyContents(document.querySelector('#source-less-chtml-degree'));
+      assertEqual('source-less CHTML degree exponent', sourceLessDegree.plain, '180°');
 
       const flattenedVector = copyContents(document.querySelector('#flattened-vector'));
       const flattenedVectorExpected = 'An infinitely long, straight, cylindrical wire of radius R has a uniform current density J⃗ = Jẑ in cylindrical coordinates.';

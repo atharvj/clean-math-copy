@@ -220,6 +220,20 @@ function macmillanMathJaxChtmlFixture(vectorSource = String.raw`\vec{J}=J\hat{z}
   return { instance, target, radiusRoot, vectorRoot, pageWindow };
 }
 
+function sourceLessChtmlRoot(id, body, extra = '') {
+  return [
+    '<mjx-container id="', id, '" class="MathJax" jax="CHTML"', extra, '>',
+    '<mjx-math aria-hidden="true">', body, '</mjx-math>',
+    '<mjx-speech aria-label="math" role="img"></mjx-speech>',
+    '</mjx-container>'
+  ].join('');
+}
+
+function sourceLessChtmlToken(name, id, text, extra = '') {
+  return '<mjx-' + name + ' data-semantic-id="' + id + '"' + extra +
+    '><mjx-c>' + text + '</mjx-c></mjx-' + name + '>';
+}
+
 function positionedWordToken(left, top, size, text) {
   return [
     '<span role="presentation" dir="ltr" style="left:calc(var(--scale-factor)*', left,
@@ -593,6 +607,29 @@ test('serializes native MathML fractions, roots, scripts, and tables', () => {
     '(x + 1)/√y = a₁²'
   );
   assert.equal(cleanCopy.mathMLToUnicode(instance.window.document.querySelector('#matrix')), '[a, b; c, d]');
+});
+
+test('serializes MathML degree scripts contextually in every output mode', () => {
+  const instance = dom([
+    '<math id="circ"><msup><mn>180</mn><mo>∘</mo></msup></math>',
+    '<math id="degree"><msup><mn>180</mn><mo>°</mo></msup></math>',
+    '<math id="indexed"><msubsup><mi>x</mi><mi>i</mi><mo>∘</mo></msubsup></math>',
+    '<math id="composition"><mrow><mi>f</mi><mo>∘</mo><mi>g</mi></mrow></math>'
+  ].join(''));
+  const documentObject = instance.window.document;
+  for (const id of ['circ', 'degree']) {
+    const math = documentObject.querySelector('#' + id);
+    assert.equal(cleanCopy.mathMLToFaithful(math), '180°');
+    assert.equal(cleanCopy.mathMLToCalculator(math), '180*degrees');
+    assert.equal(cleanCopy.mathMLToLatex(math), String.raw`{180}^{\circ}`);
+  }
+  const indexed = documentObject.querySelector('#indexed');
+  assert.equal(cleanCopy.mathMLToFaithful(indexed), 'xᵢ°');
+  assert.equal(cleanCopy.mathMLToCalculator(indexed), '(x_(i))*degrees');
+  assert.equal(cleanCopy.mathMLToLatex(indexed), String.raw`{x}_{i}^{\circ}`);
+  const composition = documentObject.querySelector('#composition');
+  assert.equal(cleanCopy.mathMLToFaithful(composition), 'f ∘ g');
+  assert.equal(cleanCopy.mathMLToLatex(composition), String.raw`f\circ g`);
 });
 
 test('mixed native MathML replaces only a visibly and normally laid-out root', () => {
@@ -1554,6 +1591,279 @@ test('Macmillan CHTML uses direct mjx-math TeX when page-world MathJax is unavai
     'An infinitely long, straight, cylindrical wire of radius R has a uniform current density ' +
       'J⃗ = Jẑ in cylindrical coordinates.'
   );
+});
+
+test('source-less MathJax CHTML reconstructs the complete phasor sentence on every host', () => {
+  const subscript = (letter) => [
+    '<mjx-msub><mjx-base>', sourceLessChtmlToken('mi', 0, '𝑉'), '</mjx-base>',
+    '<mjx-script>', sourceLessChtmlToken('mi', 1, letter), '</mjx-script></mjx-msub>'
+  ].join('');
+  let semanticId = 0;
+  const token = (name, text) => sourceLessChtmlToken(name, semanticId++, text);
+  const vector = () => [
+    '<mjx-texatom><mjx-mover><mjx-over>', token('mo', '⃗'), '</mjx-over>',
+    '<mjx-base>', token('mi', '𝑉'), '</mjx-base></mjx-mover></mjx-texatom>'
+  ].join('');
+  const vectorSubscript = (letter) => [
+    '<mjx-msub>', vector(),
+    '<mjx-script>', token('mi', letter), '</mjx-script></mjx-msub>'
+  ].join('');
+  const equation = [
+    '<mjx-mrow>', vector(), token('mo', '='), vectorSubscript('𝑅'), token('mo', '+'),
+    token('mo', '('), vectorSubscript('𝐿'), token('mo', '+'), vectorSubscript('𝐶'),
+    token('mo', ')'), '</mjx-mrow>'
+  ].join('');
+  const style = [
+    '<style>',
+    'mjx-over,mjx-base,mjx-script{display:block}',
+    'mjx-over{position:absolute;transform:translateY(-.4em)}',
+    'mjx-script{position:relative;transform:translateY(.25em)}',
+    '</style>'
+  ].join('');
+  const expected = 'A capacitor V_C, inductor V_L, and resistor V_R. ' +
+    'The output voltage vector V⃗ is the vector sum V⃗ = V⃗_R + (V⃗_L + V⃗_C).';
+  for (const url of [
+    'https://lesson.invalid/physics',
+    'https://unrelated.example/article',
+    'https://localhost.invalid:8443/custom'
+  ]) {
+    semanticId = 0;
+    const instance = dom([
+      style, '<p id="target">A capacitor ', sourceLessChtmlRoot('vc', subscript('𝐶')),
+      ', inductor ', sourceLessChtmlRoot('vl', subscript('𝐿')), ', and resistor ',
+      sourceLessChtmlRoot('vr', subscript('𝑅')), '. The output voltage vector ',
+      sourceLessChtmlRoot('vector', vector()), ' is the vector sum ',
+      sourceLessChtmlRoot('equation', equation), '.</p>'
+    ].join(''), url);
+    const target = instance.window.document.querySelector('#target');
+    const selection = selectContents(instance.window, target);
+    assert.match(selection.toString(), /⃗𝑉=⃗𝑉𝑅\+\(⃗𝑉𝐿\+⃗𝑉𝐶\)/u, url);
+    const payload = cleanCopy.getCopyPayload(
+      instance.window.document,
+      selection,
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    );
+    assert.equal(payload.reason, 'rendered-math', url);
+    assert.equal(payload.text, expected, url);
+    assert.doesNotMatch(payload.text, /[\n\r\u2061-\u2064\u{1d400}-\u{1d7ff}]/u, url);
+    const equationRoot = instance.window.document.querySelector('#equation');
+    for (const [outputMode, equationText] of Object.entries({
+      faithful: 'V⃗ = V⃗_R + (V⃗_L + V⃗_C)',
+      calculator: 'V=V_(R)+(V_(L)+V_(C))',
+      latex: '$\\overset{⃗}{V}={\\overset{⃗}{V}}_{R}+({\\overset{⃗}{V}}_{L}+{\\overset{⃗}{V}}_{C})$'
+    })) {
+      assert.equal(cleanCopy.getCopyPayload(
+        instance.window.document,
+        selectContents(instance.window, equationRoot),
+        { outputMode },
+        instance.window,
+        equationRoot
+      ).text, equationText, url + ' ' + outputMode);
+    }
+  }
+});
+
+test('whole phasor explanations combine source-less CHTML while omitting a hidden diagram transcript', () => {
+  const rendered = (id, factory) => {
+    let semanticId = 0;
+    const token = (name, text) => sourceLessChtmlToken(name, semanticId++, text);
+    return sourceLessChtmlRoot(id, factory(token));
+  };
+  const subscript = (id, letter) => rendered(id, (token) => [
+    '<mjx-msub><mjx-base>', token('mi', '𝑉'), '</mjx-base>',
+    '<mjx-script>', token('mi', letter), '</mjx-script></mjx-msub>'
+  ].join(''));
+  const vector = (token) => [
+    '<mjx-mover><mjx-over>', token('mo', '⃗'), '</mjx-over>',
+    '<mjx-base>', token('mi', '𝑉'), '</mjx-base></mjx-mover>'
+  ].join('');
+  const vectorSubscript = (token, letter) => [
+    '<mjx-msub><mjx-base>', vector(token), '</mjx-base>',
+    '<mjx-script>', token('mi', letter), '</mjx-script></mjx-msub>'
+  ].join('');
+  const equation = rendered('equation', (token) => [
+    '<mjx-mrow>', vector(token), token('mo', '='), vectorSubscript(token, '𝑅'),
+    token('mo', '+'), token('mo', '('), vectorSubscript(token, '𝐿'), token('mo', '+'),
+    vectorSubscript(token, '𝐶'), token('mo', ')'), '</mjx-mrow>'
+  ].join(''));
+  const degree = rendered('degree', (token) => [
+    '<mjx-msup><mjx-base>', token('mn', '180'), '</mjx-base>',
+    '<mjx-script>', token('mo', '∘'), '</mjx-script></mjx-msup>'
+  ].join(''));
+  const hiddenDiagramDescription = [
+    'Three sequential phasor diagrams, labeled A, B, and C.',
+    'Each diagram has a coordinate system and several labeled vectors.',
+    'This hidden accessibility transcript then describes every vector direction, color, magnitude,',
+    'parallelogram guideline, construction step, and final result in extensive detail.'
+  ].join(' ');
+  assert.ok(Array.from(hiddenDiagramDescription).length > 256);
+
+  const instance = dom([
+    '<main id="target"><h2>That\'s correct!</h2>',
+    '<p>A phasor diagram relates capacitor ', subscript('vc-1', '𝐶'), ', inductor ',
+    subscript('vl-1', '𝐿'), ', and resistor ', subscript('vr-1', '𝑅'),
+    '. The output voltage vector ', rendered('vector', vector), ' is the vector sum.</p>',
+    '<p>', equation, '</p>',
+    '<p>The drops ', subscript('vl-2', '𝐿'), ' and ', subscript('vc-2', '𝐶'),
+    ' are ', degree, ' out of phase.</p>',
+    '<figure><img src="phasor-diagram.png" alt="', hiddenDiagramDescription, '"></figure>',
+    '<p>From the options, the correct result is Figure D.</p></main>'
+  ].join(''), 'https://unrelated-courseware.invalid/explanation');
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, [
+    "That's correct!",
+    'A phasor diagram relates capacitor V_C, inductor V_L, and resistor V_R. ' +
+      'The output voltage vector V⃗ is the vector sum.',
+    'V⃗ = V⃗_R + (V⃗_L + V⃗_C)',
+    'The drops V_L and V_C are 180° out of phase.',
+    'From the options, the correct result is Figure D.'
+  ].join('\n\n'));
+  assert.doesNotMatch(payload.text + payload.html, /Three sequential|coordinate system|<img\b/iu);
+});
+
+test('source-less MathJax CHTML supports whole roots and never widens a strict partial vector selection', () => {
+  const body = [
+    '<mjx-msub><mjx-base><mjx-mover><mjx-over>',
+    sourceLessChtmlToken('mo', 0, '⃗'), '</mjx-over><mjx-base>',
+    sourceLessChtmlToken('mi', 1, '𝑉'), '</mjx-base></mjx-mover></mjx-base>',
+    '<mjx-script>', sourceLessChtmlToken('mi', 2, '𝑅'), '</mjx-script></mjx-msub>'
+  ].join('');
+  const instance = dom(sourceLessChtmlRoot('target', body));
+  const target = instance.window.document.querySelector('#target');
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    { outputMode: 'faithful' },
+    instance.window,
+    target
+  ).text, 'V⃗_R');
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    { outputMode: 'latex' },
+    instance.window,
+    target
+  ).text, '${\\overset{⃗}{V}}_{R}$');
+
+  const baseText = target.querySelector('mjx-mi mjx-c').firstChild;
+  const partial = selectRange(instance.window, baseText, 0, baseText, baseText.nodeValue.length);
+  assert.equal(partial.toString(), '𝑉');
+  assert.equal(cleanCopy.getCopyPayload(
+    instance.window.document,
+    partial,
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  ), null);
+});
+
+test('source-less CHTML rejects hidden, stale, duplicate, and unsupported semantic surfaces', () => {
+  const valid = [
+    '<mjx-msub><mjx-base>', sourceLessChtmlToken('mi', 0, 'x'), '</mjx-base>',
+    '<mjx-script>', sourceLessChtmlToken('mn', 1, '2'), '</mjx-script></mjx-msub>'
+  ].join('');
+  const cases = [
+    valid.replace('<mjx-c>x</mjx-c>', '<mjx-c style="display:none">x</mjx-c>'),
+    valid.replace('data-semantic-id="1"', 'data-semantic-id="0"'),
+    valid.replace('data-semantic-id="1"', 'data-semantic-id="' + '1'.repeat(17) + '"'),
+    valid.replace('<mjx-msub>', '<mjx-mmultiscripts>').replace('</mjx-msub>', '</mjx-mmultiscripts>'),
+    valid.replace('</mjx-script>', '</mjx-script><mjx-c>duplicate</mjx-c>')
+  ];
+  for (const body of cases) {
+    const instance = dom(sourceLessChtmlRoot('target', body));
+    const target = instance.window.document.querySelector('#target');
+    assert.equal(cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    ), null);
+  }
+
+  const staleMarkup = sourceLessChtmlRoot('target', valid).replace(
+    '<mjx-math aria-hidden="true">',
+    '<mjx-math aria-hidden="true" data-latex="y">'
+  );
+  const stale = dom(staleMarkup);
+  const staleTarget = stale.window.document.querySelector('#target');
+  assert.equal(cleanCopy.getCopyPayload(
+    stale.window.document,
+    selectContents(stale.window, staleTarget),
+    cleanCopy.DEFAULT_SETTINGS,
+    stale.window,
+    staleTarget
+  ), null);
+});
+
+test('source-less CHTML projects common visible scripts, fractions, roots, accents, fences, and tables', () => {
+  const copy = (body) => {
+    const instance = dom(sourceLessChtmlRoot('target', body));
+    const target = instance.window.document.querySelector('#target');
+    return cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, target),
+      cleanCopy.DEFAULT_SETTINGS,
+      instance.window,
+      target
+    );
+  };
+  const token = (name, id, text) => sourceLessChtmlToken(name, id, text);
+  assert.equal(copy([
+    '<mjx-msup><mjx-base>', token('mi', 0, 'x'), '</mjx-base>',
+    '<mjx-script>', token('mn', 1, '2'), '</mjx-script></mjx-msup>'
+  ].join('')).text, 'x²');
+  assert.equal(copy([
+    '<mjx-msub><mjx-base>', token('mi', 0, 'x'), '</mjx-base>',
+    '<mjx-script>', token('mi', 1, '𝑅'), '</mjx-script></mjx-msub>'
+  ].join('')).text, 'x_R');
+  assert.equal(copy([
+    '<mjx-msubsup><mjx-base>', token('mi', 0, 'x'), '</mjx-base><mjx-script>',
+    '<mjx-sub>', token('mi', 1, '𝑅'), '</mjx-sub>',
+    '<mjx-sup>', token('mn', 2, '2'), '</mjx-sup>',
+    '</mjx-script></mjx-msubsup>'
+  ].join('')).text, 'x_R²');
+  assert.equal(copy([
+    '<mjx-mfrac><mjx-frac><mjx-num>', token('mi', 0, 'x'), '</mjx-num>',
+    '<mjx-den>', token('mi', 1, 'y'), '</mjx-den></mjx-frac></mjx-mfrac>'
+  ].join('')).text, 'x/y');
+  assert.equal(copy([
+    '<mjx-msqrt><mjx-sqrt><mjx-surd>√</mjx-surd><mjx-box>',
+    token('mi', 0, 'x'), '</mjx-box></mjx-sqrt></mjx-msqrt>'
+  ].join('')).text, '√x');
+  assert.equal(copy([
+    '<mjx-mroot><mjx-root>', token('mn', 0, '3'), '</mjx-root>',
+    '<mjx-sqrt><mjx-surd>√</mjx-surd><mjx-box>', token('mi', 1, 'x'),
+    '</mjx-box></mjx-sqrt></mjx-mroot>'
+  ].join('')).text, '∛x');
+  assert.equal(copy([
+    '<mjx-mover><mjx-over>', token('mo', 0, '⃗'), '</mjx-over>',
+    '<mjx-base>', token('mi', 1, 'x'), '</mjx-base></mjx-mover>'
+  ].join('')).text, 'x⃗');
+  assert.equal(copy([
+    '<mjx-munder><mjx-base>', token('mi', 0, 'x'), '</mjx-base>',
+    '<mjx-under>', token('mo', 1, '――'), '</mjx-under></mjx-munder>'
+  ].join('')).text, 'x̲');
+  assert.equal(copy([
+    '<mjx-mrow>', token('mo', 0, '('),
+    '<mjx-msup><mjx-base>', token('mi', 1, 'x'), '</mjx-base><mjx-script>',
+    token('mn', 2, '2'), '</mjx-script></mjx-msup>', token('mo', 3, ')'), '</mjx-mrow>'
+  ].join('')).text, '(x²)');
+  assert.equal(copy([
+    '<mjx-mtable><mjx-table><mjx-itable><mjx-mtr><mjx-mtd>', token('mi', 0, 'a'),
+    '</mjx-mtd><mjx-mtd>', token('mi', 1, 'b'), '</mjx-mtd></mjx-mtr><mjx-mtr>',
+    '<mjx-mtd>', token('mi', 2, 'c'), '</mjx-mtd><mjx-mtd>', token('mi', 3, 'd'),
+    '</mjx-mtd></mjx-mtr></mjx-itable></mjx-table></mjx-mtable>'
+  ].join('')).text, '[a, b; c, d]');
 });
 
 test('Macmillan source-only CHTML never widens a strict partial vector selection', () => {
@@ -4294,6 +4604,123 @@ test('image alt text cannot reintroduce invisible artifacts into rich clipboard 
   );
   assert.equal(mixedPayload.text, 'A BCDE x = 1');
   assert.doesNotMatch(mixedPayload.html, leakedArtifact);
+});
+
+test('suppresses long hidden image descriptions on arbitrary hosts without losing surrounding text or math', () => {
+  const description = [
+    'Three sequential phasor diagrams, labeled A, B, and C.',
+    'Each phasor diagram has an unlabeled coordinate system and several labeled vectors.',
+    'The following sentences describe every vector direction and every construction step in detail.',
+    'This accessibility description is useful for the image but is not visible prose selected on the page.'
+  ].join(' ');
+  assert.ok(Array.from(description).length > 256);
+
+  for (const [host, wrapper] of [
+    ['https://alpha.example/', 'section'],
+    ['https://unrelated.example/', 'article'],
+    ['https://third.example/', 'custom-copy-shell']
+  ]) {
+    // There is deliberately no ordinary whitespace defect here. The payload
+    // must still take ownership rather than let native clipboard projection
+    // reintroduce the loaded image's hidden alt paragraph.
+    const ordinary = dom(
+      '<' + wrapper + ' id="target">Before<img src="diagram.png" alt="' +
+        description + '">After</' + wrapper + '>',
+      host
+    );
+    const ordinaryTarget = ordinary.window.document.querySelector('#target');
+    const ordinaryPayload = cleanCopy.getCopyPayload(
+      ordinary.window.document,
+      selectContents(ordinary.window, ordinaryTarget),
+      cleanCopy.DEFAULT_SETTINGS,
+      ordinary.window,
+      ordinaryTarget
+    );
+    assert.ok(ordinaryPayload, host + ' actively replaces native copy');
+    assert.equal(ordinaryPayload.text, 'BeforeAfter', host);
+    assert.doesNotMatch(ordinaryPayload.html, /Three sequential phasor/u, host);
+    assert.doesNotMatch(ordinaryPayload.html, /<img\b/iu, host);
+  }
+
+  const mixed = dom([
+    '<main id="target"><p>Formula ',
+    katex('<mrow><mi>x</mi><mo>=</mo><mn>1</mn></mrow>', 'x=1'),
+    '</p><figure><img src="diagram.png" alt="', description,
+    '"></figure><p>After.</p></main>'
+  ].join(''), 'https://renderer-neutral.example/lesson');
+  const mixedTarget = mixed.window.document.querySelector('#target');
+  const mixedPayload = cleanCopy.getCopyPayload(
+    mixed.window.document,
+    selectContents(mixed.window, mixedTarget),
+    cleanCopy.DEFAULT_SETTINGS,
+    mixed.window,
+    mixedTarget
+  );
+  assert.equal(mixedPayload.text, 'Formula x = 1\n\nAfter.');
+  assert.doesNotMatch(mixedPayload.html, /Three sequential phasor|<img\b/iu);
+  assert.match(mixedPayload.html, /role="math"/u);
+});
+
+test('keeps compact image replacements while dropping non-text image metadata consistently', () => {
+  const instance = dom([
+    '<p id="target">Before <img src="icon.png" alt="✓"> ',
+    '<img src="formula.png" alt="V_C"> ',
+    '<img src="formula-2.png" alt="x² + y²"> after</p>'
+  ].join(''));
+  const target = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, target),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    target
+  );
+  assert.equal(payload.text, 'Before ✓ V_C x² + y² after');
+  assert.doesNotMatch(payload.html, /<img\b/iu);
+  assert.match(payload.html, /Before ✓ V_C x² \+ y² after/u);
+
+  const projection = dom([
+    '<p id="target">A<img alt="✓">',
+    '<area alt="AREA SECRET">',
+    '<img aria-hidden="true" alt="ARIA SECRET">',
+    '<img role="presentation" alt="PRESENTATION SECRET">B</p>'
+  ].join(''));
+  assert.equal(
+    cleanCopy.serializeDomFragment(projection.window.document.querySelector('#target')),
+    'A✓B'
+  );
+
+  const imageOnly = dom('<p id="target"><img src="diagram.png" alt="' +
+    'A long hidden image description. '.repeat(12) + '"></p>');
+  const imageOnlyTarget = imageOnly.window.document.querySelector('#target');
+  assert.equal(cleanCopy.getCopyPayload(
+    imageOnly.window.document,
+    selectContents(imageOnly.window, imageOnlyTarget),
+    cleanCopy.DEFAULT_SETTINGS,
+    imageOnly.window,
+    imageOnlyTarget
+  ), null, 'an image-only selection remains on the native image-copy path');
+});
+
+test('bounds ordinary image replacement alt by Unicode characters, words, and lines', () => {
+  const instance = dom('<div></div>');
+  const documentObject = instance.window.document;
+  const project = (alt) => {
+    const image = documentObject.createElement('img');
+    image.setAttribute('alt', alt);
+    return cleanCopy.serializeDomFragment(image);
+  };
+  const thirtyTwoWords = Array.from({ length: 32 }, (_value, index) => 'w' + index).join(' ');
+  const thirtyThreeWords = thirtyTwoWords + ' overflow';
+  const fortyTermFormula = Array.from({ length: 40 }, () => 'x').join(' × ');
+
+  assert.equal(project('😀'.repeat(256)), '😀'.repeat(256));
+  assert.equal(project('😀'.repeat(257)), '');
+  assert.equal(project(thirtyTwoWords), thirtyTwoWords);
+  assert.equal(project(thirtyThreeWords), '');
+  assert.equal(project(fortyTermFormula), fortyTermFormula, 'bounded readable formulas are replacements, not prose');
+  assert.equal(project('first line\nsecond line'), '');
+  assert.equal(project('x'.repeat(2049)), '', 'raw input is rejected before Unicode scanning');
 });
 
 test('ordinary cleanup leaves over-budget ranges entirely native without cloning', () => {

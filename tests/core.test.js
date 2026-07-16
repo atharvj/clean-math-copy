@@ -51,6 +51,25 @@ test('faithful mode preserves visual notation while making linear structure unam
   assert.equal(cleanCopy.latexToFaithful(String.raw`\Delta x=\alpha\times 2`), 'Δx = α × 2');
 });
 
+test('degree scripts stay degrees without changing the composition operator', () => {
+  for (const source of [
+    String.raw`180^\circ`,
+    String.raw`180^{\circ}`,
+    String.raw`180\sp\circ`
+  ]) {
+    assert.equal(cleanCopy.latexToFaithful(source), '180°', source);
+    assert.equal(cleanCopy.latexToCalculator(source), '180*degrees', source);
+  }
+  for (const source of [String.raw`90^\degree`, String.raw`90^{\degree}`]) {
+    assert.equal(cleanCopy.latexToFaithful(source), '90°', source);
+    assert.equal(cleanCopy.latexToCalculator(source), '90*degrees', source);
+  }
+  assert.equal(cleanCopy.latexToFaithful(String.raw`f\circ g`), 'f∘g');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`x^{\circ+1}`), 'x^(∘+1)');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`A_\circ`), 'A_∘');
+  assert.equal(cleanCopy.latexToFaithful(String.raw`x^2`), 'x²');
+});
+
 test('faithful mode preserves invisible TeX group, denominator, function, and script scope', () => {
   const cases = new Map([
     [String.raw`\frac1{abcd}`, '1/(abcd)'],
@@ -266,6 +285,10 @@ test('supports display delimiters and original LaTeX mode', () => {
   assert.deepEqual(
     cleanCopy.convertDelimitedLatexText(String.raw`Use \(x^2\).`, 'latex'),
     { text: 'Use $x^2$.', converted: 1 }
+  );
+  assert.deepEqual(
+    cleanCopy.convertDelimitedLatexText(String.raw`Angle $180^\circ$.`, 'latex'),
+    { text: String.raw`Angle $180^\circ$.`, converted: 1 }
   );
 });
 
