@@ -19,14 +19,4 @@ The active mode always has a checkmark.
 
 PDFs open normally; on Chromium, the userscript replaces supported PDF tabs with a selectable view. Browsers that block userscripts inside their protected PDF viewer cannot be changed by a userscript. Image-only PDFs require OCR.
 
-## Development
-
-Requires Node.js 20.19+.
-
-```sh
-npm install
-npm run check
-npm run browser-smoke
-```
-
 [MIT License](./LICENSE)
