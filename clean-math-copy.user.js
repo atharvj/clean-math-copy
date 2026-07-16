@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.6.1
+// @version      2.6.2
 // @description  Accurately copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Intellectual07
 // @license      MIT
@@ -159,6 +159,10 @@
   // synchronous copy operation that observed it. Page mutations must be
   // visible to the next copy just as they are for SVG and embedded metadata.
   let ACTIVE_COPY_MATHJAX_CHTML_CACHE = null;
+  // MathJax 2 CommonHTML uses span classes instead of custom elements but
+  // carries the same semantic layout. Keep its projection independently
+  // cached for one copy operation so a failed modern probe cannot mask it.
+  let ACTIVE_COPY_MATHJAX2_CHTML_CACHE = null;
   const MATH_ROOT_SELECTOR = [
     '.katex-display',
     '.katex',
@@ -3471,8 +3475,8 @@
   function faithfulMathMLAccent(base, upper) {
     const value = String(upper == null ? '' : upper).trim();
     const accents = {
-      '^': ['hat', '\u0302'], 'ˆ': ['hat', '\u0302'],
-      '~': ['tilde', '\u0303'], '˜': ['tilde', '\u0303'],
+      '^': ['hat', '\u0302'], 'ˆ': ['hat', '\u0302'], '\u0302': ['hat', '\u0302'],
+      '~': ['tilde', '\u0303'], '˜': ['tilde', '\u0303'], '\u0303': ['tilde', '\u0303'],
       '¯': ['overline', '\u0305'], '‾': ['overline', '\u0305'], 'ˉ': ['overline', '\u0305'], '\u0305': ['overline', '\u0305'],
       '→': ['vec', '\u20d7'], '\u20d7': ['vec', '\u20d7'],
       '←': ['overleftarrow', '\u20d6'], '\u20d6': ['overleftarrow', '\u20d6'],
@@ -6389,6 +6393,36 @@
       const source = bounded(embeddedScript.textContent.trim());
       if (source) return source;
     }
+    // MathJax 2 CommonHTML inserts each rendered frame immediately before its
+    // own source script. With previews disabled, however, the preceding
+    // *element* of formula N is formula N-1's script because intervening prose
+    // is only a text node. The generic previous-first lookup below therefore
+    // assigns stale TeX to every later inline formula and one rejection sends
+    // the entire selection back to the browser. Resolve the renderer's keyed
+    // frame/script pair exactly, including the outer display wrapper, and
+    // cross-check it with the live v2 Hub when that API is available.
+    const mathJax2Chtml = mathJax2ChtmlShape(root);
+    if (mathJax2Chtml) {
+      const frameId = String(root.id || '');
+      const sourceId = frameId.endsWith('-Frame') ? frameId.slice(0, -6) : '';
+      const display = root.parentElement && root.parentElement.matches &&
+        root.parentElement.matches('span.mjx-chtml.MJXc-display') &&
+        elementChildren(root.parentElement).length === 1
+        ? root.parentElement
+        : null;
+      const candidate = (display || root).nextElementSibling;
+      let adjacentSource = '';
+      if (candidate && candidate.matches && candidate.matches('script[type^="math/tex"]')) {
+        // Official v2 associates `MathJax-Element-N-Frame` with the script
+        // `MathJax-Element-N`. An unkeyed or mismatched neighbor is ambiguous,
+        // never a reason to borrow text from another formula.
+        if (!sourceId || String(candidate.id || '') !== sourceId) return '';
+        adjacentSource = bounded((candidate.textContent || '').trim());
+      }
+      const hubSource = bounded(getMathJaxSource(root, pageWindow));
+      if (hubSource && adjacentSource && hubSource !== adjacentSource) return '';
+      return hubSource || adjacentSource;
+    }
     for (const sibling of [root.previousElementSibling, root.nextElementSibling]) {
       if (sibling && sibling.matches && sibling.matches('script[type^="math/tex"]')) {
         const source = bounded((sibling.textContent || '').trim());
@@ -6427,8 +6461,8 @@
     if (!root || root.nodeType !== 1) return false;
     const math = getMathElement(root);
     return Boolean(
-      (root.matches && root.matches('.katex-display, .MathJax_Display, .MathJax_SVG_Display, mjx-container[display="true"], mjx-container[display="block"]')) ||
-      (root.closest && root.closest('.katex-display, .MathJax_Display, .MathJax_SVG_Display')) ||
+      (root.matches && root.matches('.katex-display, .MathJax_Display, .MathJax_SVG_Display, span.mjx-chtml.MJXc-display, mjx-container[display="true"], mjx-container[display="block"]')) ||
+      (root.closest && root.closest('.katex-display, .MathJax_Display, .MathJax_SVG_Display, span.mjx-chtml.MJXc-display')) ||
       (math && math.getAttribute('display') === 'block')
     );
   }
@@ -6713,6 +6747,31 @@
     ['mjx-mtext', 'mtext'], ['mjx-ms', 'ms']
   ]);
 
+  function canonicalChtmlOverAccent(value) {
+    const textValue = cleanClipboardText(value).replace(/\s+/gu, '');
+    if (/^(?:⃗|→|[−-]*→)$/u.test(textValue)) return '\u20d7';
+    if (/^(?:⃖|←|←[−-]*)$/u.test(textValue)) return '\u20d6';
+    if (/^(?:\^|ˆ|̂)$/u.test(textValue)) return '\u0302';
+    if (/^(?:~|˜|̃)$/u.test(textValue)) return '\u0303';
+    if (/^(?:¯|‾|ˉ|̅|―+)$/u.test(textValue)) return '\u0305';
+    if (/^(?:˙|̇)$/u.test(textValue)) return '\u0307';
+    if (/^(?:¨|̈)$/u.test(textValue)) return '\u0308';
+    if (/^(?:ˊ|́)$/u.test(textValue)) return '\u0301';
+    if (/^(?:ˋ|̀)$/u.test(textValue)) return '\u0300';
+    if (/^(?:˘|̆)$/u.test(textValue)) return '\u0306';
+    if (/^(?:ˇ|̌)$/u.test(textValue)) return '\u030c';
+    if (/^(?:˚|̊)$/u.test(textValue)) return '\u030a';
+    if (textValue === '⏞') return '⏞';
+    return '';
+  }
+
+  function canonicalChtmlUnderAccent(value) {
+    const textValue = cleanClipboardText(value).replace(/\s+/gu, '');
+    if (/^(?:¯|‾|ˉ|̅|̲|―+|–+|-+|_+)$/u.test(textValue)) return '\u0332';
+    if (textValue === '⏟') return '⏟';
+    return '';
+  }
+
   function sourceLessMathJaxChtmlTextIsVisible(textNode, visualMath) {
     if (!textNode || textNode.nodeType !== 3 || !visualMath) return false;
     const documentObject = visualMath.ownerDocument;
@@ -6773,7 +6832,11 @@
     const rawJax = String(root.getAttribute('jax') || '');
     if (rawJax.length > 32) return finish(null);
     const jax = rawJax.trim().toLowerCase();
-    if (jax && jax !== 'chtml') return finish(null);
+    // MathJax 3 and 4 both identify their CommonHTML output explicitly.
+    // Requiring that renderer-owned marker keeps a page-authored collection
+    // of similarly named custom elements from authenticating as source-less
+    // math, especially now that a valid formula may be a single token.
+    if (jax !== 'chtml') return finish(null);
     // Independent MathML or TeX is authoritative. This projection is solely
     // for genuine CHTML surfaces whose semantic custom-element tree is the
     // only exact representation available to the copy event.
@@ -6786,6 +6849,11 @@
       if (sibling === visualMath) continue;
       const name = (sibling.localName || '').toLowerCase();
       if (!['mjx-speech', 'mjx-assistive-mml'].includes(name)) return finish(null);
+      // Renderer-owned accessibility siblings are empty containers or carry
+      // their speech through attributes/MathML. Never silently delete actual
+      // selected sibling text: malformed or page-authored CHTML must remain
+      // native when an alternate branch could be visibly contributing.
+      if (String(sibling.textContent || '').trim()) return finish(null);
     }
 
     const documentObject = root.ownerDocument;
@@ -6793,7 +6861,7 @@
     const state = {
       nodes: 0,
       characters: 0,
-      structural: 0,
+      tokens: 0,
       consumedText: new Set(),
       semanticIds: new Set(),
       invalid: false
@@ -6849,30 +6917,6 @@
       const name = (child.localName || '').toLowerCase();
       return !SOURCELESS_CHTML_EMPTY_LAYOUT_TAGS.has(name);
     });
-    const canonicalOverAccent = (value) => {
-      const textValue = cleanClipboardText(value).replace(/\s+/gu, '');
-      if (/^(?:⃗|→|[−-]*→)$/u.test(textValue)) return '\u20d7';
-      if (/^(?:⃖|←|←[−-]*)$/u.test(textValue)) return '\u20d6';
-      if (/^(?:\^|ˆ|̂)$/u.test(textValue)) return '\u0302';
-      if (/^(?:~|˜|̃)$/u.test(textValue)) return '\u0303';
-      if (/^(?:¯|‾|ˉ|̅|―+)$/u.test(textValue)) return '\u0305';
-      if (/^(?:˙|̇)$/u.test(textValue)) return '\u0307';
-      if (/^(?:¨|̈)$/u.test(textValue)) return '\u0308';
-      if (/^(?:ˊ|́)$/u.test(textValue)) return '\u0301';
-      if (/^(?:ˋ|̀)$/u.test(textValue)) return '\u0300';
-      if (/^(?:˘|̆)$/u.test(textValue)) return '\u0306';
-      if (/^(?:ˇ|̌)$/u.test(textValue)) return '\u030c';
-      if (/^(?:˚|̊)$/u.test(textValue)) return '\u030a';
-      if (textValue === '⏞') return '⏞';
-      return '';
-    };
-    const canonicalUnderAccent = (value) => {
-      const textValue = cleanClipboardText(value).replace(/\s+/gu, '');
-      if (/^(?:¯|‾|ˉ|̅|̲|―+)$/u.test(textValue)) return '\u0332';
-      if (textValue === '⏟') return '⏟';
-      return '';
-    };
-
     const convert = (node, depth = 0) => {
       if (!node || state.invalid || depth > MAX_MATHML_DEPTH) {
         state.invalid = true;
@@ -6906,6 +6950,7 @@
           state.invalid = true;
           return null;
         }
+        state.tokens += 1;
         return make(tokenName, value);
       }
       if (SOURCELESS_CHTML_EMPTY_LAYOUT_TAGS.has(name)) {
@@ -6919,7 +6964,6 @@
         return null;
       }
       if (name === 'mjx-msub' || name === 'mjx-msup') {
-        state.structural += 1;
         const children = directSemanticChildren(node);
         const scriptWrapper = children.find((child) =>
           (child.localName || '').toLowerCase() === 'mjx-script');
@@ -6939,7 +6983,6 @@
         return result;
       }
       if (name === 'mjx-msubsup') {
-        state.structural += 1;
         const children = directSemanticChildren(node);
         const scriptWrapper = children.find((child) =>
           (child.localName || '').toLowerCase() === 'mjx-script');
@@ -6965,7 +7008,6 @@
         const result = make('msubsup'); result.append(base, sub, sup); return result;
       }
       if (name === 'mjx-mover' || name === 'mjx-munder') {
-        state.structural += 1;
         const children = directSemanticChildren(node);
         const roleName = name === 'mjx-mover' ? 'mjx-over' : 'mjx-under';
         const role = children.filter((child) => (child.localName || '').toLowerCase() === roleName);
@@ -6980,7 +7022,9 @@
         const annotation = convert(role[0], depth + 1);
         if (!base || !annotation) { state.invalid = true; return null; }
         const raw = annotation.textContent || '';
-        const canonical = name === 'mjx-mover' ? canonicalOverAccent(raw) : canonicalUnderAccent(raw);
+        const canonical = name === 'mjx-mover'
+          ? canonicalChtmlOverAccent(raw)
+          : canonicalChtmlUnderAccent(raw);
         const result = make(name === 'mjx-mover' ? 'mover' : 'munder');
         result.setAttribute(name === 'mjx-mover' ? 'accent' : 'accentunder', canonical ? 'true' : 'false');
         if (canonical) annotation.textContent = canonical;
@@ -6988,7 +7032,6 @@
         return result;
       }
       if (name === 'mjx-munderover') {
-        state.structural += 1;
         const roles = ownedDescendants(node, new Set(['mjx-base', 'mjx-under', 'mjx-over']));
         const bases = roles.filter((item) => (item.localName || '').toLowerCase() === 'mjx-base');
         const lowers = roles.filter((item) => (item.localName || '').toLowerCase() === 'mjx-under');
@@ -7004,7 +7047,6 @@
         const result = make('munderover'); result.append(base, lower, upper); return result;
       }
       if (name === 'mjx-mfrac') {
-        state.structural += 1;
         const roles = ownedDescendants(node, new Set(['mjx-num', 'mjx-den']));
         const numerators = roles.filter((item) => (item.localName || '').toLowerCase() === 'mjx-num');
         const denominators = roles.filter((item) => (item.localName || '').toLowerCase() === 'mjx-den');
@@ -7018,7 +7060,6 @@
         const result = make('mfrac'); result.append(numerator, denominator); return result;
       }
       if (name === 'mjx-msqrt' || name === 'mjx-mroot') {
-        state.structural += 1;
         const boxes = ownedDescendants(node, new Set(['mjx-box']));
         if (boxes.length !== 1) { state.invalid = true; return null; }
         const surds = ownedDescendants(node, new Set(['mjx-surd']));
@@ -7036,7 +7077,6 @@
         const result = make('mroot'); result.append(radicand, degree); return result;
       }
       if (name === 'mjx-mtable') {
-        state.structural += 1;
         const rows = ownedDescendants(node, new Set(['mjx-mtr']));
         if (!rows.length || rows.length > MAX_MATHML_NODES) { state.invalid = true; return null; }
         const table = make('mtable');
@@ -7078,7 +7118,18 @@
     };
 
     const presentation = convert(visualMath);
-    if (state.invalid || !presentation || !state.structural) return finish(null);
+    // A genuine CHTML equation is not required to contain a fraction, script,
+    // radical, or accent. MathJax emits the same authenticated container and
+    // token topology for a lone inline variable such as `V` or `R`. Rejecting
+    // those leaf-only roots makes one harmless variable invalidate an entire
+    // mixed prose selection and hands the copy back to the browser, including
+    // every flattened renderer artifact and image description. Token-only
+    // roots still pass all of the strict checks above: one direct mjx-math
+    // branch, allowlisted CHTML elements, visible and fully consumed text,
+    // bounded traversal, sanitized MathML agreement, and punctuation
+    // agreement. Require at least one converted token so empty renderer
+    // scaffolding cannot authenticate itself.
+    if (state.invalid || !presentation || !state.tokens) return finish(null);
     const allText = documentObject.createTreeWalker(visualMath, 4);
     let nativeVisibleText = '';
     for (let textNode = allText.nextNode(); textNode; textNode = allText.nextNode()) {
@@ -7096,6 +7147,492 @@
     const visiblePunctuation = canonicalVisiblePunctuationProfile(nativeVisibleText);
     if (!punctuationProfilesAgree(semanticPunctuation, visiblePunctuation)) return finish(null);
     return finish({ root, visualMath, math: safeMath, nativeVisibleText });
+  }
+
+  const MATHJAX2_CHTML_TOKEN_CLASSES = new Map([
+    ['mjx-mi', 'mi'], ['mjx-mn', 'mn'], ['mjx-mo', 'mo'],
+    ['mjx-mtext', 'mtext'], ['mjx-ms', 'ms']
+  ]);
+  const MATHJAX2_CHTML_TRANSPARENT_CLASSES = new Set([
+    'mjx-math', 'mjx-mrow', 'mjx-mstyle', 'mjx-mpadded',
+    'mjx-texatom', 'mjx-semantics'
+  ]);
+  const MATHJAX2_CHTML_STRUCTURAL_CLASSES = new Set([
+    'mjx-msubsup', 'mjx-mfrac', 'mjx-msqrt', 'mjx-mroot',
+    'mjx-munderover', 'mjx-mtable'
+  ]);
+  const MATHJAX2_CHTML_ROLE_CLASSES = new Set([
+    'mjx-base', 'mjx-sub', 'mjx-sup', 'mjx-stack', 'mjx-over',
+    'mjx-under', 'mjx-op', 'mjx-numerator', 'mjx-denominator',
+    'mjx-root', 'mjx-surd', 'mjx-box', 'mjx-itable', 'mjx-table',
+    'mjx-row', 'mjx-cell', 'mjx-mtr', 'mjx-mtd'
+  ]);
+  const MATHJAX2_CHTML_GLYPH_CLASSES = new Set([
+    'mjx-char', 'mjx-charbox', 'mjx-delim-h', 'mjx-delim-v'
+  ]);
+  const MATHJAX2_CHTML_EMPTY_CLASSES = new Set([
+    'mjx-line', 'mjx-vsize', 'mjx-strut', 'mjx-spacer'
+  ]);
+  const MATHJAX2_CHTML_ALLOWED_CLASSES = new Set([
+    'mjx-chtml',
+    ...MATHJAX2_CHTML_TOKEN_CLASSES.keys(),
+    ...MATHJAX2_CHTML_TRANSPARENT_CLASSES,
+    ...MATHJAX2_CHTML_STRUCTURAL_CLASSES,
+    ...MATHJAX2_CHTML_ROLE_CLASSES,
+    ...MATHJAX2_CHTML_GLYPH_CLASSES,
+    ...MATHJAX2_CHTML_EMPTY_CLASSES
+  ]);
+
+  function mathJax2ChtmlPrimaryClass(element) {
+    if (!element || element.nodeType !== 1 || (element.localName || '').toLowerCase() !== 'span') return '';
+    const values = Array.from(element.classList || []).filter((name) => /^mjx-[a-z0-9-]+$/u.test(name));
+    return values.length === 1 ? values[0] : '';
+  }
+
+  function mathJax2ChtmlShape(root) {
+    if (!root || root.nodeType !== 1 || !root.matches ||
+        !root.matches('span.mjx-chtml.MathJax_CHTML') || hasSignificantDirectText(root)) return null;
+    const children = elementChildren(root);
+    if (!children.length || children.length > 2 ||
+        mathJax2ChtmlPrimaryClass(children[0]) !== 'mjx-math') return null;
+    const visualMath = children[0];
+    if (children.length === 1) return { visualMath, assistiveBranch: null, assistiveMath: null };
+
+    // AssistiveMML.js in the official v2 full configurations appends exactly
+    // one clipped MathML sibling after the painted CommonHTML branch. Model
+    // only that renderer-owned shape; an arbitrary second branch must never
+    // be mistaken for selected glyphs or silently discarded.
+    const assistiveBranch = children[1];
+    const classNames = Array.from(assistiveBranch.classList || []);
+    if ((assistiveBranch.localName || '').toLowerCase() !== 'span' ||
+        !classNames.includes('MJX_Assistive_MathML') ||
+        classNames.some((name) => !['MJX_Assistive_MathML', 'MJX_Assistive_MathML_Block'].includes(name)) ||
+        assistiveBranch.getAttribute('role') !== 'presentation' ||
+        hasSignificantDirectText(assistiveBranch)) return null;
+    const assistiveChildren = elementChildren(assistiveBranch);
+    const assistiveMath = assistiveChildren.length === 1 &&
+      (assistiveChildren[0].localName || '').toLowerCase() === 'math' &&
+      assistiveChildren[0].namespaceURI === MATHML_NAMESPACE
+      ? assistiveChildren[0]
+      : null;
+    return assistiveMath ? { visualMath, assistiveBranch, assistiveMath } : null;
+  }
+
+  function mathJax2AssistiveBranchIsHidden(branch) {
+    const documentObject = branch && branch.ownerDocument;
+    const view = documentObject && documentObject.defaultView;
+    if (!branch || !view || typeof view.getComputedStyle !== 'function') return false;
+    let computed;
+    try { computed = view.getComputedStyle(branch); } catch (_error) { return false; }
+    const display = String(computed && computed.display || '').toLowerCase();
+    const visibility = String(computed && computed.visibility || '').toLowerCase();
+    if (display === 'none' || visibility === 'hidden' || visibility === 'collapse') return true;
+    const position = String(computed && computed.position || '').toLowerCase();
+    const clip = String(computed && computed.clip || '').trim().toLowerCase();
+    const overflow = String(computed && computed.overflow || '').toLowerCase();
+    const width = Number.parseFloat(String(computed && computed.width || ''));
+    const height = Number.parseFloat(String(computed && computed.height || ''));
+    return position === 'absolute' && clip && clip !== 'auto' && overflow === 'hidden' &&
+      Number.isFinite(width) && width <= 2 && Number.isFinite(height) && height <= 2;
+  }
+
+  function mathJax2ChtmlDescriptor(root) {
+    const cache = ACTIVE_COPY_MATHJAX2_CHTML_CACHE;
+    if (cache && cache.has(root)) return cache.get(root);
+    const finish = (value) => {
+      if (cache && root && (typeof root === 'object' || typeof root === 'function')) cache.set(root, value);
+      return value;
+    };
+    if (!root || root.nodeType !== 1 || !root.matches ||
+        !root.matches('span.mjx-chtml.MathJax_CHTML') || !root.isConnected ||
+        !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return finish(null);
+    const shape = mathJax2ChtmlShape(root);
+    if (!shape) return finish(null);
+    const { visualMath, assistiveBranch, assistiveMath } = shape;
+    const documentObject = root.ownerDocument;
+    if (!documentObject || typeof documentObject.createElementNS !== 'function') return finish(null);
+
+    // Authenticate the complete CommonHTML vocabulary before projecting any
+    // part of it. MathJax 2 emits ordinary spans with one lower-case mjx role
+    // class; its additional MJXc-* classes describe fonts and spacing only.
+    // Unknown elements or role combinations remain native until modeled.
+    const elements = [root].concat(Array.from(visualMath.querySelectorAll('*')));
+    if (elements.length > MAX_MATHML_NODES) return finish(null);
+    for (const element of elements) {
+      const role = mathJax2ChtmlPrimaryClass(element);
+      if (!role || !MATHJAX2_CHTML_ALLOWED_CLASSES.has(role) ||
+          (element !== root && role === 'mjx-chtml')) return finish(null);
+    }
+
+    const state = {
+      nodes: 0,
+      characters: 0,
+      tokens: 0,
+      consumedText: new Set(),
+      invalid: false
+    };
+    const make = (name, textValue) => {
+      const element = documentObject.createElementNS(MATHML_NAMESPACE, name);
+      if (textValue != null) element.textContent = textValue;
+      return element;
+    };
+    const rowFrom = (values) => {
+      const items = values.filter(Boolean);
+      if (!items.length) return make('mrow');
+      if (items.length === 1) return items[0];
+      const row = make('mrow');
+      for (const item of items) row.appendChild(item);
+      return row;
+    };
+    const markText = (owner) => {
+      const walker = documentObject.createTreeWalker(owner, 4);
+      let value = '';
+      for (let textNode = walker.nextNode(); textNode; textNode = walker.nextNode()) {
+        const raw = String(textNode.nodeValue || '');
+        if (!raw) continue;
+        state.characters += raw.length;
+        if (state.characters > MAX_MATH_SOURCE_LENGTH ||
+            (!/^\s*$/u.test(raw) && state.consumedText.has(textNode)) ||
+            (!/^\s*$/u.test(raw) && !sourceLessMathJaxChtmlTextIsVisible(textNode, visualMath))) {
+          state.invalid = true;
+          return '';
+        }
+        state.consumedText.add(textNode);
+        value += raw;
+      }
+      return cleanClipboardText(value).replace(/[\t\n\f\r ]+/g, ' ').trim();
+    };
+    const ownedRoles = (owner, wanted) => {
+      const values = [];
+      const stack = [];
+      for (let child = owner.lastElementChild; child; child = child.previousElementSibling) stack.push(child);
+      while (stack.length) {
+        const element = stack.pop();
+        const role = mathJax2ChtmlPrimaryClass(element);
+        if (wanted.has(role)) {
+          values.push(element);
+          continue;
+        }
+        if (MATHJAX2_CHTML_STRUCTURAL_CLASSES.has(role)) continue;
+        for (let child = element.lastElementChild; child; child = child.previousElementSibling) stack.push(child);
+      }
+      return values;
+    };
+    let convert;
+    const convertLoose = (node, depth) => {
+      if (!node || state.invalid || depth > MAX_MATHML_DEPTH) {
+        state.invalid = true;
+        return null;
+      }
+      const role = mathJax2ChtmlPrimaryClass(node);
+      if (MATHJAX2_CHTML_TOKEN_CLASSES.has(role) ||
+          MATHJAX2_CHTML_TRANSPARENT_CLASSES.has(role) ||
+          MATHJAX2_CHTML_STRUCTURAL_CLASSES.has(role)) return convert(node, depth + 1);
+      if (MATHJAX2_CHTML_EMPTY_CLASSES.has(role)) {
+        if (markText(node)) state.invalid = true;
+        return null;
+      }
+      if (!MATHJAX2_CHTML_ROLE_CLASSES.has(role)) {
+        state.invalid = true;
+        return null;
+      }
+      const values = [];
+      for (const child of elementChildren(node)) {
+        const value = convertLoose(child, depth + 1);
+        if (value) values.push(value);
+      }
+      return rowFrom(values);
+    };
+    const roleValue = (role, depth) => convertLoose(role, depth + 1);
+
+    convert = (node, depth = 0) => {
+      if (!node || state.invalid || depth > MAX_MATHML_DEPTH) {
+        state.invalid = true;
+        return null;
+      }
+      state.nodes += 1;
+      if (state.nodes > MAX_MATHML_NODES) {
+        state.invalid = true;
+        return null;
+      }
+      const role = mathJax2ChtmlPrimaryClass(node);
+      const tokenName = MATHJAX2_CHTML_TOKEN_CLASSES.get(role);
+      if (tokenName) {
+        const descendants = Array.from(node.querySelectorAll('*'));
+        if (descendants.length > MAX_MATHML_NODES || descendants.some((element) => {
+          const childRole = mathJax2ChtmlPrimaryClass(element);
+          return !MATHJAX2_CHTML_GLYPH_CLASSES.has(childRole) &&
+            !MATHJAX2_CHTML_EMPTY_CLASSES.has(childRole) && childRole !== 'mjx-box';
+        })) {
+          state.invalid = true;
+          return null;
+        }
+        const value = normalizeOfficeGlyphs(markText(node));
+        if (!value) {
+          state.invalid = true;
+          return null;
+        }
+        state.tokens += 1;
+        return make(tokenName, value);
+      }
+      if (MATHJAX2_CHTML_EMPTY_CLASSES.has(role)) {
+        if (markText(node)) state.invalid = true;
+        return null;
+      }
+      if (role === 'mjx-msubsup') {
+        const roles = ownedRoles(node, new Set(['mjx-base', 'mjx-sub', 'mjx-sup']));
+        const bases = roles.filter((item) => mathJax2ChtmlPrimaryClass(item) === 'mjx-base');
+        const subs = roles.filter((item) => mathJax2ChtmlPrimaryClass(item) === 'mjx-sub');
+        const sups = roles.filter((item) => mathJax2ChtmlPrimaryClass(item) === 'mjx-sup');
+        if (bases.length !== 1 || subs.length > 1 || sups.length > 1 ||
+            (!subs.length && !sups.length)) {
+          state.invalid = true;
+          return null;
+        }
+        const base = roleValue(bases[0], depth);
+        const sub = subs.length ? roleValue(subs[0], depth) : null;
+        const sup = sups.length ? roleValue(sups[0], depth) : null;
+        if (!base || (subs.length && !sub) || (sups.length && !sup)) {
+          state.invalid = true;
+          return null;
+        }
+        const result = make(sub && sup ? 'msubsup' : (sub ? 'msub' : 'msup'));
+        result.appendChild(base);
+        if (sub) result.appendChild(sub);
+        if (sup) result.appendChild(sup);
+        return result;
+      }
+      if (role === 'mjx-munderover') {
+        const names = new Set(['mjx-base', 'mjx-op', 'mjx-sub', 'mjx-sup', 'mjx-under', 'mjx-over']);
+        const roles = ownedRoles(node, names);
+        const byName = (name) => roles.filter((item) => mathJax2ChtmlPrimaryClass(item) === name);
+        const baseRoles = byName('mjx-base').concat(byName('mjx-op'));
+        const subs = byName('mjx-sub');
+        const sups = byName('mjx-sup');
+        const unders = byName('mjx-under');
+        const overs = byName('mjx-over');
+        if (baseRoles.length !== 1 || subs.length > 1 || sups.length > 1 ||
+            unders.length > 1 || overs.length > 1 ||
+            ((subs.length || sups.length) && (unders.length || overs.length)) ||
+            (!subs.length && !sups.length && !unders.length && !overs.length)) {
+          state.invalid = true;
+          return null;
+        }
+        const base = roleValue(baseRoles[0], depth);
+        if (!base) { state.invalid = true; return null; }
+        if (subs.length || sups.length) {
+          const sub = subs.length ? roleValue(subs[0], depth) : null;
+          const sup = sups.length ? roleValue(sups[0], depth) : null;
+          if ((subs.length && !sub) || (sups.length && !sup)) { state.invalid = true; return null; }
+          // This renderer class is reserved for limits placed below/above a
+          // large operator. Ordinary side scripts use mjx-msubsup. Preserve
+          // that distinction so ∑ bounds remain limits rather than turning
+          // the operator into a parenthesized scripted operand.
+          const result = make(sub && sup ? 'munderover' : (sub ? 'munder' : 'mover'));
+          result.appendChild(base);
+          if (sub) result.appendChild(sub);
+          if (sup) result.appendChild(sup);
+          return result;
+        }
+        const under = unders.length ? roleValue(unders[0], depth) : null;
+        const over = overs.length ? roleValue(overs[0], depth) : null;
+        if ((unders.length && !under) || (overs.length && !over)) { state.invalid = true; return null; }
+        const result = make(under && over ? 'munderover' : (under ? 'munder' : 'mover'));
+        const underAccent = under && canonicalChtmlUnderAccent(under.textContent || '');
+        const overAccent = over && canonicalChtmlOverAccent(over.textContent || '');
+        if (under) {
+          result.setAttribute('accentunder', underAccent ? 'true' : 'false');
+          if (underAccent) under.textContent = underAccent;
+        }
+        if (over) {
+          result.setAttribute('accent', overAccent ? 'true' : 'false');
+          if (overAccent) over.textContent = overAccent;
+        }
+        result.appendChild(base);
+        if (under) result.appendChild(under);
+        if (over) result.appendChild(over);
+        return result;
+      }
+      if (role === 'mjx-mfrac') {
+        const roles = ownedRoles(node, new Set(['mjx-numerator', 'mjx-denominator']));
+        const numerators = roles.filter((item) => mathJax2ChtmlPrimaryClass(item) === 'mjx-numerator');
+        const denominators = roles.filter((item) => mathJax2ChtmlPrimaryClass(item) === 'mjx-denominator');
+        if (numerators.length !== 1 || denominators.length !== 1) { state.invalid = true; return null; }
+        const numerator = roleValue(numerators[0], depth);
+        const denominator = roleValue(denominators[0], depth);
+        if (!numerator || !denominator) { state.invalid = true; return null; }
+        const result = make('mfrac'); result.append(numerator, denominator); return result;
+      }
+      if (role === 'mjx-msqrt' || role === 'mjx-mroot') {
+        const surds = ownedRoles(node, new Set(['mjx-surd']));
+        const roots = ownedRoles(node, new Set(['mjx-root']));
+        if (surds.length !== 1 || (role === 'mjx-mroot' ? roots.length !== 1 : roots.length !== 0)) {
+          state.invalid = true;
+          return null;
+        }
+        if (!markText(surds[0])) { state.invalid = true; return null; }
+        const radicandOwner = surds[0].nextElementSibling;
+        if (!radicandOwner || mathJax2ChtmlPrimaryClass(radicandOwner) !== 'mjx-box') {
+          state.invalid = true;
+          return null;
+        }
+        const radicand = roleValue(radicandOwner, depth);
+        if (!radicand) { state.invalid = true; return null; }
+        if (role === 'mjx-msqrt') {
+          const result = make('msqrt'); result.appendChild(radicand); return result;
+        }
+        const degree = roleValue(roots[0], depth);
+        if (!degree) { state.invalid = true; return null; }
+        const result = make('mroot'); result.append(radicand, degree); return result;
+      }
+      if (role === 'mjx-mtable') {
+        const rows = ownedRoles(node, new Set(['mjx-mtr']));
+        if (!rows.length || rows.length > MAX_MATHML_NODES) { state.invalid = true; return null; }
+        const table = make('mtable');
+        let columns = -1;
+        for (const sourceRow of rows) {
+          const cells = ownedRoles(sourceRow, new Set(['mjx-mtd']));
+          if (!cells.length || (columns >= 0 && columns !== cells.length)) {
+            state.invalid = true;
+            return null;
+          }
+          columns = cells.length;
+          const row = make('mtr');
+          for (const sourceCell of cells) {
+            const value = roleValue(sourceCell, depth);
+            if (!value) { state.invalid = true; return null; }
+            const cell = make('mtd'); cell.appendChild(value); row.appendChild(cell);
+          }
+          table.appendChild(row);
+        }
+        return table;
+      }
+      if (!MATHJAX2_CHTML_TRANSPARENT_CLASSES.has(role)) {
+        state.invalid = true;
+        return null;
+      }
+      // `semantics` renders only its first presentation child. Reject extra
+      // branches rather than accidentally selecting annotation text.
+      const semanticChildren = elementChildren(node).filter((child) =>
+        !MATHJAX2_CHTML_EMPTY_CLASSES.has(mathJax2ChtmlPrimaryClass(child))
+      );
+      if (role === 'mjx-semantics' && semanticChildren.length !== 1) {
+        state.invalid = true;
+        return null;
+      }
+      const converted = [];
+      for (const child of semanticChildren) {
+        const value = convertLoose(child, depth + 1);
+        if (value) converted.push(value);
+      }
+      return rowFrom(converted);
+    };
+
+    const presentation = convert(visualMath);
+    if (state.invalid || !presentation || !state.tokens) return finish(null);
+    const walker = documentObject.createTreeWalker(visualMath, 4);
+    let nativeVisibleText = '';
+    for (let textNode = walker.nextNode(); textNode; textNode = walker.nextNode()) {
+      const raw = String(textNode.nodeValue || '');
+      if (!raw || /^\s*$/u.test(raw)) continue;
+      if (!state.consumedText.has(textNode)) return finish(null);
+      nativeVisibleText += raw;
+    }
+    nativeVisibleText = cleanClipboardText(nativeVisibleText);
+    if (!nativeVisibleText || nativeVisibleText.length > MAX_SELECTION_KEY_LENGTH) return finish(null);
+    const math = make('math'); math.appendChild(presentation);
+    const safeMath = sanitizedMathMLClone(math);
+    if (!safeMath) return finish(null);
+    // This MathML was projected from every selected CommonHTML glyph above,
+    // not recovered from an independent hidden branch. Generic text-order
+    // agreement is deliberately inappropriate here: v2 paints an accent
+    // before its base (`→V`) and paints roots/fractions with layout boxes,
+    // while the projected semantics correctly store `V⃗`, msqrt, and mfrac.
+    // Complete text consumption plus the exact allowlisted renderer topology
+    // is the independent authentication boundary for source-less v2 output.
+    const semanticPunctuation = canonicalVisiblePunctuationProfile(safeMath.textContent || '');
+    const visiblePunctuation = canonicalVisiblePunctuationProfile(nativeVisibleText);
+    if (!punctuationProfilesAgree(semanticPunctuation, visiblePunctuation)) return finish(null);
+    let safeAssistiveMath = null;
+    if (assistiveMath) {
+      if (!mathJax2AssistiveBranchIsHidden(assistiveBranch)) return finish(null);
+      safeAssistiveMath = sanitizedMathMLClone(assistiveMath);
+      if (!safeAssistiveMath) return finish(null);
+      // v2's AssistiveMML serializer emits underline as a generic
+      // `<munder><mo>_</mo>` without accentunder=true, while the CHTML branch
+      // paints the same mark with repeated dash glyphs. Canonicalize only the
+      // small, unambiguous accent glyph allowlist before comparison.
+      for (const scripted of Array.from(safeAssistiveMath.querySelectorAll('munder, mover'))) {
+        const scriptedChildren = elementChildren(scripted);
+        if (scriptedChildren.length !== 2) continue;
+        const accent = (scripted.localName || '').toLowerCase() === 'munder'
+          ? canonicalChtmlUnderAccent(scriptedChildren[1].textContent || '')
+          : canonicalChtmlOverAccent(scriptedChildren[1].textContent || '');
+        if (!accent) continue;
+        scripted.setAttribute(
+          (scripted.localName || '').toLowerCase() === 'munder' ? 'accentunder' : 'accent',
+          'true'
+        );
+        scriptedChildren[1].textContent = accent;
+      }
+      const projectedFaithful = mathMLToFaithful(safeMath);
+      const assistiveFaithful = mathMLToFaithful(safeAssistiveMath);
+      const projectedCalculator = mathMLToCalculator(safeMath);
+      const assistiveCalculator = mathMLToCalculator(safeAssistiveMath);
+      const projectedSignature = semanticVisibleAnchorSignature(projectedFaithful);
+      const assistiveSignature = semanticVisibleAnchorSignature(assistiveFaithful);
+      const anchorAgreement = !projectedSignature.overBudget && !assistiveSignature.overBudget &&
+        projectedSignature.identifiers === assistiveSignature.identifiers &&
+        projectedSignature.orderedIdentifiers === assistiveSignature.orderedIdentifiers &&
+        projectedSignature.accents === assistiveSignature.accents &&
+        projectedSignature.orderedAccents === assistiveSignature.orderedAccents &&
+        projectedSignature.glyphs === assistiveSignature.glyphs &&
+        ((projectedSignature.uncertainOperators || assistiveSignature.uncertainOperators) ||
+          (projectedSignature.operators === assistiveSignature.operators &&
+            projectedSignature.orderedOperators === assistiveSignature.orderedOperators));
+      // AssistiveMML sometimes parenthesizes a vector before adding its
+      // subscript (`(V⃗)_R`) while the visual projection emits the equivalent
+      // `V⃗_R`. Compare complete ordered anchors/accents and require identical
+      // calculator structure so those cosmetic fences do not reject genuine
+      // output while stale grouping, scripts, fractions, or operands still do.
+      if (!projectedFaithful || !assistiveFaithful ||
+          !anchorAgreement ||
+          faithfulAgreementKey(projectedCalculator) !== faithfulAgreementKey(assistiveCalculator)) {
+        return finish(null);
+      }
+    }
+    return finish({
+      root,
+      visualMath,
+      math: safeMath,
+      nativeVisibleText,
+      assistiveBranch,
+      assistiveMath,
+      safeAssistiveMath
+    });
+  }
+
+  function sourceLessChtmlDescriptor(root, pageWindow) {
+    const modern = sourceLessMathJaxChtmlDescriptor(root, pageWindow);
+    if (modern) return modern;
+    // A v2 frame with an authenticated adjacent/live TeX source remains a
+    // source-backed renderer. Preserve that source in original-LaTeX mode;
+    // use the structural projection only when v2 truly has no source.
+    if (getMathSource(root, pageWindow)) return null;
+    if (root && root.matches && root.matches('span.mjx-chtml.MathJax_CHTML')) {
+      const display = root.parentElement && root.parentElement.matches &&
+        root.parentElement.matches('span.mjx-chtml.MJXc-display') &&
+        elementChildren(root.parentElement).length === 1
+        ? root.parentElement
+        : null;
+      const adjacent = (display || root).nextElementSibling;
+      // `getMathSource` returns an empty string for mismatched, unkeyed,
+      // empty, or over-budget source metadata. Those are ambiguous frames,
+      // not source-less frames, and must never fall through to reconstruction.
+      if ((adjacent && adjacent.matches && adjacent.matches('script[type^="math/tex"]')) ||
+          getMathJaxSource(root, pageWindow)) return null;
+    }
+    return mathJax2ChtmlDescriptor(root);
   }
 
   function semanticOrderedMathJaxVisibleText(root) {
@@ -7758,6 +8295,19 @@
     const svgDescriptor = mathJaxSvgDescriptor(root);
     if (svgDescriptor) return true;
     const source = getMathSource(root, pageWindow);
+    const mathJax2Chtml = mathJax2ChtmlDescriptor(root);
+    if (source && mathJax2Chtml) {
+      // v2 paints scripts and accents in box order (`→V`, `VC`) rather
+      // than semantic reading order. Compare its keyed TeX source against
+      // the authenticated structural projection, never raw textContent and
+      // never a neighboring formula's script.
+      const faithfulSource = latexToFaithful(source);
+      const renderedFaithful = mathMLToFaithful(mathJax2Chtml.math);
+      if (!faithfulSourceAgreesWithRendered(faithfulSource, renderedFaithful)) return false;
+      const expectedPunctuation = latexVisiblePunctuationProfile(source);
+      const visiblePunctuation = canonicalVisiblePunctuationProfile(mathJax2Chtml.nativeVisibleText);
+      return punctuationProfilesAgree(expectedPunctuation, visiblePunctuation);
+    }
     const visible = independentVisibleMathText(root);
     if (!source) return true;
     // Metadata with no independently selected surface is not a formula the
@@ -7915,6 +8465,14 @@
   function isMathRoot(element) {
     if (!element || element.nodeType !== 1 || !element.matches) return false;
     if (rendererInternalSourceAttributeNode(element)) return false;
+    // Official MathJax 2 AssistiveMML adds data-mathml to the already
+    // authenticated renderer frame. Do not run that frame through the generic
+    // embedded-owner shape first: its intentional visual + assistive branches
+    // would fail the single-surface test and discovery would promote the
+    // hidden <math> all the way to an ordinary prose ancestor.
+    if (element.matches('.MathJax_CHTML, .MathJax_SVG, .MathJax, mjx-container, .katex, .katex-display')) {
+      return true;
+    }
     if (element.matches('[data-mathml],[data-equation-content]')) {
       return Boolean(embeddedMathOwnerShape(element));
     }
@@ -8273,14 +8831,17 @@
   function rootsForRange(range) {
     const previousMathJaxSvgCache = ACTIVE_COPY_MATHJAX_SVG_CACHE;
     const previousMathJaxChtmlCache = ACTIVE_COPY_MATHJAX_CHTML_CACHE;
+    const previousMathJax2ChtmlCache = ACTIVE_COPY_MATHJAX2_CHTML_CACHE;
     if (!previousMathJaxSvgCache) ACTIVE_COPY_MATHJAX_SVG_CACHE = new WeakMap();
     if (!previousMathJaxChtmlCache) ACTIVE_COPY_MATHJAX_CHTML_CACHE = new WeakMap();
+    if (!previousMathJax2ChtmlCache) ACTIVE_COPY_MATHJAX2_CHTML_CACHE = new WeakMap();
     try {
       const discovery = mathRootDiscoveryForRange(range);
       return discovery.overBudget ? [] : discovery.roots;
     } finally {
       ACTIVE_COPY_MATHJAX_SVG_CACHE = previousMathJaxSvgCache;
       ACTIVE_COPY_MATHJAX_CHTML_CACHE = previousMathJaxChtmlCache;
+      ACTIVE_COPY_MATHJAX2_CHTML_CACHE = previousMathJax2ChtmlCache;
     }
   }
 
@@ -9159,8 +9720,17 @@
   }
 
   function semanticMathRootAgreesWithVisible(root, math, pageWindow) {
-    const sourceLessChtml = sourceLessMathJaxChtmlDescriptor(root, pageWindow);
+    const sourceLessChtml = sourceLessChtmlDescriptor(root, pageWindow);
     if (sourceLessChtml && sourceLessChtml.math === math) return true;
+    if (root && root.matches && root.matches('span.mjx-chtml.MathJax_CHTML')) {
+      const mathJax2Chtml = mathJax2ChtmlDescriptor(root);
+      // A standard AssistiveMML branch is independently sanitized and
+      // cross-checked against the complete painted v2 projection by the
+      // descriptor. Any other MathML child or any disagreement is malformed
+      // renderer output and must remain native.
+      return Boolean(mathJax2Chtml &&
+        (mathJax2Chtml.assistiveMath === math || mathJax2Chtml.math === math));
+    }
     const embedded = embeddedMathDescriptor(root);
     if (embedded && embedded.math === math) return true;
     if (!wikipediaMathAgreesWithFallback(root, math)) return false;
@@ -9174,7 +9744,8 @@
 
   function semanticMathSelectionPayload(root, range, settings, pageWindow) {
     const nativeMath = getMathElement(root);
-    const sourceLessChtml = nativeMath ? null : sourceLessMathJaxChtmlDescriptor(root, pageWindow);
+    const sourceLessChtml = nativeMath ? null : sourceLessChtmlDescriptor(root, pageWindow);
+    const mathJax2Chtml = mathJax2ChtmlDescriptor(root);
     const math = nativeMath || (sourceLessChtml && sourceLessChtml.math);
     const selectedText = cleanClipboardText(range.toString());
     const selectedKey = mathSelectionKey(selectedText);
@@ -9192,6 +9763,17 @@
         : { kind: 'unmatched' };
     }
     if (selectedKey.length > MAX_SELECTION_KEY_LENGTH) return { kind: 'unmatched' };
+    if (nativeMath && mathJax2Chtml && mathJax2Chtml.assistiveMath === nativeMath) {
+      // Browser selection excludes the clipped AssistiveMML text even when
+      // Range endpoints surround the entire frame. Match only the painted
+      // CommonHTML glyph key so the hidden duplicate neither blocks a whole
+      // formula nor lets a strict partial selection widen.
+      const exactRoot = range.startContainer === root && range.startOffset === 0 &&
+        range.endContainer === root && range.endOffset === root.childNodes.length;
+      return exactRoot || selectedKey === mathSelectionKey(mathJax2Chtml.nativeVisibleText)
+        ? { kind: 'whole' }
+        : { kind: 'unmatched' };
+    }
     if (sourceLessChtml) {
       // The CHTML projection is authenticated for the complete painted
       // semantic tree. It intentionally has no source-to-offset map, so an
@@ -9202,7 +9784,13 @@
         : { kind: 'unmatched' };
     }
     if (!math) {
-      const visibleKey = mathSelectionKey(independentVisibleMathText(root));
+      // MathJax 2 positions fraction rows and large-operator limits with
+      // absolute layout. The generic source-backed visibility probe rejects
+      // that layout by design; its exact authenticated CHTML projector has
+      // already consumed every visible glyph and is the correct surface key.
+      const visibleKey = mathSelectionKey(
+        mathJax2Chtml ? mathJax2Chtml.nativeVisibleText : independentVisibleMathText(root)
+      );
       // Source-only SVG/CHTML renderers still support a typical mouse drag
       // whose endpoints live inside the visual branch. Promote only an exact
       // complete surface match; every strict partial remains native so source
@@ -9296,12 +9884,19 @@
   }
 
   function wholeMathRootPayload(root, settings, pageWindow) {
-    const embedded = embeddedMathDescriptor(root);
     const nativeMath = getMathElement(root);
-    const sourceLessChtml = nativeMath ? null : sourceLessMathJaxChtmlDescriptor(root, pageWindow);
-    const sourceMath = nativeMath || (sourceLessChtml && sourceLessChtml.math);
-    const rejectedSourceLessChtml = !nativeMath && !sourceLessChtml && root && root.matches &&
-      root.matches('mjx-container.MathJax') && root.querySelector && root.querySelector(':scope > mjx-math');
+    const mathJax2Chtml = mathJax2ChtmlDescriptor(root);
+    const projectedMathJax2 = mathJax2Chtml && mathJax2Chtml.assistiveMath === nativeMath
+      ? mathJax2Chtml.math
+      : null;
+    const embedded = projectedMathJax2 ? null : embeddedMathDescriptor(root);
+    const sourceLessChtml = nativeMath ? null : sourceLessChtmlDescriptor(root, pageWindow);
+    const sourceMath = projectedMathJax2 || nativeMath || (sourceLessChtml && sourceLessChtml.math);
+    const rejectedSourceLessChtml = !nativeMath && !sourceLessChtml && root && root.matches && (
+      (root.matches('mjx-container.MathJax') && root.querySelector && root.querySelector(':scope > mjx-math')) ||
+      (root.matches('span.mjx-chtml.MathJax_CHTML') && root.querySelector &&
+        root.querySelector(':scope > span.mjx-math'))
+    );
     // A malformed or ambiguous CHTML semantic tree must not fall through to
     // the older plain-text source-less fallback. That fallback would flatten
     // a rejected x_2 surface to x2 and erase the very topology that failed
@@ -9710,10 +10305,14 @@
       MAX_ORDINARY_SELECTION_MARKUP_LENGTH
     )) return null;
     const values = originalRoots.map((root) => {
-      const embedded = embeddedMathDescriptor(root);
       const nativeMath = getMathElement(root);
-      const sourceLessChtml = nativeMath ? null : sourceLessMathJaxChtmlDescriptor(root, pageWindow);
-      const sourceMath = nativeMath || (sourceLessChtml && sourceLessChtml.math);
+      const mathJax2Chtml = mathJax2ChtmlDescriptor(root);
+      const projectedMathJax2 = mathJax2Chtml && mathJax2Chtml.assistiveMath === nativeMath
+        ? mathJax2Chtml.math
+        : null;
+      const embedded = projectedMathJax2 ? null : embeddedMathDescriptor(root);
+      const sourceLessChtml = nativeMath ? null : sourceLessChtmlDescriptor(root, pageWindow);
+      const sourceMath = projectedMathJax2 || nativeMath || (sourceLessChtml && sourceLessChtml.math);
       const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
       const sourceText = sourceMath ? '' : getMathSource(root, pageWindow);
       const sourceAgreement = sourceMath
@@ -14766,9 +15365,11 @@
   function getCopyPayload(documentObject, selection, settingsInput, pageWindow, target, allowDeferredPdf) {
     const previousMathJaxSvgCache = ACTIVE_COPY_MATHJAX_SVG_CACHE;
     const previousMathJaxChtmlCache = ACTIVE_COPY_MATHJAX_CHTML_CACHE;
+    const previousMathJax2ChtmlCache = ACTIVE_COPY_MATHJAX2_CHTML_CACHE;
     const previousEmbeddedMathCache = ACTIVE_COPY_EMBEDDED_MATH_CACHE;
     ACTIVE_COPY_MATHJAX_SVG_CACHE = new WeakMap();
     ACTIVE_COPY_MATHJAX_CHTML_CACHE = new WeakMap();
+    ACTIVE_COPY_MATHJAX2_CHTML_CACHE = new WeakMap();
     ACTIVE_COPY_EMBEDDED_MATH_CACHE = new WeakMap();
     try {
     const settings = normalizeSettings(settingsInput);
@@ -14870,6 +15471,7 @@
     } finally {
       ACTIVE_COPY_MATHJAX_SVG_CACHE = previousMathJaxSvgCache;
       ACTIVE_COPY_MATHJAX_CHTML_CACHE = previousMathJaxChtmlCache;
+      ACTIVE_COPY_MATHJAX2_CHTML_CACHE = previousMathJax2ChtmlCache;
       ACTIVE_COPY_EMBEDDED_MATH_CACHE = previousEmbeddedMathCache;
     }
   }

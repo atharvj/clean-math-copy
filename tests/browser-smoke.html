@@ -16,6 +16,14 @@
     .pseudo-fraction > em, .pseudo-fraction > strong { display: table-row; }
     .pseudo-fraction > em { border-bottom: 1px solid currentColor; }
     .pseudo-fraction > em::before { content: "SECRET"; }
+    /* Exact layout-relevant rules emitted by MathJax 2.7.9 CommonHTML. */
+    .mjx-chtml { display: inline-block; line-height: 0; white-space: nowrap; }
+    .mjx-math { display: inline-block; border-collapse: separate; border-spacing: 0; }
+    .mjx-math * { display: inline-block; box-sizing: content-box !important; text-align: left; }
+    .mjx-stack { display: inline-block; }
+    .mjx-op, .mjx-over, .mjx-stack > .mjx-sup, .mjx-stack > .mjx-sub,
+    .mjx-char { display: block; }
+    .mjx-char { white-space: pre; }
   </style>
 </head>
 <body>
@@ -81,6 +89,31 @@
     alt="Three sequential phasor diagrams, labeled A, B, and C. Each phasor diagram has an unlabeled coordinate system and several labeled vectors. This hidden accessibility description continues with every vector direction, construction step, parallelogram guideline, color, magnitude, and final result even though none of those words are visible prose on the selected page.">After</p>
   <span id="source-less-chtml"><mjx-container class="MathJax" jax="CHTML"><mjx-math aria-hidden="true"><mjx-mover><mjx-over><mjx-mo><mjx-c>⃗</mjx-c></mjx-mo></mjx-over><mjx-base><mjx-mi><mjx-c>𝑉</mjx-c></mjx-mi></mjx-base></mjx-mover><mjx-mo><mjx-c>=</mjx-c></mjx-mo><mjx-msub><mjx-base><mjx-mover><mjx-over><mjx-mo><mjx-c>⃗</mjx-c></mjx-mo></mjx-over><mjx-base><mjx-mi><mjx-c>𝑉</mjx-c></mjx-mi></mjx-base></mjx-mover></mjx-base><mjx-script><mjx-mi><mjx-c>𝑅</mjx-c></mjx-mi></mjx-script></mjx-msub><mjx-mo><mjx-c>+</mjx-c></mjx-mo><mjx-mo><mjx-c>(</mjx-c></mjx-mo><mjx-msub><mjx-base><mjx-mover><mjx-over><mjx-mo><mjx-c>⃗</mjx-c></mjx-mo></mjx-over><mjx-base><mjx-mi><mjx-c>𝑉</mjx-c></mjx-mi></mjx-base></mjx-mover></mjx-base><mjx-script><mjx-mi><mjx-c>𝐿</mjx-c></mjx-mi></mjx-script></mjx-msub><mjx-mo><mjx-c>+</mjx-c></mjx-mo><mjx-msub><mjx-base><mjx-mover><mjx-over><mjx-mo><mjx-c>⃗</mjx-c></mjx-mo></mjx-over><mjx-base><mjx-mi><mjx-c>𝑉</mjx-c></mjx-mi></mjx-base></mjx-mover></mjx-base><mjx-script><mjx-mi><mjx-c>𝐶</mjx-c></mjx-mi></mjx-script></mjx-msub><mjx-mo><mjx-c>)</mjx-c></mjx-mo></mjx-math><mjx-speech aria-label="vector equation" role="img"></mjx-speech></mjx-container></span>
   <span id="source-less-chtml-degree"><mjx-container class="MathJax" jax="CHTML"><mjx-math aria-hidden="true"><mjx-msup><mjx-base><mjx-mn><mjx-c>180</mjx-c></mjx-mn></mjx-base><mjx-script><mjx-mo><mjx-c>∘</mjx-c></mjx-mo></mjx-script></mjx-msup></mjx-math><mjx-speech aria-label="180 degrees" role="img"></mjx-speech></mjx-container></span>
+  <main id="source-less-chtml-page">
+    <p>Capacitor voltage <mjx-container class="MathJax" jax="CHTML"><mjx-math aria-hidden="true"><mjx-msub><mjx-base><mjx-mi><mjx-c>𝑉</mjx-c></mjx-mi></mjx-base><mjx-script><mjx-mi><mjx-c>𝐶</mjx-c></mjx-mi></mjx-script></mjx-msub></mjx-math><mjx-speech aria-label="V sub C" role="img"></mjx-speech></mjx-container>.</p>
+    <figure><img
+      src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2' height='2'%3E%3Crect width='2' height='2' fill='black'/%3E%3C/svg%3E"
+      alt="Three sequential phasor diagrams, labeled A, B, and C. Each phasor diagram has an unlabeled coordinate system and several labeled vectors. This hidden accessibility description continues with every vector direction, construction step, parallelogram guideline, color, magnitude, and final result even though none of those words are visible prose on the selected page."></figure>
+    <p>Output voltage vector <mjx-container class="MathJax" jax="CHTML"><mjx-math aria-hidden="true"><mjx-mi><mjx-c>𝑉</mjx-c></mjx-mi></mjx-math><mjx-speech aria-label="V" role="img"></mjx-speech></mjx-container>.</p>
+  </main>
+  <!-- Genuine MathJax 2.7.9 CommonHTML topology. Unlike modern CHTML, v2
+       paints vector accents before their bases and scripts after their bases. -->
+  <main id="mathjax2-source-page">
+    <p>Legacy source-backed <span class="MathJax_Preview"></span><span id="MathJax-Element-201-Frame" class="mjx-chtml MathJax_CHTML" style="font-size:101%"><span class="mjx-math"><span class="mjx-mrow"><span class="mjx-msubsup"><span class="mjx-base" style="margin-right:-0.186em"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I" style="padding-top:0.436em;padding-bottom:0.313em;padding-right:0.186em">V</span></span></span><span class="mjx-sub" style="font-size:70.7%;vertical-align:-0.23em;padding-right:0.071em"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I" style="padding-top:0.498em;padding-bottom:0.313em;padding-right:0.045em">C</span></span></span></span></span></span></span><script id="MathJax-Element-201" type="math/tex">V_C</script>.</p>
+    <p><span class="MathJax_Preview"></span><span id="MathJax-Element-202-Frame" class="mjx-chtml MathJax_CHTML"><span class="mjx-math"><span class="mjx-mrow"><span class="mjx-texatom"><span class="mjx-mrow"><span class="mjx-munderover"><span class="mjx-stack"><span class="mjx-over"><span class="mjx-mo"><span class="mjx-char MJXc-TeX-vec-R">→</span></span></span><span class="mjx-op"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">V</span></span></span></span></span></span></span><span class="mjx-mo MJXc-space3"><span class="mjx-char MJXc-TeX-main-R">=</span></span><span class="mjx-msubsup MJXc-space3"><span class="mjx-base"><span class="mjx-texatom"><span class="mjx-mrow"><span class="mjx-munderover"><span class="mjx-stack"><span class="mjx-over"><span class="mjx-mo"><span class="mjx-char MJXc-TeX-vec-R">→</span></span></span><span class="mjx-op"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">V</span></span></span></span></span></span></span></span><span class="mjx-sub"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">R</span></span></span></span><span class="mjx-mo MJXc-space2"><span class="mjx-char MJXc-TeX-main-R">+</span></span><span class="mjx-mo MJXc-space2"><span class="mjx-char MJXc-TeX-main-R">(</span></span><span class="mjx-msubsup"><span class="mjx-base"><span class="mjx-texatom"><span class="mjx-mrow"><span class="mjx-munderover"><span class="mjx-stack"><span class="mjx-over"><span class="mjx-mo"><span class="mjx-char MJXc-TeX-vec-R">→</span></span></span><span class="mjx-op"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">V</span></span></span></span></span></span></span></span><span class="mjx-sub"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">L</span></span></span></span><span class="mjx-mo MJXc-space2"><span class="mjx-char MJXc-TeX-main-R">+</span></span><span class="mjx-msubsup MJXc-space2"><span class="mjx-base"><span class="mjx-texatom"><span class="mjx-mrow"><span class="mjx-munderover"><span class="mjx-stack"><span class="mjx-over"><span class="mjx-mo"><span class="mjx-char MJXc-TeX-vec-R">→</span></span></span><span class="mjx-op"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">V</span></span></span></span></span></span></span></span><span class="mjx-sub"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">C</span></span></span></span><span class="mjx-mo"><span class="mjx-char MJXc-TeX-main-R">)</span></span></span></span></span><script id="MathJax-Element-202" type="math/tex">\vec V = \vec V_R + (\vec V_L + \vec V_C)</script></p>
+    <figure><img
+      src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2' height='2'%3E%3Crect width='2' height='2' fill='black'/%3E%3C/svg%3E"
+      alt="Three sequential legacy phasor diagrams contain an unlabeled coordinate system, voltage vectors, opposite directions, a parallelogram construction, color information, magnitude comparisons, and detailed final-result guidance that is not visible prose. Additional hidden annotations describe every arrow, axis, label, and construction step."></figure>
+    <p>Legacy source-backed end.</p>
+  </main>
+  <main id="mathjax2-source-less-page">
+    <p>Legacy source-less <span id="MathJax-Element-203-Frame" class="mjx-chtml MathJax_CHTML" style="font-size:101%"><span class="mjx-math"><span class="mjx-mrow"><span class="mjx-msubsup"><span class="mjx-base" style="margin-right:-0.186em"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I" style="padding-top:0.436em;padding-bottom:0.313em;padding-right:0.186em">V</span></span></span><span class="mjx-sub" style="font-size:70.7%;vertical-align:-0.23em;padding-right:0.071em"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I" style="padding-top:0.498em;padding-bottom:0.313em;padding-right:0.045em">C</span></span></span></span></span></span></span>.</p>
+    <p><span id="MathJax-Element-204-Frame" class="mjx-chtml MathJax_CHTML"><span class="mjx-math"><span class="mjx-mrow"><span class="mjx-texatom"><span class="mjx-mrow"><span class="mjx-munderover"><span class="mjx-stack"><span class="mjx-over"><span class="mjx-mo"><span class="mjx-char MJXc-TeX-vec-R">→</span></span></span><span class="mjx-op"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">V</span></span></span></span></span></span></span><span class="mjx-mo MJXc-space3"><span class="mjx-char MJXc-TeX-main-R">=</span></span><span class="mjx-msubsup MJXc-space3"><span class="mjx-base"><span class="mjx-texatom"><span class="mjx-mrow"><span class="mjx-munderover"><span class="mjx-stack"><span class="mjx-over"><span class="mjx-mo"><span class="mjx-char MJXc-TeX-vec-R">→</span></span></span><span class="mjx-op"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">V</span></span></span></span></span></span></span></span><span class="mjx-sub"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">R</span></span></span></span><span class="mjx-mo MJXc-space2"><span class="mjx-char MJXc-TeX-main-R">+</span></span><span class="mjx-mo MJXc-space2"><span class="mjx-char MJXc-TeX-main-R">(</span></span><span class="mjx-msubsup"><span class="mjx-base"><span class="mjx-texatom"><span class="mjx-mrow"><span class="mjx-munderover"><span class="mjx-stack"><span class="mjx-over"><span class="mjx-mo"><span class="mjx-char MJXc-TeX-vec-R">→</span></span></span><span class="mjx-op"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">V</span></span></span></span></span></span></span></span><span class="mjx-sub"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">L</span></span></span></span><span class="mjx-mo MJXc-space2"><span class="mjx-char MJXc-TeX-main-R">+</span></span><span class="mjx-msubsup MJXc-space2"><span class="mjx-base"><span class="mjx-texatom"><span class="mjx-mrow"><span class="mjx-munderover"><span class="mjx-stack"><span class="mjx-over"><span class="mjx-mo"><span class="mjx-char MJXc-TeX-vec-R">→</span></span></span><span class="mjx-op"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">V</span></span></span></span></span></span></span></span><span class="mjx-sub"><span class="mjx-mi"><span class="mjx-char MJXc-TeX-math-I">C</span></span></span></span><span class="mjx-mo"><span class="mjx-char MJXc-TeX-main-R">)</span></span></span></span></span></p>
+    <figure><img
+      src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2' height='2'%3E%3Crect width='2' height='2' fill='black'/%3E%3C/svg%3E"
+      alt="Three sequential source-less legacy phasor diagrams contain coordinate axes, several labeled vectors, an opposite direction, parallelogram construction guidelines, color details, magnitude comparisons, and a verbose final-result transcript that is not visible prose."></figure>
+    <p>Legacy source-less end.</p>
+  </main>
   <p id="flattened-vector">An infinitely long, straight, cylindrical wire of radius 𝑅 has a uniform current density <span><span style="display:block">⃗</span><span style="display:block">𝐽</span><span style="display:block">=𝐽⁢</span><span style="display:block">ˆ</span><span style="display:block">𝑧</span></span> in cylindrical coordinates.</p>
   <span id="raw-styled">$\mathrm{speed}=2\mathrm{time}$</span>
   <span id="rich-script-editor" contenteditable="true">x2 + H2O</span>
@@ -401,6 +434,64 @@
       assertEqual('source-less CHTML phasor equation', sourceLessChtml.plain, 'V⃗ = V⃗_R + (V⃗_L + V⃗_C)');
       const sourceLessDegree = copyContents(document.querySelector('#source-less-chtml-degree'));
       assertEqual('source-less CHTML degree exponent', sourceLessDegree.plain, '180°');
+      const sourceLessPage = copyContents(document.querySelector('#source-less-chtml-page'));
+      assertEqual('whole source-less CHTML page is owned', sourceLessPage.prevented, true);
+      assertEqual(
+        'whole source-less CHTML page keeps a plain token root',
+        sourceLessPage.plain,
+        'Capacitor voltage V_C.\n\nOutput voltage vector V.'
+      );
+      assertEqual(
+        'whole source-less CHTML page suppresses the diagram transcript',
+        /Three sequential|coordinate system|<img\b/i.test(sourceLessPage.plain + sourceLessPage.html),
+        false
+      );
+
+      const mathJax2SourcePage = copyContents(document.querySelector('#mathjax2-source-page'));
+      assertEqual(
+        'source-backed MathJax 2 subscript root',
+        copyContents(document.querySelector('#MathJax-Element-201-Frame')).plain,
+        'V_C'
+      );
+      assertEqual(
+        'source-backed MathJax 2 vector equation root',
+        copyContents(document.querySelector('#MathJax-Element-202-Frame')).plain,
+        'V⃗ = V⃗_R + (V⃗_L + V⃗_C)'
+      );
+      assertEqual('whole source-backed MathJax 2 page is owned', mathJax2SourcePage.prevented, true);
+      assertEqual(
+        'source-backed MathJax 2 vectors and subscripts stay semantic',
+        mathJax2SourcePage.plain,
+        'Legacy source-backed V_C.\n\nV⃗ = V⃗_R + (V⃗_L + V⃗_C)\n\nLegacy source-backed end.'
+      );
+      assertEqual(
+        'source-backed MathJax 2 diagram transcript is suppressed',
+        /Three sequential|parallelogram|<img\b/i.test(mathJax2SourcePage.plain + mathJax2SourcePage.html),
+        false
+      );
+
+      const mathJax2SourceLessPage = copyContents(document.querySelector('#mathjax2-source-less-page'));
+      assertEqual(
+        'source-less MathJax 2 subscript root',
+        copyContents(document.querySelector('#MathJax-Element-203-Frame')).plain,
+        'V_C'
+      );
+      assertEqual(
+        'source-less MathJax 2 vector equation root',
+        copyContents(document.querySelector('#MathJax-Element-204-Frame')).plain,
+        'V⃗ = V⃗_R + (V⃗_L + V⃗_C)'
+      );
+      assertEqual('whole source-less MathJax 2 page is owned', mathJax2SourceLessPage.prevented, true);
+      assertEqual(
+        'source-less MathJax 2 vectors and subscripts stay semantic',
+        mathJax2SourceLessPage.plain,
+        'Legacy source-less V_C.\n\nV⃗ = V⃗_R + (V⃗_L + V⃗_C)\n\nLegacy source-less end.'
+      );
+      assertEqual(
+        'source-less MathJax 2 diagram transcript is suppressed',
+        /Three sequential|parallelogram|<img\b/i.test(mathJax2SourceLessPage.plain + mathJax2SourceLessPage.html),
+        false
+      );
 
       const flattenedVector = copyContents(document.querySelector('#flattened-vector'));
       const flattenedVectorExpected = 'An infinitely long, straight, cylindrical wire of radius R has a uniform current density J⃗ = Jẑ in cylindrical coordinates.';
