@@ -16,6 +16,7 @@
     .pseudo-fraction > em, .pseudo-fraction > strong { display: table-row; }
     .pseudo-fraction > em { border-bottom: 1px solid currentColor; }
     .pseudo-fraction > em::before { content: "SECRET"; }
+    .unsourced-pseudo-math::before { content: "+"; }
     /* Exact layout-relevant rules emitted by MathJax 2.7.9 CommonHTML. */
     .mjx-chtml { display: inline-block; line-height: 0; white-space: nowrap; }
     .mjx-math { display: inline-block; border-collapse: separate; border-spacing: 0; }
@@ -24,6 +25,16 @@
     .mjx-op, .mjx-over, .mjx-stack > .mjx-sup, .mjx-stack > .mjx-sub,
     .mjx-char { display: block; }
     .mjx-char { white-space: pre; }
+    .mjx-mfrac > .mjx-box.MJXc-stacked > .mjx-numerator,
+    .mjx-mfrac > .mjx-box.MJXc-stacked > .mjx-denominator,
+    .mjx-mfrac > .mjx-box.MJXc-stacked > .mjx-line { display: block; text-align: center; }
+    .mjx-mfrac > .mjx-box.MJXc-stacked > .mjx-line { border-bottom: 1px solid currentColor; }
+    .MJXc-stacked { height: 0; position: relative; }
+    .MJXc-stacked > * { position: absolute; }
+    .mjx-mtable { display: inline-table; }
+    .mjx-mtable > .mjx-table { display: table; }
+    .mjx-mtable > .mjx-table > .mjx-mtr { display: table-row; }
+    .mjx-mtable > .mjx-table > .mjx-mtr > .mjx-mtd { display: table-cell; padding: .08em .2em; }
   </style>
 </head>
 <body>
@@ -75,6 +86,8 @@
   <p id="css-stack-lead">And it is written in symbols as:</p>
   <p id="css-stack-equation"><span class="lim"><em>lim</em><strong>x→1</strong></span><span class="intbl"><em>x<sup>2</sup>−1</em><strong>x−1</strong></span> = 2</p>
   <span id="css-stack-pseudo" class="pseudo-fraction"><em>x</em><strong>y</strong></span>
+  <span id="unsourced-safe-math" role="math">V<sub>C</sub> + x<sup>2</sup></span>
+  <span id="unsourced-pseudo-math" class="unsourced-pseudo-math" role="math">xy</span>
 
   <main id="wikipedia-quadratic">
     <p>Given a general quadratic equation of the form <span class="nowrap">⁠<span class="mwe-math-element mwe-math-element-inline"><span class="mwe-math-mathml-inline mwe-math-mathml-a11y" style="display:none"><math alttext="{\displaystyle \textstyle ax^{2}+bx+c=0}"><semantics><mrow><mi>a</mi><msup><mi>x</mi><mn>2</mn></msup><mo>+</mo><mi>b</mi><mi>x</mi><mo>+</mo><mi>c</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">{\displaystyle \textstyle ax^{2}+bx+c=0}</annotation></semantics></math></span><img class="mwe-math-fallback-image-inline" aria-hidden="true" alt="{\displaystyle \textstyle ax^{2}+bx+c=0}"></span>⁠</span>, the values can be found using the quadratic formula,</p>
@@ -114,6 +127,174 @@
       alt="Three sequential source-less legacy phasor diagrams contain coordinate axes, several labeled vectors, an opposite direction, parallelogram construction guidelines, color details, magnitude comparisons, and a verbose final-result transcript that is not visible prose."></figure>
     <p>Legacy source-less end.</p>
   </main>
+  <main id="mathjax2-macmillan-page">
+    <p>The magnitude <span data-mjx2-formula="vlmax"></span> of the voltage across the inductor is related to the current amplitude <span data-mjx2-formula="im"></span> and the inductive reactance <span data-mjx2-formula="xl"></span>.</p>
+    <p>Therefore, the maximum inductor voltage is</p>
+    <p class="mathjax2-display"><span data-mjx2-formula="voltage"></span></p>
+    <p>Solving the phase relation for the inductance gives</p>
+    <p class="mathjax2-display"><span data-mjx2-formula="inductance"></span></p>
+    <p>The current amplitude can be expressed in terms of the source amplitude, impedance, resistance, and phase angle:</p>
+    <p class="mathjax2-display"><span data-mjx2-formula="current"></span></p>
+    <p>Substitution into the voltage expression gives</p>
+    <p class="mathjax2-display"><span data-mjx2-formula="final"></span></p>
+    <p>Thus the maximum voltage across the inductor is 81.1 V.</p>
+  </main>
+  <script>
+    (() => {
+      // Sanitized equivalents of the DOM emitted by official MathJax 2.7.9
+      // CommonHTML. Measurement-only ids/styles are omitted; renderer roles,
+      // box nesting, empty function-application nodes, and glyph order remain.
+      const escapeHTML = (value) => String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      const token = (role, value, font = 'main-R', extraClass = '') =>
+        '<span class="' + role + extraClass + '"><span class="mjx-char MJXc-TeX-' + font + '">' +
+        escapeHTML(value) + '</span></span>';
+      const mi = (value, roman = false, extraClass = '') =>
+        token('mjx-mi', value, roman ? 'main-R' : 'math-I', extraClass);
+      const mn = (value, extraClass = '') => token('mjx-mn', value, 'main-R', extraClass);
+      const mo = (value, extraClass = '') => token('mjx-mo', value, 'main-R', extraClass);
+      const row = (...values) => '<span class="mjx-mrow">' + values.flat().join('') + '</span>';
+      const atom = (value) => '<span class="mjx-texatom">' + row(value) + '</span>';
+      const emptyToken = (role) => '<span class="' + role + '"><span class="mjx-char"></span></span>';
+      const emptyRole = (role, id = '') => '<span' + (id ? ' id="' + id + '"' : '') +
+        ' class="' + role + '"></span>';
+      const sub = (base, value, extraClass = '') =>
+        '<span class="mjx-msubsup' + extraClass + '"><span class="mjx-base">' + base +
+        '</span><span class="mjx-sub">' + value + '</span></span>';
+      const sup = (base, value, extraClass = '') =>
+        '<span class="mjx-msubsup' + extraClass + '"><span class="mjx-base">' + base +
+        '</span><span class="mjx-sup">' + value + '</span></span>';
+      const frac = (numerator, denominator, extraClass = '') =>
+        '<span class="mjx-mfrac' + extraClass + '"><span class="mjx-box MJXc-stacked">' +
+        '<span class="mjx-numerator">' + numerator + '</span>' +
+        '<span class="mjx-denominator">' + denominator + '</span>' +
+        '<span class="mjx-line" style="border-bottom:1px solid"></span></span>' +
+        '<span class="mjx-vsize"></span></span>';
+      const table = (rows) => '<span class="mjx-mtable"><span class="mjx-table">' + rows.map((cells) =>
+        '<span class="mjx-mtr">' + cells.map((cell, index) =>
+          '<span class="mjx-mtd" style="text-align:' + (index === 0 ? 'right' : 'left') + '">' + cell + '</span>'
+        ).join('') + '</span>'
+      ).join('') + '</span></span>';
+      const functionName = (value) => mi(value, true, ' MJXc-space1') + emptyToken('mjx-mo');
+      const mspace = (scaled = false) => '<span class="mjx-mspace" style="' +
+        (scaled ? 'font-size:141.4%;' : '') + 'width:0.167em;height:0px"></span>';
+      const spacedUnit = (value, scaled = false) => mspace(scaled) + atom(mi(value, true));
+      const scriptVariable = (base, value, extraClass = '') => sub(mi(base), mi(value), extraClass);
+      const compoundVoltage = () => sub(mi('V'), atom(row(mi('L'), mo(','), mo('max'))));
+      const phi = () => mi('ϕ', false, ' MJXc-space1');
+      const omegaC = () => row(mi('ω'), mi('C'));
+      const oneOverOmegaC = () => frac(mn('1'), omegaC());
+      const em = () => scriptVariable('E', 'm');
+      const im = () => scriptVariable('I', 'm');
+      const degree = () => sup(mn('41.0'), mo('∘'), ' MJXc-space1');
+
+      const definitions = {
+        vlmax: {
+          body: row(compoundVoltage()),
+          source: String.raw`V_{L,\max}`
+        },
+        im: {
+          body: row(im()),
+          source: String.raw`I_m`
+        },
+        xl: {
+          body: row(scriptVariable('X', 'L'), mo('=', ' MJXc-space3'), mi('ω'), mi('L')),
+          source: String.raw`X_L=\omega L`
+        },
+        voltage: {
+          display: true,
+          body: row(
+            compoundVoltage(), mo('=', ' MJXc-space3'), im(),
+            scriptVariable('X', 'L'), mo('=', ' MJXc-space3'), im(), mi('ω'), mi('L')
+          ),
+          source: String.raw`V_{L,\max}=I_m X_L=I_m\omega L`
+        },
+        inductance: {
+          display: true,
+          body: row(
+            mi('L'), mo('=', ' MJXc-space3'),
+            frac(
+              row(mi('R'), functionName('tan'), phi(), mo('+'), oneOverOmegaC()),
+              mi('ω'),
+              ' MJXc-space3'
+            )
+          ),
+          source: String.raw`L=\frac{R\tan\phi+\frac{1}{\omega C}}{\omega}`
+        },
+        current: {
+          display: true,
+          body: row(table([
+            [row(im(), emptyRole('mjx-strut')), row(
+              emptyRole('mjx-mi', 'MJXc-Node-51'), mo('=', ' MJXc-space3'), frac(em(), mi('Z'), ' MJXc-space3')
+            )],
+            [row(emptyRole('mjx-strut')), row(
+              emptyRole('mjx-mi'), mo('=', ' MJXc-space3'),
+              frac(em(), row(mi('R'), atom(mo('/')), functionName('cos'), phi()), ' MJXc-space3')
+            )],
+            [row(emptyRole('mjx-strut')), row(
+              emptyRole('mjx-mi'), mo('=', ' MJXc-space3'),
+              frac(row(em(), functionName('cos'), phi()), mi('R'), ' MJXc-space3')
+            )]
+          ])),
+          source: String.raw`\begin{aligned}I_m&=\frac{E_m}{Z}\\&=\frac{E_m}{R/\cos\phi}\\&=\frac{E_m\cos\phi}{R}\end{aligned}`
+        },
+        final: {
+          display: true,
+          body: row(
+            compoundVoltage(), mo('=', ' MJXc-space3'),
+            row(mo('('), frac(row(em(), functionName('cos'), phi()), mi('R')), mo(')')),
+            row(
+              mo('('), mi('R'), functionName('tan'), phi(), mo('+'), oneOverOmegaC(), mo(')')
+            ),
+            mo('=', ' MJXc-space3'),
+            row(
+              mo('('),
+              frac(
+                row(mo('('), mn('120'), spacedUnit('V', true), mo(')'), functionName('cos'), degree()),
+                row(mn('113'), mspace(true), mi('Ω', true))
+              ),
+              mo(')')
+            ),
+            row(
+              mo('['), mo('('), mn('113'), mspace(), mi('Ω', true), mo(')'),
+              functionName('tan'), degree(), mo('+'),
+              frac(
+                mn('1'),
+                row(
+                  mo('('), mn('603'), mspace(true),
+                  atom(row(mi('r', true), mi('a', true), mi('d', true), atom(mo('/')), mi('s', true))), mo(')'),
+                  mo('('), mn('571'), mo('×'),
+                  sup(mn('10'), atom(row(mo('−'), mn('6')))),
+                  spacedUnit('F', true), mo(')')
+                )
+              ),
+              mo(']')
+            ),
+            mo('=', ' MJXc-space3'), mn('81.1', ' MJXc-space3'), spacedUnit('V')
+          ),
+          source: String.raw`V_{L,\max}=\left(\frac{E_m\cos\phi}{R}\right)\left(R\tan\phi+\frac{1}{\omega C}\right)=\left(\frac{(120\,\mathrm V)\cos 41.0^\circ}{113\,\Omega}\right)\left[(113\,\Omega)\tan 41.0^\circ+\frac{1}{(603\,\mathrm{rad/s})(571\times10^{-6}\,\mathrm F)}\right]=81.1\,\mathrm V`
+        }
+      };
+
+      let number = 301;
+      for (const placeholder of document.querySelectorAll('#mathjax2-macmillan-page [data-mjx2-formula]')) {
+        const definition = definitions[placeholder.getAttribute('data-mjx2-formula')];
+        const id = 'MathJax-Element-' + number;
+        number += 1;
+        const template = document.createElement('template');
+        template.innerHTML = '<span id="' + id + '-Frame" class="mjx-chtml MathJax_CHTML" style="font-size:101%">' +
+          '<span class="mjx-math">' + definition.body + '</span></span>';
+        const frame = template.content.firstElementChild;
+        const source = document.createElement('script');
+        source.id = id;
+        source.type = 'math/tex' + (definition.display ? '; mode=display' : '');
+        source.textContent = definition.source;
+        placeholder.replaceWith(frame, source);
+      }
+    })();
+  </script>
   <p id="flattened-vector">An infinitely long, straight, cylindrical wire of radius 𝑅 has a uniform current density <span><span style="display:block">⃗</span><span style="display:block">𝐽</span><span style="display:block">=𝐽⁢</span><span style="display:block">ˆ</span><span style="display:block">𝑧</span></span> in cylindrical coordinates.</p>
   <span id="raw-styled">$\mathrm{speed}=2\mathrm{time}$</span>
   <span id="rich-script-editor" contenteditable="true">x2 + H2O</span>
@@ -391,6 +572,12 @@
       const pseudoFraction = copyContents(document.querySelector('#css-stack-pseudo'));
       assertEqual('generated CSS math content fails closed', pseudoFraction.prevented, false);
       assertEqual('generated CSS math content stays native', pseudoFraction.plain, '');
+      const unsourcedSafe = copyContents(document.querySelector('#unsourced-safe-math'));
+      assertEqual('safe generic unsourced math is still owned', unsourcedSafe.prevented, true);
+      assertEqual('safe generic unsourced scripts stay semantic', unsourcedSafe.plain, 'V_C + x²');
+      const unsourcedPseudo = copyContents(document.querySelector('#unsourced-pseudo-math'));
+      assertEqual('generated content rejects generic unsourced math', unsourcedPseudo.prevented, false);
+      assertEqual('generic unsourced pseudo content stays native', unsourcedPseudo.plain, '');
 
       const wikipediaTarget = document.querySelector('#wikipedia-quadratic');
       const wikipediaRange = document.createRange();
@@ -490,6 +677,53 @@
       assertEqual(
         'source-less MathJax 2 diagram transcript is suppressed',
         /Three sequential|parallelogram|<img\b/i.test(mathJax2SourceLessPage.plain + mathJax2SourceLessPage.html),
+        false
+      );
+
+      const macmillanPage = document.querySelector('#mathjax2-macmillan-page');
+      const macmillanFrames = Array.from(macmillanPage.querySelectorAll('.MathJax_CHTML'));
+      const macmillanExpectedFormulas = [
+        'V_(L, max)',
+        'Iₘ',
+        'X_L = ωL',
+        'V_(L, max) = IₘX_L = IₘωL',
+        'L = (R tan ϕ + 1/(ωC))/ω',
+        'Iₘ = Eₘ/Z; = Eₘ/(R/cos ϕ); = (Eₘ cos ϕ)/R',
+        'V_(L, max) = ((Eₘ cos ϕ)/R)(R tan ϕ + 1/(ωC)) = ((120 V) cos 41.0°/(113 Ω))[(113 Ω) tan 41.0° + 1/((603 rad/s)(571 × 10⁻⁶ F))] = 81.1 V'
+      ];
+      assertEqual('Macmillan fixture has every reported formula', macmillanFrames.length, 7);
+      const macmillanStack = macmillanFrames[4].querySelector('.MJXc-stacked');
+      const macmillanNumerator = macmillanFrames[4].querySelector('.mjx-numerator');
+      assertEqual('Macmillan fixture uses official relative stacked boxes', getComputedStyle(macmillanStack).position, 'relative');
+      assertEqual('Macmillan fixture gives stacked boxes zero layout height', getComputedStyle(macmillanStack).height, '0px');
+      assertEqual('Macmillan fixture absolutely positions fraction rows', getComputedStyle(macmillanNumerator).position, 'absolute');
+      const macmillanAlignedCells = macmillanFrames[5].querySelectorAll('.mjx-mtd');
+      assertEqual('Macmillan aligned left column is renderer-right-aligned', getComputedStyle(macmillanAlignedCells[0]).textAlign, 'right');
+      assertEqual('Macmillan aligned equation column is renderer-left-aligned', getComputedStyle(macmillanAlignedCells[1]).textAlign, 'left');
+      macmillanFrames.forEach((frame, index) => {
+        const copied = copyContents(frame);
+        assertEqual('Macmillan MathJax 2 formula ' + (index + 1) + ' is owned', copied.prevented, true);
+        assertEqual('Macmillan MathJax 2 formula ' + (index + 1) + ' stays semantic', copied.plain, macmillanExpectedFormulas[index]);
+        assertEqual('Macmillan MathJax 2 formula ' + (index + 1) + ' has no layout newlines', /\n/u.test(copied.plain), false);
+      });
+      const macmillan = copyContents(macmillanPage);
+      const macmillanExpected = [
+        'The magnitude V_(L, max) of the voltage across the inductor is related to the current amplitude Iₘ and the inductive reactance X_L = ωL.',
+        'Therefore, the maximum inductor voltage is',
+        macmillanExpectedFormulas[3],
+        'Solving the phase relation for the inductance gives',
+        macmillanExpectedFormulas[4],
+        'The current amplitude can be expressed in terms of the source amplitude, impedance, resistance, and phase angle:',
+        macmillanExpectedFormulas[5],
+        'Substitution into the voltage expression gives',
+        macmillanExpectedFormulas[6],
+        'Thus the maximum voltage across the inductor is 81.1 V.'
+      ].join('\n\n');
+      assertEqual('whole Macmillan MathJax 2 passage is owned', macmillan.prevented, true);
+      assertEqual('whole Macmillan MathJax 2 passage keeps paragraph boundaries', macmillan.plain, macmillanExpected);
+      assertEqual(
+        'Macmillan passage never leaks flattened fraction rows or math alphabets',
+        /\n(?:Rtan|1|ωC|Eₘ|Z|R\/cos|113|603|571)|[𝑉𝐿𝐼𝑋𝐸𝑅𝑍𝜙𝜔]/u.test(macmillan.plain),
         false
       );
 

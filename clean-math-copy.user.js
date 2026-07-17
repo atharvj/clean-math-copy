@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.6.2
+// @version      2.6.3
 // @description  Accurately copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Intellectual07
 // @license      MIT
@@ -141,6 +141,11 @@
   const TRUSTED_RICH_STYLE_NODES = new WeakSet();
   const TRUSTED_PDF_VIEWER_ROOTS = new WeakSet();
   const TRUSTED_TEXT_PLACEHOLDERS = new WeakMap();
+  // Renderer projections can prove that a visual table came from an equation
+  // alignment grammar (rather than a matrix that happens to use right/left
+  // columns). Keep that proof out of page-controlled attributes and carry it
+  // across only this module's sanitized MathML clones.
+  const AUTHENTIC_ALIGNED_MATHML_TABLES = new WeakSet();
   // Embedded image/SVG metadata is mutable page state. Cache descriptors only
   // during one synchronous copy projection so changing an image, an
   // accessibility representation, or its metadata can never reuse a result
@@ -283,6 +288,12 @@
     r: 'ᵣ', s: 'ₛ', t: 'ₜ', u: 'ᵤ', v: 'ᵥ', x: 'ₓ', schwa: 'ₔ',
     beta: 'ᵦ', gamma: 'ᵧ', rho: 'ᵨ', phi: 'ᵩ', chi: 'ᵪ'
   });
+  const SUPERSCRIPT_GLYPH_BASES = new Map(
+    Object.entries(SUPERSCRIPTS).map(([base, glyph]) => [glyph, base])
+  );
+  const SUBSCRIPT_GLYPH_BASES = new Map(
+    Object.entries(SUBSCRIPTS).map(([base, glyph]) => [glyph, base])
+  );
 
   const DOUBLE_STRUCK = Object.freeze({
     C: 'ℂ', H: 'ℍ', N: 'ℕ', P: 'ℙ', Q: 'ℚ', R: 'ℝ', Z: 'ℤ'
@@ -315,7 +326,8 @@
     'double-struck': { ...DOUBLE_STRUCK }
   });
   const OFFICE_SEMANTIC_LETTERLIKE = new Set([
-    ...Object.values(DOUBLE_STRUCK), 'ℏ', 'ℓ', '℘', 'ℜ', 'ℑ'
+    ...Object.values(DOUBLE_STRUCK), ...MATH_VARIANT_GREEK_SYMBOLS,
+    'ℏ', 'ℓ', '℘', 'ℜ', 'ℑ'
   ]);
 
   const ASCII_SYMBOLS = Object.freeze({
@@ -359,6 +371,15 @@
   const ORDINARY_DROP_CONTENT_TAGS = new Set([
     'applet', 'audio', 'canvas', 'embed', 'frame', 'frameset', 'iframe', 'link',
     'meta', 'noscript', 'object', 'script', 'style', 'svg', 'template', 'video'
+  ]);
+  const UNSOURCED_MATH_FALLBACK_UNSAFE_TAGS = new Set([
+    ...ORDINARY_DROP_CONTENT_TAGS,
+    // Replaced and interactive elements can paint meaning that textContent
+    // cannot authenticate. Even an image alt is page-authored metadata, not
+    // independent evidence for the pixels selected by the user.
+    'area', 'bdi', 'bdo', 'button', 'datalist', 'details', 'input', 'map',
+    'meter', 'option', 'optgroup', 'picture', 'progress', 'rp', 'rt', 'ruby',
+    'select', 'source', 'summary', 'textarea', 'track'
   ]);
   const CSS_STACK_MATH_UNSAFE_TAGS = new Set([
     'a', 'area', 'audio', 'bdo', 'br', 'button', 'canvas', 'code', 'datalist',
@@ -1486,13 +1507,13 @@
       const callable = delimitedStart || (next && !/[=,;:)}\]]/.test(next) && !/[*/^_]/.test(next));
       if (!callable) {
         this.position = start;
-        return symbol;
+        return ' ' + symbol;
       }
 
       const argument = this.parseCalculatorArgumentAtom();
       if (!argument) {
         this.position = start;
-        return symbol;
+        return ' ' + symbol;
       }
       const plainSymbol = symbol.startsWith(DECLARED_OPERATOR_START) && symbol.endsWith(DECLARED_OPERATOR_END)
         ? symbol.slice(DECLARED_OPERATOR_START.length, -DECLARED_OPERATOR_END.length)
@@ -1505,7 +1526,11 @@
           : call + '_(' + scripts['_'] + ')';
       }
       if (scripts['^'] && !inverseName) call += '^(' + scripts['^'] + ')';
-      return call;
+      // TeX operator commands are separate tokens even when the source has no
+      // literal whitespace (`R\tan\phi`). Preserve that boundary until the
+      // calculator formatter can turn it into explicit multiplication; plain
+      // concatenation would misread `Rtan` as four variables.
+      return ' ' + call;
     }
 
     parseFaithfulFunction(symbol) {
@@ -1517,7 +1542,12 @@
         scripts[marker] = this.parseArgument();
         this.skipCalculatorSpacing();
       }
-      return symbol +
+      // Preserve the TeX function boundary on both sides. The apply sentinel
+      // separates the function from its argument; the leading soft space
+      // prevents a preceding factor from merging into the name (`R tan ϕ`,
+      // not the ambiguous identifier `Rtan ϕ`). Normal faithful formatting
+      // removes this space at a row/fence/operator boundary.
+      return ' ' + symbol +
         (scripts['_'] ? toFaithfulScript(scripts['_'], SUBSCRIPTS, '_') : '') +
         (scripts['^'] ? toFaithfulScript(scripts['^'], SUPERSCRIPTS, '^') : '') +
         FAITHFUL_FUNCTION_APPLY;
@@ -1679,11 +1709,23 @@
           : value;
       }
       if (['mathbb', 'Bbb'].includes(name)) {
-        return applyMathVariant(this.parseArgument(), 'double-struck', this.faithfulMode ? name : 'double-struck');
+        const value = this.parseArgument();
+        if (this.calculatorMode) {
+          return /^[A-Za-z][A-Za-z0-9_]*$/.test(value)
+            ? DECLARED_IDENTIFIER_START + value + DECLARED_IDENTIFIER_END
+            : value;
+        }
+        return applyMathVariant(value, 'double-struck', this.faithfulMode ? name : 'double-struck');
       }
       if (['mathcal', 'mathscr', 'mathfrak'].includes(name)) {
         const variants = { mathcal: 'script', mathscr: 'script', mathfrak: 'fraktur' };
-        return applyMathVariant(this.parseArgument(), variants[name], this.faithfulMode ? name : variants[name]);
+        const value = this.parseArgument();
+        if (this.calculatorMode) {
+          return /^[A-Za-z][A-Za-z0-9_]*$/.test(value)
+            ? DECLARED_IDENTIFIER_START + value + DECLARED_IDENTIFIER_END
+            : value;
+        }
+        return applyMathVariant(value, variants[name], this.faithfulMode ? name : variants[name]);
       }
       if (['color', 'class', 'cssId', 'style'].includes(name)) {
         this.parseArgument();
@@ -1919,6 +1961,23 @@
 
   function formatFaithfulMathText(input, retainProtectedText) {
     let text = resolveFaithfulScopes(cleanClipboardText(String(input == null ? '' : input)));
+    const functionNames = Array.from(CALCULATOR_FUNCTIONS)
+      .filter((name) => /^[A-Za-z]+$/u.test(name))
+      .sort((left, right) => right.length - left.length)
+      .join('|');
+    // parseFaithfulFunction emits one soft leading space. Keep it only when
+    // an actual preceding operand would otherwise merge into the function
+    // name; operators and fences already provide an unambiguous boundary.
+    const leadingFunctionSpace = new RegExp(
+      '(^|\\S)[ \\t]+(?=(?:' + functionNames + ')[^\\n' +
+        FAITHFUL_FUNCTION_APPLY + ']{0,128}' + FAITHFUL_FUNCTION_APPLY + ')',
+      'gu'
+    );
+    text = text.replace(leadingFunctionSpace, (_match, previous) =>
+      previous && /[\p{L}\p{N}\p{M})\]}⟩⌉⌋|‖₀-₟⁰-⁹′″‴⁗]/u.test(previous)
+        ? previous + ' '
+        : previous
+    );
     text = text
       .replace(/([0-9])\u2062(?=[0-9])/g, '$1⋅')
       .replace(/[\u2061]/g, '')
@@ -1937,7 +1996,7 @@
       .replace(/-/g, '−')
       .replace(/\s*([=≠≈≃≅≡≤≥<>∈∉∋∌⊂⊃⊆⊇⊊⊋≺≻≼≽∝⇐⇒⇔↔→←↦∣-∦⟵-⟺])\s*/g, ' $1 ')
       .replace(/([|∣∥‖])\s+(?=[₀-₟⁰-⁹¹²³⁺⁻⁼⁽⁾ⁿⁱᵢⱼᵦ-ᵪ_^])/gu, '$1')
-      .replace(/([\p{L}\p{N}\p{M})\]}])\s*([+−-])\s*(?=[\p{L}\p{N}\p{M}(\[{\u221a])/gu, '$1 $2 ')
+      .replace(/([\p{L}\p{N}\p{M})\]}⟩⌉⌋|‖°!%₀-₟⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ′″‴⁗])\s*([+−-])\s*(?=[\p{L}\p{N}\p{M}(\[{\u221a])/gu, '$1 $2 ')
       .replace(/\s*([×÷·⋅∗∙∖±∓∪∩∧∨⊕⊗])\s*/g, ' $1 ')
       .replace(/\s*,\s*/g, ', ')
       .replace(/\s*;\s*/g, '; ')
@@ -2926,6 +2985,122 @@
     return calculatorResult('piecewise(' + branches.join(',') + ')', 'operand');
   }
 
+  function calculatorMatrixTableText(node) {
+    if (!node || (node.localName || '').toLowerCase() !== 'mtable' ||
+        mathMLAlignedEquationRows(node)) return '';
+    const rows = elementChildren(node);
+    if (!rows.length || rows.some((row) =>
+      !['mtr', 'mlabeledtr'].includes((row.localName || '').toLowerCase())
+    )) return '';
+    const cells = rows.map((row) => elementChildren(row));
+    const columns = cells[0] && cells[0].length;
+    if (!columns || cells.some((row) => row.length !== columns || row.some((cell) =>
+      (cell.localName || '').toLowerCase() !== 'mtd'
+    ))) return '';
+    return '[' + cells.map((row) => '[' + row.map((cell) =>
+      serializeMathMLCalculatorNode(cell).text
+    ).join(',') + ']').join(',') + ']';
+  }
+
+  function calculatorFencedMatrix(children, explicitOpen, explicitClose) {
+    const meaningful = children.filter((child) =>
+      !['mspace', 'mphantom', 'annotation', 'annotation-xml', 'none'].includes(
+        (child.localName || '').toLowerCase()
+      )
+    );
+    let table;
+    let open = explicitOpen;
+    let close = explicitClose;
+    if (open != null || close != null) {
+      if (meaningful.length !== 1 || (meaningful[0].localName || '').toLowerCase() !== 'mtable') return null;
+      table = meaningful[0];
+    } else {
+      if (meaningful.length !== 3 ||
+          (meaningful[0].localName || '').toLowerCase() !== 'mo' ||
+          (meaningful[1].localName || '').toLowerCase() !== 'mtable' ||
+          (meaningful[2].localName || '').toLowerCase() !== 'mo') return null;
+      open = normalizedMathToken(meaningful[0].textContent || '');
+      close = normalizedMathToken(meaningful[2].textContent || '');
+      table = meaningful[1];
+    }
+    const matrix = calculatorMatrixTableText(table);
+    if (!matrix) return null;
+    const ordinaryPairs = new Map([['(', ')'], ['[', ']'], ['{', '}'], ['⟨', '⟩']]);
+    if (ordinaryPairs.get(open) === close) return calculatorResult(matrix, 'operand');
+    const singleBars = new Set(['|', '∣', '❘']);
+    const doubleBars = new Set(['‖', '∥', '‗']);
+    if (singleBars.has(open) && singleBars.has(close)) {
+      return calculatorResult('det(' + matrix + ')', 'operand');
+    }
+    if (doubleBars.has(open) && doubleBars.has(close)) {
+      return calculatorResult('norm(' + matrix + ')', 'operand');
+    }
+    return null;
+  }
+
+  function mathMLAlignedEquationRows(node) {
+    if (!node || (node.localName || '').toLowerCase() !== 'mtable') return null;
+    const rows = elementChildren(node);
+    if (!rows.length || rows.some((row) =>
+      !['mtr', 'mlabeledtr'].includes((row.localName || '').toLowerCase())
+    )) return null;
+    const cells = rows.map((row) => elementChildren(row));
+    const columns = cells[0] && cells[0].length;
+    if (!columns || cells.some((row) => row.length !== columns || row.some((cell) =>
+      (cell.localName || '').toLowerCase() !== 'mtd'
+    ))) return null;
+
+    const columnAlign = String(node.getAttribute && node.getAttribute('columnalign') || '')
+      .trim().toLowerCase().split(/\s+/u).filter(Boolean);
+    const columnSpacing = String(node.getAttribute && node.getAttribute('columnspacing') || '')
+      .trim().toLowerCase().split(/\s+/u).filter(Boolean);
+    const paired = columns >= 2 && columns % 2 === 0 &&
+      columnAlign.length === columns &&
+      columnAlign.every((value, index) => value === (index % 2 ? 'left' : 'right'));
+    const gathered = columns === 1 && columnAlign.length === 1 && columnAlign[0] === 'center';
+    if (!paired && !gathered) return null;
+
+    // MathML column alignment is also ordinary matrix presentation metadata.
+    // It cannot, by itself, tell `aligned` from a two-column matrix whose
+    // second entries happen to begin with =, <=, or another relation. Accept
+    // only an independently authenticated renderer projection, explicit
+    // MathML alignment markers, or KaTeX's exact display-alignment semantics.
+    // Once authenticated, row content is deliberately unrestricted: a valid
+    // continuation can begin with +/-, and an alignment point can use := or
+    // any other authored operator.
+    if (AUTHENTIC_ALIGNED_MATHML_TABLES.has(node)) return cells;
+    if (node.querySelector && node.querySelector('maligngroup, malignmark')) return cells;
+
+    const zero = /^0+(?:\.0+)?(?:px|pt|em|ex|%)?$/u;
+    const zeroSpaced = columnSpacing.length > 0 && columnSpacing.every((value) => zero.test(value));
+    const rowSpacing = String(node.getAttribute && node.getAttribute('rowspacing') || '')
+      .trim().toLowerCase();
+    const katexDisplayCells = rowSpacing === '0.25em' && zeroSpaced && cells.every((row) =>
+      row.every((cell) => {
+        const contents = elementChildren(cell);
+        if (contents.length !== 1 || (contents[0].localName || '').toLowerCase() !== 'mstyle') return false;
+        const style = contents[0];
+        return String(style.getAttribute && style.getAttribute('displaystyle') || '').toLowerCase() === 'true' &&
+          String(style.getAttribute && style.getAttribute('scriptlevel') || '') === '0';
+      })
+    );
+    return katexDisplayCells ? cells : null;
+  }
+
+  function serializeMathMLAlignedEquationRows(rows, serializeCell, pairSeparator) {
+    return rows.map((cells) => {
+      if (cells.length === 1) return serializeCell(cells[0]);
+      const pairs = [];
+      for (let index = 0; index < cells.length; index += 2) {
+        pairs.push(serializeCell(cells[index]) + pairSeparator + serializeCell(cells[index + 1]));
+      }
+      // alignedat can place several independently aligned equations on one
+      // visual row. A cell-by-cell concatenation turns `x=1` beside `y=2`
+      // into the false expression `x=1y=2`; keep each pair explicit.
+      return pairs.join('; ');
+    });
+  }
+
   function serializeMathMLCalculatorNode(node) {
     if (!node) return calculatorResult('', 'space');
     if (node.nodeType === 3) return calculatorResult(calculatorIdentifier(node.nodeValue || ''), 'operand');
@@ -2937,6 +3112,8 @@
     if (['math', 'mrow', 'mstyle', 'mpadded'].includes(name)) {
       const piecewise = calculatorPiecewiseRow(children);
       if (piecewise) return piecewise;
+      const fencedMatrix = calculatorFencedMatrix(children);
+      if (fencedMatrix) return fencedMatrix;
     }
     const functionBase = calculatorFunctionApplicationBase(node);
     if (functionBase) return functionBase;
@@ -3050,13 +3227,25 @@
     if (name === 'mfenced') {
       const open = node.getAttribute('open') == null ? '(' : node.getAttribute('open');
       const close = node.getAttribute('close') == null ? ')' : node.getAttribute('close');
+      const fencedMatrix = calculatorFencedMatrix(children, open, close);
+      if (fencedMatrix) return fencedMatrix;
       if (isVerticalBarToken(open) && isVerticalBarToken(close)) {
         return calculatorResult('abs(' + children.map((item) => serializeMathMLCalculatorNode(item).text).join(',') + ')', 'operand');
       }
       return calculatorResult(open + children.map((item) => serializeMathMLCalculatorNode(item).text).join(',') + close, 'operand');
     }
     if (name === 'mtable') {
-      return calculatorResult('[' + children.map((row) => '[' + elementChildren(row).map((cell) => serializeMathMLCalculatorNode(cell).text).join(',') + ']').join(',') + ']', 'operand');
+      const alignedRows = mathMLAlignedEquationRows(node);
+      if (alignedRows) {
+        const rows = serializeMathMLAlignedEquationRows(
+          alignedRows,
+          (cell) => serializeMathMLCalculatorNode(cell).text,
+          ''
+        );
+        return calculatorResult(joinReadableEquationRows(rows), 'operand');
+      }
+      const matrix = calculatorMatrixTableText(node);
+      return calculatorResult(matrix || '[' + children.map((row) => '[' + elementChildren(row).map((cell) => serializeMathMLCalculatorNode(cell).text).join(',') + ']').join(',') + ']', 'operand');
     }
     if (name === 'mtr' || name === 'mlabeledtr' || name === 'mtd') return calculatorResult(rowText(), 'operand');
     if (name === 'menclose') return calculatorResult(rowText(), 'operand');
@@ -3339,6 +3528,9 @@
         if (numericMerge || wordMerge) output += '⋅';
       } else if (previous && previous.kind === 'large') {
         if (output && !/\s$/u.test(output)) output += ' ';
+      } else if (token.functionApplication && previous && faithfulCanEnd(previous) &&
+                 output && !/\s$/u.test(output)) {
+        output += ' ';
       } else if (token.fraction && previous && faithfulCanEnd(previous) &&
                  output && !/\s$/u.test(output)) {
         output += ' (' + token.text + ')';
@@ -3429,6 +3621,14 @@
     const tokens = flattenSequence(children).filter((token) =>
       token.text || ['space', 'apply', 'invisibleTimes'].includes(token.kind)
     );
+    for (let index = 0; index + 1 < tokens.length; index += 1) {
+      if (tokens[index + 1].kind !== 'apply') continue;
+      const resolved = resolveFaithfulScopes(tokens[index].text || '').trim();
+      const name = resolved.match(/^([A-Za-z]+)(?:[₀-₟⁰-⁹¹²³⁺⁻⁼⁽⁾ⁿⁱᵢⱼᵦ-ᵪ_^].*)?$/u);
+      if (name && CALCULATOR_FUNCTIONS.has(name[1])) {
+        tokens[index] = { ...tokens[index], functionApplication: true };
+      }
+    }
     for (let index = 1; index + 1 < tokens.length; index += 1) {
       if (!tokens[index].zeroLineFraction || tokens[index - 1].kind !== 'open' ||
           tokens[index - 1].text !== '(' || tokens[index + 1].kind !== 'close' ||
@@ -3671,26 +3871,17 @@
       return faithfulResult(open + contents + close, 'operand');
     }
     if (name === 'mtable') {
-      const columnAlign = String(node.getAttribute && node.getAttribute('columnalign') || '')
-        .trim().toLowerCase().split(/\s+/u).filter(Boolean);
-      const columnSpacing = String(node.getAttribute && node.getAttribute('columnspacing') || '')
-        .trim().toLowerCase().split(/\s+/u).filter(Boolean);
-      const rowCellCounts = children.map((row) => elementChildren(row).length);
-      const zeroSpaced = columnSpacing.length > 0 && columnSpacing.every((value) =>
-        /^0+(?:\.0+)?(?:px|pt|em|ex|%)?$/u.test(value)
-      );
-      const pairedAlignmentSpacing = columnSpacing.length > 0 && columnSpacing.every((value, index) =>
-        index % 2 === 1 || /^0+(?:\.0+)?(?:px|pt|em|ex|%)?$/u.test(value)
-      );
-      const alignmentLayout = (zeroSpaced || pairedAlignmentSpacing) && (
-        (rowCellCounts.length > 0 && rowCellCounts.every((count) => count === 1) && columnAlign[0] === 'center') ||
-        (columnAlign.length >= 2 && columnAlign.every((value, index) => value === (index % 2 ? 'left' : 'right')))
-      );
-      const rows = children.map((row) => elementChildren(row)
-        .map((cell) => serializeMathMLFaithfulNode(cell).text)
-        .join(alignmentLayout ? ' ' : ', '));
-      const tableText = alignmentLayout ? joinReadableEquationRows(rows) : rows.join('; ');
-      return faithfulResult(alignmentLayout ? tableText : '[' + tableText + ']', 'operand', { tableText });
+      const alignedRows = mathMLAlignedEquationRows(node);
+      const rows = alignedRows
+        ? serializeMathMLAlignedEquationRows(
+          alignedRows,
+          (cell) => serializeMathMLFaithfulNode(cell).text,
+          ' '
+        )
+        : children.map((row) => elementChildren(row)
+          .map((cell) => serializeMathMLFaithfulNode(cell).text).join(', '));
+      const tableText = alignedRows ? joinReadableEquationRows(rows) : rows.join('; ');
+      return faithfulResult(alignedRows ? tableText : '[' + tableText + ']', 'operand', { tableText });
     }
     if (name === 'mtr' || name === 'mlabeledtr') {
       return faithfulResult(children.map((child) => serializeMathMLFaithfulNode(child).text).join(', '), 'operand');
@@ -3755,6 +3946,37 @@
       .replace(/[\u00d7\u00b7\u22c5\u2217]/g, '*')
       .replace(/\u00f7/g, '/')
       .replace(/[\u2223\u2758]/g, '|');
+  }
+
+  function scriptAwareMathSelectionKey(input) {
+    const superscriptMarker = '\ue130';
+    const subscriptMarker = '\ue131';
+    let value = Array.from(cleanClipboardText(String(input == null ? '' : input)), (character) => {
+      if (SUPERSCRIPT_GLYPH_BASES.has(character)) {
+        return superscriptMarker + SUPERSCRIPT_GLYPH_BASES.get(character);
+      }
+      if (SUBSCRIPT_GLYPH_BASES.has(character)) {
+        return subscriptMarker + SUBSCRIPT_GLYPH_BASES.get(character);
+      }
+      if (character === '^') return superscriptMarker;
+      if (character === '_') return subscriptMarker;
+      return character;
+    }).join('');
+    try {
+      value = value.normalize('NFKC');
+    } catch (_error) {
+      // Retaining the original code points is conservative on legacy engines.
+    }
+    return value
+      .replace(/[\u061c\u200e\u200f\u202a-\u202e\u2061-\u2069\ufe00-\ufe0f]/gu, '')
+      .replace(/[\s\u00a0\u2000-\u200a\u202f\u205f\u3000]/gu, '')
+      .replace(/[\u2212\u2010-\u2015]/gu, '-')
+      .replace(/[\u00d7\u00b7\u22c5\u2217]/gu, '*')
+      .replace(/\u00f7/gu, '/')
+      .replace(/[\u2223\u2758]/gu, '|')
+      .replaceAll(superscriptMarker, '^')
+      .replaceAll(subscriptMarker, '_')
+      .replace(/([_^])\(([^()])\)/gu, '$1$2');
   }
 
   function presentationMathNode(mathElement) {
@@ -4578,9 +4800,31 @@
     )));
   }
 
+  function cloneMathMLWithProvenance(node, deep = true) {
+    if (!node || typeof node.cloneNode !== 'function') return null;
+    const clone = node.cloneNode(deep);
+    if (!deep || node.nodeType !== 1 || clone.nodeType !== 1) return clone;
+    const sourceTables = [];
+    const clonedTables = [];
+    if ((node.localName || '').toLowerCase() === 'mtable') sourceTables.push(node);
+    if ((clone.localName || '').toLowerCase() === 'mtable') clonedTables.push(clone);
+    if (node.querySelectorAll) sourceTables.push(...node.querySelectorAll('mtable'));
+    if (clone.querySelectorAll) clonedTables.push(...clone.querySelectorAll('mtable'));
+    // A deep DOM clone preserves element order exactly. Refuse to transfer
+    // any marker if that invariant is not true rather than guessing which
+    // table inherited the renderer proof.
+    if (sourceTables.length !== clonedTables.length) return clone;
+    for (let index = 0; index < sourceTables.length; index += 1) {
+      if (AUTHENTIC_ALIGNED_MATHML_TABLES.has(sourceTables[index])) {
+        AUTHENTIC_ALIGNED_MATHML_TABLES.add(clonedTables[index]);
+      }
+    }
+    return clone;
+  }
+
   function sliceMathMLSurfaceNode(node, surface, start, end, documentObject) {
     if (!node || node.nodeType !== 1 || start < 0 || end <= start || end > surface.length) return null;
-    if (start === 0 && end === surface.length) return node.cloneNode(true);
+    if (start === 0 && end === surface.length) return cloneMathMLWithProvenance(node);
     const name = (node.localName || '').toLowerCase();
     if (['mi', 'mn', 'mo', 'mtext', 'ms'].includes(name)) {
       const clone = node.cloneNode(false);
@@ -4660,7 +4904,7 @@
     if (!nodes || !nodes.length || !documentObject) return null;
     const math = documentObject.createElementNS(MATHML_NAMESPACE, 'math');
     const row = documentObject.createElementNS(MATHML_NAMESPACE, 'mrow');
-    for (const node of nodes) row.appendChild(node.cloneNode(true));
+    for (const node of nodes) row.appendChild(cloneMathMLWithProvenance(node));
     math.appendChild(row);
     return math;
   }
@@ -4673,14 +4917,70 @@
       .replace(/~/g, String.raw`\~{}`);
   }
 
-  function mathMLToLatexNode(node) {
+  function mathMLToLatexNode(node, inheritedMathVariant) {
     if (!node || node.nodeType !== 1) return '';
     const name = (node.localName || '').toLowerCase();
     const children = elementChildren(node);
-    const child = (index) => mathMLToLatexNode(children[index]);
-    const all = () => children.map(mathMLToLatexNode).join('');
-    if (name === 'semantics') return mathMLToLatexNode(presentationMathNode(node));
-    if (name === 'mi' || name === 'mn') return mathMLTokenText(node).trim();
+    // MathML permits mathvariant on mstyle (and on the outer math element),
+    // where it is inherited by descendant token elements. Carry that style
+    // through structural rows instead of looking only at each mi/mn. A token's
+    // own declaration remains the final override, including explicit normal.
+    const declaredInheritedVariant = ['math', 'mstyle'].includes(name)
+      ? canonicalMathVariant(node.getAttribute && node.getAttribute('mathvariant') || '')
+      : '';
+    const descendantMathVariant = declaredInheritedVariant ||
+      canonicalMathVariant(inheritedMathVariant || '');
+    const child = (index) => mathMLToLatexNode(children[index], descendantMathVariant);
+    const all = () => children.map((item) =>
+      mathMLToLatexNode(item, descendantMathVariant)
+    ).join('');
+    if (name === 'semantics') {
+      return mathMLToLatexNode(presentationMathNode(node), descendantMathVariant);
+    }
+    if (name === 'mi' || name === 'mn') {
+      const renderedValue = mathMLTokenText(node).trim();
+      const toLatexCharacters = (value) => Array.from(value, (character) =>
+        String(PDF_LATEX_CHARACTERS[character] || character)
+      ).join('');
+      const ownVariant = canonicalMathVariant(
+        node.getAttribute && node.getAttribute('mathvariant') || ''
+      );
+      const variant = ownVariant || descendantMathVariant;
+      if (!variant) return toLatexCharacters(renderedValue);
+      // mathMLTokenText has already applied mathvariant for readable Unicode
+      // output. LaTeX commands must instead wrap the unstyled token base;
+      // otherwise script E becomes the double-styled `\mathcal{ℰ}`. Renderer
+      // projections retain the raw base in textContent, while NFKD safely
+      // recovers it when authored MathML already contains a styled glyph.
+      const rawValue = normalizedMathToken(node.textContent || '');
+      const baseValue = Array.from(rawValue, mathVariantBaseCharacter).join('');
+      const base = toLatexCharacters(baseValue);
+      const rendered = toLatexCharacters(renderedValue);
+      const next = node.nextElementSibling;
+      const functionApplication = name === 'mi' && CALCULATOR_FUNCTIONS.has(baseValue) &&
+        next && (next.localName || '').toLowerCase() === 'mo' &&
+        normalizedMathToken(next.textContent || '') === '\u2061';
+      if (functionApplication) return '\\' + baseValue + ' ';
+      const greek = /^[α-ωΑ-Ωϵϑϰϕϱϖ∂∇]$/u.test(baseValue);
+      const wrap = (command, contents) => '\\' + command + '{' + contents + '}';
+      switch (variant) {
+        case 'normal': return name === 'mi' ? wrap('mathrm', base) : base;
+        case 'italic': return name === 'mi' ? base : wrap('mathit', base);
+        case 'bold': return wrap(greek ? 'boldsymbol' : 'mathbf', base);
+        case 'bold-italic': return wrap('boldsymbol', base);
+        case 'script': return wrap('mathcal', base);
+        case 'bold-script': return wrap('mathbf', wrap('mathcal', base));
+        case 'fraktur': return wrap('mathfrak', base);
+        case 'bold-fraktur': return wrap('mathbf', wrap('mathfrak', base));
+        case 'double-struck': return wrap('mathbb', base);
+        case 'sans-serif': return wrap('mathsf', base);
+        case 'bold-sans-serif': return wrap('mathbf', wrap('mathsf', base));
+        case 'sans-serif-italic': return wrap('mathit', wrap('mathsf', base));
+        case 'sans-serif-bold-italic': return wrap('boldsymbol', wrap('mathsf', base));
+        case 'monospace': return wrap('mathtt', base);
+        default: return rendered;
+      }
+    }
     if (name === 'mtext' || name === 'ms') return '\\text{' + latexEscapeText(mathMLTokenText(node)) + '}';
     if (name === 'mo') {
       const token = normalizedMathToken(mathMLTokenText(node));
@@ -4694,7 +4994,18 @@
       };
       return operators[token] || token;
     }
-    if (name === 'mspace' || name === 'mphantom' || name === 'annotation' || name === 'annotation-xml' || name === 'none') return '';
+    if (name === 'mspace') {
+      const width = String(node.getAttribute && node.getAttribute('width') || '').trim().toLowerCase();
+      const measurement = width.match(/^([+]?(?:\d+(?:\.\d*)?|\.\d+))(em|ex|px|pt)$/u);
+      if (!measurement || Number(measurement[1]) <= 0) return '';
+      // MathJax 2's authenticated `\,` projection is about 0.167em. Preserve
+      // that authored unit/function separation; use a normal TeX control space
+      // for larger positive mspace values whose exact macro is unknowable.
+      return ['em', 'ex'].includes(measurement[2]) && Number(measurement[1]) <= 0.25
+        ? String.raw`\,`
+        : '\\ ';
+    }
+    if (name === 'mphantom' || name === 'annotation' || name === 'annotation-xml' || name === 'none') return '';
     if (name === 'mfrac') return '\\frac{' + child(0) + '}{' + child(1) + '}';
     if (name === 'msqrt') return '\\sqrt{' + all() + '}';
     if (name === 'mroot') return '\\sqrt[' + child(1) + ']{' + child(0) + '}';
@@ -4717,12 +5028,16 @@
     if (name === 'mfenced') {
       const open = node.getAttribute('open') == null ? '(' : node.getAttribute('open');
       const close = node.getAttribute('close') == null ? ')' : node.getAttribute('close');
-      return String.raw`\left` + open + children.map(mathMLToLatexNode).join(',') + String.raw`\right` + close;
+      return String.raw`\left` + open + children.map((item) =>
+        mathMLToLatexNode(item, descendantMathVariant)
+      ).join(',') + String.raw`\right` + close;
     }
     if (name === 'mtable') {
-      return String.raw`\begin{matrix}` + children.map((row) =>
-        elementChildren(row).map(mathMLToLatexNode).join('&')
-      ).join(String.raw`\\`) + String.raw`\end{matrix}`;
+      const alignedRows = mathMLAlignedEquationRows(node);
+      const rows = alignedRows || children.map((row) => elementChildren(row));
+      return (alignedRows ? String.raw`\begin{aligned}` : String.raw`\begin{matrix}`) + rows.map((row) =>
+        row.map((item) => mathMLToLatexNode(item, descendantMathVariant)).join('&')
+      ).join(String.raw`\\`) + (alignedRows ? String.raw`\end{aligned}` : String.raw`\end{matrix}`);
     }
     if (name === 'maction') return child(0);
     return all();
@@ -4744,7 +5059,7 @@
 
   function repairLegacyKatexNumericScriptBases(mathElement) {
     if (!mathElement || typeof mathElement.cloneNode !== 'function') return null;
-    const repaired = mathElement.cloneNode(true);
+    const repaired = cloneMathMLWithProvenance(mathElement);
     let repairs = 0;
     for (const script of Array.from(repaired.querySelectorAll('msup, msub, msubsup'))) {
       const directBase = elementChildren(script)[0];
@@ -5009,7 +5324,7 @@
                   const localStart = Math.max(0, occurrence - sequence.boundaries[index]);
                   const localEnd = Math.min(variant.length, finish - sequence.boundaries[index]);
                   const piece = localStart === 0 && localEnd === variant.length
-                    ? surfaceChildren[index].cloneNode(true)
+                    ? cloneMathMLWithProvenance(surfaceChildren[index])
                     : sliceMathMLSurfaceNode(surfaceChildren[index], variant, localStart, localEnd, mathElement.ownerDocument);
                   if (!piece) { sliced.length = 0; break; }
                   sliced.push(piece);
@@ -6484,6 +6799,19 @@
     return faithfulAgreementKey(source) === faithfulAgreementKey(rendered);
   }
 
+  function latexSourceAgreesWithProjectedMath(source, mathElement) {
+    if (!source || !mathElement) return false;
+    const sourceFaithful = latexToFaithful(source);
+    const projectedFaithful = mathMLToFaithful(mathElement);
+    // Both serializers retain script direction, fraction/radical grouping,
+    // fences, accents, operators, and ordered operands. Equality of their
+    // faithful forms therefore accepts harmless TeX spelling/spacing aliases
+    // while rejecting a keyed-but-stale source such as visible V_C paired
+    // with `V^C`. A mismatch must never win merely because the script id is
+    // adjacent to the renderer frame.
+    return faithfulSourceAgreesWithRendered(sourceFaithful, projectedFaithful);
+  }
+
   function faithfulRenderedMathText(root, mathElement, pageWindow) {
     const rendered = mathElement ? mathMLToFaithful(mathElement) : '';
     const source = getMathSource(root, pageWindow);
@@ -6818,6 +7146,147 @@
     return false;
   }
 
+  const SOURCELESS_CHTML_TABLE_LAYOUT_ROLES = new Map([
+    ['inline-table', new Set(['mjx-mtable', 'mjx-itable', 'mjx-table'])],
+    ['table', new Set(['mjx-mtable', 'mjx-itable', 'mjx-table'])],
+    ['table-row', new Set(['mjx-mtr', 'mjx-row'])],
+    ['table-cell', new Set(['mjx-mtd', 'mjx-cell'])]
+  ]);
+  const SOURCELESS_CHTML_POSITIONED_LAYOUT_ROLES = new Set([
+    // MathJax deliberately positions only named pieces whose semantic role is
+    // recovered structurally below. Ordinary rows and operands must remain in
+    // normal flow: moving one of those would make DOM order cease to describe
+    // the formula the user can see.
+    'mjx-over', 'mjx-under', 'mjx-op', 'mjx-sub', 'mjx-sup', 'mjx-script',
+    'mjx-root', 'mjx-surd', 'mjx-num', 'mjx-den', 'mjx-numerator',
+    'mjx-denominator', 'mjx-line', 'mjx-vsize', 'mjx-strut', 'mjx-nstrut',
+    'mjx-dstrut', 'mjx-spacer', 'mjx-delim-h', 'mjx-delim-v'
+  ]);
+  const SOURCELESS_CHTML_GLYPH_PIECE_ROLES = new Set(['mjx-char', 'mjx-charbox', 'mjx-c']);
+  const SOURCELESS_CHTML_STRETCH_SCAFFOLD_ROLES = new Set([
+    'mjx-surd', 'mjx-delim-h', 'mjx-delim-v', 'mjx-stretchy-h', 'mjx-stretchy-v'
+  ]);
+  const SOURCELESS_CHTML_TOKEN_OWNER_ROLES = new Set([
+    'mjx-mi', 'mjx-mn', 'mjx-mo', 'mjx-mtext', 'mjx-ms'
+  ]);
+
+  function sourceLessChtmlComputedProperty(computed, camelName, cssName) {
+    const direct = computed && computed[camelName];
+    if (direct != null && String(direct).trim()) return String(direct).trim().toLowerCase();
+    if (!computed || typeof computed.getPropertyValue !== 'function') return '';
+    return String(computed.getPropertyValue(cssName) || '').trim().toLowerCase();
+  }
+
+  function sourceLessChtmlZeroOrAutoOffset(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return !normalized || normalized === 'auto' || normalized === 'normal' ||
+      /^[-+]?0(?:\.0+)?(?:px|em|ex|rem|ch|vw|vh|vmin|vmax|%)?$/u.test(normalized);
+  }
+
+  function sourceLessChtmlElementMayBePositioned(element, role, roleOf) {
+    if (SOURCELESS_CHTML_POSITIONED_LAYOUT_ROLES.has(role)) return true;
+    if (!SOURCELESS_CHTML_GLYPH_PIECE_ROLES.has(role)) return false;
+    // A normal token leaf is the painted operand/operator itself; shifting it
+    // can silently change visible order. MathJax transforms glyph pieces only
+    // inside an explicit radical or stretchy-delimiter scaffold. Stop at the
+    // first token owner so a page cannot borrow a distant structural ancestor.
+    let depth = 0;
+    for (let current = element.parentElement; current && depth < 8;
+      current = current.parentElement, depth += 1) {
+      const ancestorRole = String(roleOf(current) || '').toLowerCase();
+      if (SOURCELESS_CHTML_STRETCH_SCAFFOLD_ROLES.has(ancestorRole)) return true;
+      if (SOURCELESS_CHTML_TOKEN_OWNER_ROLES.has(ancestorRole)) return false;
+    }
+    return false;
+  }
+
+  function sourceLessChtmlTransformIsSafe(computed, mayBePositioned) {
+    const transform = sourceLessChtmlComputedProperty(computed, 'transform', 'transform')
+      .replace(/\s+/gu, '');
+    const translate = sourceLessChtmlComputedProperty(computed, 'translate', 'translate')
+      .replace(/\s+/gu, '');
+    const rotate = sourceLessChtmlComputedProperty(computed, 'rotate', 'rotate')
+      .replace(/\s+/gu, '');
+    const scale = sourceLessChtmlComputedProperty(computed, 'scale', 'scale')
+      .replace(/\s+/gu, '');
+    const none = (value) => !value || value === 'none';
+    const zeroRotation = (value) => none(value) ||
+      /^[-+]?0(?:\.0+)?(?:deg|grad|rad|turn)?$/u.test(value);
+    const positiveScale = (value) => {
+      if (none(value)) return true;
+      const pieces = value.split(/[ ,]+/u).filter(Boolean);
+      return pieces.length > 0 && pieces.length <= 3 && pieces.every((piece) => {
+        const number = Number(piece);
+        return Number.isFinite(number) && number > 0;
+      });
+    };
+    if (!zeroRotation(rotate) || !positiveScale(scale)) return false;
+    if (none(transform) && none(translate) && none(scale)) return true;
+    if (!mayBePositioned) return false;
+    if (!none(translate) && /(?:calc\(|var\(|nan|infinity)/u.test(translate)) return false;
+    if (none(transform)) return true;
+    // CHTML uses translations for accents/scripts and positive axis scaling
+    // for stretchy glyph pieces. Rotation, reflection, skew, perspective, and
+    // 3-D transforms can paint a different formula than this projector sees.
+    if (/(?:rotate|skew|perspective|matrix3d)/u.test(transform)) return false;
+    const matrix = transform.match(/^matrix\(([-+\d.e]+),([-+\d.e]+),([-+\d.e]+),([-+\d.e]+),([-+\d.e]+),([-+\d.e]+)\)$/u);
+    if (matrix) {
+      const values = matrix.slice(1).map(Number);
+      return values.every(Number.isFinite) && Math.abs(values[1]) <= 1e-7 &&
+        Math.abs(values[2]) <= 1e-7 && values[0] > 0 && values[3] > 0;
+    }
+    const functions = transform.match(/[a-z0-9]+\([^)]*\)/gu);
+    if (!functions || functions.join('') !== transform) return false;
+    return functions.every((part) => {
+      if (/^translate(?:x|y)?\(/u.test(part)) return !/(?:calc\(|var\(|nan|infinity)/u.test(part);
+      const match = part.match(/^scale(?:x|y)?\(([^)]*)\)$/u);
+      return Boolean(match) && positiveScale(match[1]);
+    });
+  }
+
+  function sourceLessChtmlVisualOrderIsSafe(elements, roleOf) {
+    if (!Array.isArray(elements) || !elements.length ||
+        elements.length > MAX_MATHML_NODES || typeof roleOf !== 'function') return false;
+    const documentObject = elements[0] && elements[0].ownerDocument;
+    const view = documentObject && documentObject.defaultView;
+    if (!view || typeof view.getComputedStyle !== 'function') return false;
+    for (const element of elements) {
+      const role = String(roleOf(element) || '').toLowerCase();
+      const mayBePositioned = sourceLessChtmlElementMayBePositioned(element, role, roleOf);
+      let computed;
+      try { computed = view.getComputedStyle(element); } catch (_error) { return false; }
+      if (!computed || !cssStackMathGeneratedContentIsSafe(element, view)) return false;
+      const display = sourceLessChtmlComputedProperty(computed, 'display', 'display');
+      if (/^(?:flex|inline-flex|grid|inline-grid)$/u.test(display)) return false;
+      if (display === 'inline-table' || display.startsWith('table')) {
+        const roles = SOURCELESS_CHTML_TABLE_LAYOUT_ROLES.get(display);
+        if (!roles || !roles.has(role)) return false;
+      }
+      const order = sourceLessChtmlComputedProperty(computed, 'order', 'order');
+      if (order && !/^[-+]?0(?:\.0+)?$/u.test(order)) return false;
+      const direction = sourceLessChtmlComputedProperty(computed, 'direction', 'direction');
+      const unicodeBidi = sourceLessChtmlComputedProperty(computed, 'unicodeBidi', 'unicode-bidi');
+      const writingMode = sourceLessChtmlComputedProperty(computed, 'writingMode', 'writing-mode');
+      const textTransform = sourceLessChtmlComputedProperty(computed, 'textTransform', 'text-transform');
+      const floatValue = sourceLessChtmlComputedProperty(computed, 'cssFloat', 'float') ||
+        sourceLessChtmlComputedProperty(computed, 'float', 'float');
+      if ((direction && direction !== 'ltr') ||
+          (unicodeBidi && unicodeBidi !== 'normal' && unicodeBidi !== 'isolate') ||
+          (writingMode && writingMode !== 'horizontal-tb') ||
+          (textTransform && textTransform !== 'none') ||
+          (floatValue && floatValue !== 'none')) return false;
+      const position = sourceLessChtmlComputedProperty(computed, 'position', 'position');
+      if (position === 'fixed' || position === 'sticky') return false;
+      const offsets = ['top', 'right', 'bottom', 'left'].map((name) =>
+        sourceLessChtmlComputedProperty(computed, name, name));
+      if (position === 'absolute' && !mayBePositioned) return false;
+      if (position === 'relative' && offsets.some((value) => !sourceLessChtmlZeroOrAutoOffset(value)) &&
+          !mayBePositioned) return false;
+      if (!sourceLessChtmlTransformIsSafe(computed, mayBePositioned)) return false;
+    }
+    return true;
+  }
+
   function sourceLessMathJaxChtmlDescriptor(root, pageWindow) {
     const cache = ACTIVE_COPY_MATHJAX_CHTML_CACHE;
     if (cache && cache.has(root)) return cache.get(root);
@@ -6845,6 +7314,11 @@
       (child.localName || '').toLowerCase() === 'mjx-math');
     if (directMath.length !== 1) return finish(null);
     const visualMath = directMath[0];
+    const visualElements = [root, visualMath].concat(Array.from(visualMath.querySelectorAll('*')));
+    if (!sourceLessChtmlVisualOrderIsSafe(
+      visualElements,
+      (element) => (element.localName || '').toLowerCase()
+    )) return finish(null);
     for (const sibling of elementChildren(root)) {
       if (sibling === visualMath) continue;
       const name = (sibling.localName || '').toLowerCase();
@@ -7171,7 +7645,7 @@
     'mjx-char', 'mjx-charbox', 'mjx-delim-h', 'mjx-delim-v'
   ]);
   const MATHJAX2_CHTML_EMPTY_CLASSES = new Set([
-    'mjx-line', 'mjx-vsize', 'mjx-strut', 'mjx-spacer'
+    'mjx-line', 'mjx-vsize', 'mjx-strut', 'mjx-spacer', 'mjx-mspace'
   ]);
   const MATHJAX2_CHTML_ALLOWED_CLASSES = new Set([
     'mjx-chtml',
@@ -7182,11 +7656,43 @@
     ...MATHJAX2_CHTML_GLYPH_CLASSES,
     ...MATHJAX2_CHTML_EMPTY_CLASSES
   ]);
+  const MATHJAX2_CHTML_FONT_VARIANTS = Object.freeze({
+    'MJXc-TeX-main-R': 'normal',
+    'MJXc-TeX-main-I': 'italic',
+    'MJXc-TeX-main-B': 'bold',
+    'MJXc-TeX-math-BI': 'bold-italic',
+    'MJXc-TeX-cal-R': 'script',
+    'MJXc-TeX-cal-B': 'bold-script',
+    'MJXc-TeX-frak-R': 'fraktur',
+    'MJXc-TeX-frak-B': 'bold-fraktur',
+    'MJXc-TeX-ams-R': 'double-struck',
+    'MJXc-TeX-sans-R': 'sans-serif',
+    'MJXc-TeX-sans-I': 'sans-serif-italic',
+    'MJXc-TeX-sans-B': 'bold-sans-serif',
+    'MJXc-TeX-type-R': 'monospace'
+  });
 
   function mathJax2ChtmlPrimaryClass(element) {
     if (!element || element.nodeType !== 1 || (element.localName || '').toLowerCase() !== 'span') return '';
     const values = Array.from(element.classList || []).filter((name) => /^mjx-[a-z0-9-]+$/u.test(name));
     return values.length === 1 ? values[0] : '';
+  }
+
+  function mathJax2ChtmlTokenMathVariant(token, role) {
+    if (!['mjx-mi', 'mjx-mn'].includes(role)) return { variant: '' };
+    const children = elementChildren(token);
+    if (children.length !== 1 || mathJax2ChtmlPrimaryClass(children[0]) !== 'mjx-char' ||
+        elementChildren(children[0]).length) return { variant: '' };
+    const classes = Array.from(children[0].classList || []);
+    const fonts = classes.filter((name) =>
+      Object.prototype.hasOwnProperty.call(MATHJAX2_CHTML_FONT_VARIANTS, name)
+    );
+    // Font semantics are trusted only on the exact official glyph leaf. A
+    // page-added class, multiple font declarations, or nested box remains an
+    // ordinary visible token and cannot forge a mathematical alphabet.
+    if (!fonts.length) return { variant: '' };
+    if (fonts.length !== 1 || classes.some((name) => name !== 'mjx-char' && name !== fonts[0])) return null;
+    return { variant: MATHJAX2_CHTML_FONT_VARIANTS[fonts[0]] };
   }
 
   function mathJax2ChtmlShape(root) {
@@ -7232,8 +7738,16 @@
     const overflow = String(computed && computed.overflow || '').toLowerCase();
     const width = Number.parseFloat(String(computed && computed.width || ''));
     const height = Number.parseFloat(String(computed && computed.height || ''));
+    const officialBlockBranch = branch.classList &&
+      branch.classList.contains('MJX_Assistive_MathML_Block');
+    // Display math deliberately gives the clipped assistive branch width
+    // 100% while keeping it one pixel high. Requiring a one-pixel width
+    // rejects official MathJax 2 display output even though the exact
+    // renderer-owned Block class, rect clip, absolute positioning, and hidden
+    // overflow prove that the branch is not painted selectable content.
     return position === 'absolute' && clip && clip !== 'auto' && overflow === 'hidden' &&
-      Number.isFinite(width) && width <= 2 && Number.isFinite(height) && height <= 2;
+      Number.isFinite(height) && height <= 2 &&
+      ((Number.isFinite(width) && width <= 2) || officialBlockBranch);
   }
 
   function mathJax2ChtmlDescriptor(root) {
@@ -7256,19 +7770,21 @@
     // part of it. MathJax 2 emits ordinary spans with one lower-case mjx role
     // class; its additional MJXc-* classes describe fonts and spacing only.
     // Unknown elements or role combinations remain native until modeled.
-    const elements = [root].concat(Array.from(visualMath.querySelectorAll('*')));
+    const elements = [root, visualMath].concat(Array.from(visualMath.querySelectorAll('*')));
     if (elements.length > MAX_MATHML_NODES) return finish(null);
     for (const element of elements) {
       const role = mathJax2ChtmlPrimaryClass(element);
       if (!role || !MATHJAX2_CHTML_ALLOWED_CLASSES.has(role) ||
           (element !== root && role === 'mjx-chtml')) return finish(null);
     }
+    if (!sourceLessChtmlVisualOrderIsSafe(elements, mathJax2ChtmlPrimaryClass)) return finish(null);
 
     const state = {
       nodes: 0,
       characters: 0,
       tokens: 0,
       consumedText: new Set(),
+      alignmentFillers: new Set(),
       invalid: false
     };
     const make = (name, textValue) => {
@@ -7318,6 +7834,84 @@
       }
       return values;
     };
+    const convertEmptyRole = (node, role) => {
+      // Official v2 CommonHTML emits an empty mjx-mspace for explicit TeX
+      // spacing. A positive renderer width is authored semantic separation
+      // (`120\,\mathrm V`) and must survive as MathML mspace; dropping it
+      // merges units and makes source agreement fail. Unlike the older
+      // rule/vsize/strut boxes, no descendant is part of this grammar.
+      if (role === 'mjx-mspace') {
+        const attributes = Array.from(node.attributes || []);
+        const id = node.getAttribute && node.getAttribute('id') || '';
+        const classesAreExact = Array.from(node.classList || []).every((name) => name === 'mjx-mspace');
+        if (!classesAreExact ||
+            attributes.some((attribute) => !['class', 'id', 'style'].includes(attribute.name)) ||
+            (id && !/^MJXc-Node-[1-9][0-9]{0,8}$/u.test(id)) ||
+            elementChildren(node).length || String(node.textContent || '') !== '') {
+          state.invalid = true;
+          return null;
+        }
+        const style = String(node.getAttribute && node.getAttribute('style') || '');
+        const declarations = style.split(';').map((value) => value.trim()).filter(Boolean);
+        const measurements = new Map();
+        for (const declaration of declarations) {
+          const match = declaration.match(/^([a-z-]+)\s*:\s*(.*?)\s*$/iu);
+          if (!match || !['font-size', 'width', 'height'].includes(match[1].toLowerCase()) ||
+              measurements.has(match[1].toLowerCase())) {
+            state.invalid = true;
+            return null;
+          }
+          measurements.set(match[1].toLowerCase(), match[2]);
+        }
+        const width = measurements.get('width') || '';
+        const height = measurements.get('height') || '';
+        const fontSize = measurements.get('font-size') || '';
+        const widthMatch = width.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(em|ex|px|pt)$/iu);
+        const heightMatch = !height || height.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(em|ex|px|pt)$/iu);
+        const fontSizeMatch = !fontSize || fontSize.match(/^(?:\d+(?:\.\d*)?|\.\d+)%$/u);
+        if ((style && (!widthMatch || !heightMatch || !fontSizeMatch)) ||
+            (widthMatch && Math.abs(Number(widthMatch[1])) > 16) ||
+            (height && Math.abs(Number(heightMatch[1])) > 16) ||
+            (fontSize && (Number.parseFloat(fontSize) <= 0 || Number.parseFloat(fontSize) > 1000))) {
+          state.invalid = true;
+          return null;
+        }
+        if (!widthMatch || Number(widthMatch[1]) <= 0) return null;
+        const space = make('mspace');
+        space.setAttribute('width', widthMatch[1] + widthMatch[2].toLowerCase());
+        return space;
+      }
+      if (markText(node)) state.invalid = true;
+      return null;
+    };
+    const inlineMathJax2CellAlignment = (cell) => {
+      const style = String(cell && cell.getAttribute && cell.getAttribute('style') || '');
+      const declarations = style.split(';').map((value) => value.trim()).filter(Boolean);
+      const alignments = declarations.filter((value) => /^text-align\s*:/iu.test(value));
+      if (alignments.length !== 1) return '';
+      const match = alignments[0].match(/^text-align\s*:\s*(right|left)\s*(?:!important\s*)?$/iu);
+      return match ? match[1].toLowerCase() : '';
+    };
+    const exactMathJax2AlignmentFiller = (cell) => {
+      // TeX's aligned environment is rendered as two cells per row. The
+      // left-aligned relation cell starts with one exact, empty mjx-mi before
+      // the equals sign. It is a renderer alignment atom, not a missing
+      // identifier. Model only the official direct mtd > mrow > mi shape.
+      const cellChildren = elementChildren(cell);
+      if (cellChildren.length !== 1 ||
+          mathJax2ChtmlPrimaryClass(cellChildren[0]) !== 'mjx-mrow') return null;
+      const rowChildren = elementChildren(cellChildren[0]);
+      const filler = rowChildren[0];
+      const attributes = filler ? Array.from(filler.attributes || []) : [];
+      const id = filler && filler.getAttribute && filler.getAttribute('id') || '';
+      if (!filler || rowChildren.length < 2 ||
+          mathJax2ChtmlPrimaryClass(filler) !== 'mjx-mi' ||
+          Array.from(filler.classList || []).some((name) => name !== 'mjx-mi') ||
+          attributes.some((attribute) => !['class', 'id'].includes(attribute.name)) ||
+          (id && !/^MJXc-Node-[1-9][0-9]{0,8}$/u.test(id)) ||
+          elementChildren(filler).length || String(filler.textContent || '') !== '') return null;
+      return filler;
+    };
     let convert;
     const convertLoose = (node, depth) => {
       if (!node || state.invalid || depth > MAX_MATHML_DEPTH) {
@@ -7329,8 +7923,7 @@
           MATHJAX2_CHTML_TRANSPARENT_CLASSES.has(role) ||
           MATHJAX2_CHTML_STRUCTURAL_CLASSES.has(role)) return convert(node, depth + 1);
       if (MATHJAX2_CHTML_EMPTY_CLASSES.has(role)) {
-        if (markText(node)) state.invalid = true;
-        return null;
+        return convertEmptyRole(node, role);
       }
       if (!MATHJAX2_CHTML_ROLE_CLASSES.has(role)) {
         state.invalid = true;
@@ -7362,22 +7955,58 @@
         if (descendants.length > MAX_MATHML_NODES || descendants.some((element) => {
           const childRole = mathJax2ChtmlPrimaryClass(element);
           return !MATHJAX2_CHTML_GLYPH_CLASSES.has(childRole) &&
-            !MATHJAX2_CHTML_EMPTY_CLASSES.has(childRole) && childRole !== 'mjx-box';
+            !(MATHJAX2_CHTML_EMPTY_CLASSES.has(childRole) && childRole !== 'mjx-mspace') &&
+            childRole !== 'mjx-box';
         })) {
           state.invalid = true;
           return null;
         }
         const value = normalizeOfficeGlyphs(markText(node));
         if (!value) {
+          if (role === 'mjx-mi' && state.alignmentFillers.has(node) &&
+              elementChildren(node).length === 0 && String(node.textContent || '') === '') {
+            return null;
+          }
+          // MathJax 2 CommonHTML represents U+2061 FUNCTION APPLICATION with
+          // exactly one empty `mjx-mo > mjx-char` glyph box. It is emitted
+          // between a named function and its argument (`tan ϕ`, `cos ϕ`) but
+          // contributes no painted or selectable character. Treat only that
+          // exact renderer-owned empty topology as transparent. Any text,
+          // nested element, additional role/font class, or other empty token
+          // remains invalid and fails closed.
+          const emptyGlyphs = elementChildren(node);
+          const invisibleFunctionApplication = role === 'mjx-mo' &&
+            emptyGlyphs.length === 1 &&
+            mathJax2ChtmlPrimaryClass(emptyGlyphs[0]) === 'mjx-char' &&
+            Array.from(emptyGlyphs[0].classList || []).every((name) => name === 'mjx-char') &&
+            elementChildren(emptyGlyphs[0]).length === 0 &&
+            String(node.textContent || '') === '';
+          const previous = node.previousElementSibling;
+          const functionName = invisibleFunctionApplication &&
+            mathJax2ChtmlPrimaryClass(previous) === 'mjx-mi'
+            ? cleanClipboardText(previous.textContent || '').trim().toLowerCase()
+            : '';
+          if (functionName && functionName.length <= 16 && CALCULATOR_FUNCTIONS.has(functionName) &&
+              node.nextElementSibling) {
+            // Preserve the semantic function boundary. U+2061 is removed from
+            // ordinary visible-text keys, but the faithful/calculator
+            // serializers use it to distinguish `cos ϕ` from the product of
+            // four variables `c·o·s·ϕ`.
+            state.tokens += 1;
+            return make('mo', '\u2061');
+          }
           state.invalid = true;
           return null;
         }
         state.tokens += 1;
-        return make(tokenName, value);
+        const token = make(tokenName, value);
+        const mathVariant = mathJax2ChtmlTokenMathVariant(node, role);
+        if (!mathVariant) { state.invalid = true; return null; }
+        if (mathVariant.variant) token.setAttribute('mathvariant', mathVariant.variant);
+        return token;
       }
       if (MATHJAX2_CHTML_EMPTY_CLASSES.has(role)) {
-        if (markText(node)) state.invalid = true;
-        return null;
+        return convertEmptyRole(node, role);
       }
       if (role === 'mjx-msubsup') {
         const roles = ownedRoles(node, new Set(['mjx-base', 'mjx-sub', 'mjx-sup']));
@@ -7490,13 +8119,47 @@
         if (!rows.length || rows.length > MAX_MATHML_NODES) { state.invalid = true; return null; }
         const table = make('mtable');
         let columns = -1;
+        const rowCells = [];
+        let alignmentLayout = true;
+        const alignmentFillers = [];
         for (const sourceRow of rows) {
-          const cells = ownedRoles(sourceRow, new Set(['mjx-mtd']));
-          if (!cells.length || (columns >= 0 && columns !== cells.length)) {
+          const cells = elementChildren(sourceRow);
+          if (!cells.length || cells.some((cell) => mathJax2ChtmlPrimaryClass(cell) !== 'mjx-mtd') ||
+              (columns >= 0 && columns !== cells.length)) {
             state.invalid = true;
             return null;
           }
           columns = cells.length;
+          rowCells.push(cells);
+          const rowFillers = [];
+          if (cells.length < 2 || cells.length % 2 !== 0) {
+            alignmentLayout = false;
+          } else {
+            for (let index = 0; index < cells.length; index += 2) {
+              const filler = inlineMathJax2CellAlignment(cells[index]) === 'right' &&
+                inlineMathJax2CellAlignment(cells[index + 1]) === 'left'
+                ? exactMathJax2AlignmentFiller(cells[index + 1])
+                : null;
+              if (!filler) {
+                alignmentLayout = false;
+                break;
+              }
+              rowFillers.push(filler);
+            }
+          }
+          alignmentFillers.push(...rowFillers);
+        }
+        if (alignmentLayout) {
+          alignmentFillers.forEach((filler) => state.alignmentFillers.add(filler));
+          table.setAttribute('columnalign', Array.from({ length: columns }, (_value, index) =>
+            index % 2 ? 'left' : 'right'
+          ).join(' '));
+          table.setAttribute('columnspacing', Array.from({ length: columns }, (_value, index) =>
+            index % 2 ? '2em' : '0em'
+          ).join(' '));
+          AUTHENTIC_ALIGNED_MATHML_TABLES.add(table);
+        }
+        for (const cells of rowCells) {
           const row = make('mtr');
           for (const sourceCell of cells) {
             const value = roleValue(sourceCell, depth);
@@ -7514,6 +8177,7 @@
       // `semantics` renders only its first presentation child. Reject extra
       // branches rather than accidentally selecting annotation text.
       const semanticChildren = elementChildren(node).filter((child) =>
+        mathJax2ChtmlPrimaryClass(child) === 'mjx-mspace' ||
         !MATHJAX2_CHTML_EMPTY_CLASSES.has(mathJax2ChtmlPrimaryClass(child))
       );
       if (role === 'mjx-semantics' && semanticChildren.length !== 1) {
@@ -8406,16 +9070,57 @@
   function sourceOnlyFallbackLayoutIsSafe(root) {
     if (!root || root.nodeType !== 1 ||
         !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return false;
-    // An explicit accessible label is the representation itself; descendant
-    // renderer boxes are irrelevant once the bounded label is selected.
     const visible = independentVisibleMathText(root);
     const accessible = root.getAttribute && (root.getAttribute('aria-label') || root.getAttribute('alt'));
-    if (accessible && accessible.length <= MAX_MATH_SOURCE_LENGTH && visible &&
-        mathSelectionKey(accessible) !== mathSelectionKey(visible)) return false;
-    const image = root.querySelector && root.querySelector('img[alt]');
-    const imageAlt = image && image.getAttribute('alt') || '';
-    if (imageAlt && imageAlt.length <= MAX_MATH_SOURCE_LENGTH && visible &&
-        mathSelectionKey(imageAlt) !== mathSelectionKey(visible)) return false;
+    const documentObject = root.ownerDocument;
+    const view = documentObject && documentObject.defaultView;
+    if (!documentObject || !documentObject.createRange || !view ||
+        typeof view.getComputedStyle !== 'function') return false;
+    const computedValue = (computed, name, property) => String(
+      computed && (computed[name] || (computed.getPropertyValue &&
+        computed.getPropertyValue(property || name))) || ''
+    ).trim().toLowerCase();
+    const zeroOrAutoOffset = (input) => {
+      const value = String(input || '').replace(/\s+/gu, '').toLowerCase();
+      return !value || value === 'auto' ||
+        /^[+-]?0(?:\.0+)?(?:%|[a-z]+)?$/u.test(value);
+    };
+    const strictComputedLayoutIsSafe = (computed) => {
+      if (computedStyleHasUnsafeVisibleLayout(computed, false)) return false;
+      const position = computedValue(computed, 'position');
+      if (/^(?:relative|sticky)$/u.test(position) &&
+          ['top', 'right', 'bottom', 'left'].some((name) =>
+            !zeroOrAutoOffset(computedValue(computed, name)))) return false;
+      const direction = computedValue(computed, 'direction');
+      const unicodeBidi = computedValue(computed, 'unicodeBidi', 'unicode-bidi');
+      if ((direction && direction !== 'ltr') ||
+          (unicodeBidi && !['normal', 'isolate'].includes(unicodeBidi))) return false;
+      // Any clipping or scrolling can make only part of descendant text
+      // visible. A generic source-less root has no independent semantics with
+      // which to recover whatever the clip conceals.
+      return !['overflow', 'overflowX', 'overflowY'].some((name) =>
+        /(?:^|\s)(?:hidden|clip|scroll|auto|overlay)(?:\s|$)/u.test(
+          computedValue(computed, name, name.replace(/[A-Z]/gu, (letter) => '-' + letter.toLowerCase()))
+        ));
+    };
+
+    // Non-inherited ancestor layout can hide or move a selected descendant
+    // even when the descendant's own computed style looks ordinary. Audit a
+    // bounded composed path through shadow hosts to the document element.
+    let ancestor = composedParentElement(root);
+    let ancestorDepth = 0;
+    while (ancestor) {
+      ancestorDepth += 1;
+      if (ancestorDepth > MAX_RICH_SELECTION_DEPTH) return false;
+      let computed;
+      try {
+        computed = view.getComputedStyle(ancestor);
+      } catch (_error) {
+        return false;
+      }
+      if (!strictComputedLayoutIsSafe(computed)) return false;
+      ancestor = composedParentElement(ancestor);
+    }
 
     const stack = [root];
     let visited = 0;
@@ -8425,22 +9130,41 @@
       visited += 1;
       if (visited > MAX_MATHML_NODES) return false;
       const tag = (element.localName || '').toLowerCase();
-      // Raw textContent would include these nodes even though the ordinary
-      // serializer correctly drops them. Never promote that hidden content
-      // through a source-less element that merely resembles rendered math.
-      if ((isVisuallyHiddenElement(element) || SKIP_TAGS.has(tag) ||
-          ORDINARY_DROP_CONTENT_TAGS.has(tag)) && (element.textContent || '').trim()) return false;
+      // A source-less fallback cannot authenticate pixels painted by an
+      // image, SVG, canvas, embedded document, form control, ruby/details
+      // alternate, or other replaced surface.
+      if (UNSOURCED_MATH_FALLBACK_UNSAFE_TAGS.has(tag) || tag === 'img') return false;
+      if (isHiddenElement(element) && (element.textContent || '').trim()) return false;
+      if (/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(element.textContent || '')) {
+        return false;
+      }
+      if (!cssStackMathGeneratedContentIsSafe(element, view)) return false;
+      let computed;
+      try {
+        computed = view.getComputedStyle(element);
+      } catch (_error) {
+        return false;
+      }
+      if (!strictComputedLayoutIsSafe(computed)) return false;
       for (let child = element.lastElementChild; child; child = child.previousElementSibling) stack.push(child);
     }
-    const documentObject = root.ownerDocument;
-    if (!documentObject || !documentObject.createRange) return false;
     const range = documentObject.createRange();
     try {
       range.selectNodeContents(root);
     } catch (_error) {
       return false;
     }
-    return !ordinaryComputedLayoutRisk(range, documentObject);
+    if (ordinaryComputedLayoutRisk(range, documentObject)) return false;
+    if (accessible) {
+      if (accessible.length > MAX_MATH_SOURCE_LENGTH) return false;
+      const fragment = cloneOrdinaryRangeWithContext(range, documentObject);
+      if (!fragment) return false;
+      const serialized = serializeOrdinaryFragment(fragment, 'faithful');
+      if (serialized.evidence.semanticScriptUnrepresentable ||
+          scriptAwareMathSelectionKey(accessible) !==
+            scriptAwareMathSelectionKey(finalizeRewrittenText(serialized.text))) return false;
+    }
+    return Boolean(visible);
   }
 
   function extractMathText(root, outputMode, pageWindow) {
@@ -8450,6 +9174,15 @@
     const source = getMathSource(root, pageWindow);
     const math = getMathElement(root);
     if (mode === 'latex' && source) {
+      const projectedMathJax2 = root && root.matches &&
+        root.matches('span.mjx-chtml.MathJax_CHTML')
+        ? mathJax2ChtmlDescriptor(root)
+        : null;
+      if (projectedMathJax2 && projectedMathJax2.math &&
+          !latexSourceAgreesWithProjectedMath(source, projectedMathJax2.math)) {
+        const delimiter = isDisplayMath(root) ? '$$' : '$';
+        return delimiter + mathMLToLatexNode(projectedMathJax2.math) + delimiter;
+      }
       return isDisplayMath(root) ? '$$' + source + '$$' : '$' + source + '$';
     }
     if (mode === 'calculator') {
@@ -8476,10 +9209,52 @@
     if (element.matches('[data-mathml],[data-equation-content]')) {
       return Boolean(embeddedMathOwnerShape(element));
     }
+    if (element.matches('[role="math"]')) {
+      // ARIA's generic math role is sometimes placed on a prose wrapper that
+      // contains a genuine renderer root. Treating that wrapper as the one
+      // canonical formula shadows the authenticated descendant and makes one
+      // harmless accessibility role poison the complete selection. Keep an
+      // independently sourced wrapper as a candidate, but otherwise let the
+      // renderer child be replaced while the wrapper remains ordinary,
+      // layout-audited context.
+      const nestedSelector = [
+        '.katex', 'mjx-container', '.MathJax_Display', '.MathJax_CHTML',
+        '.MathJax_SVG', '.MathJax', '.mwe-math-element', '[role="math"]',
+        '[data-latex]', '[data-tex]', '[data-math-source]', '[data-mathml]',
+        '[data-equation-content]'
+      ].join(',');
+      // Avoid a selector-engine subtree query here. Discovery calls this for
+      // every candidate, and repeated `querySelector()` containment work can
+      // become quadratic across a document containing many small formulas.
+      // A bounded manual walk shares the discovery model's fail-closed limit.
+      let nestedRenderer = null;
+      const stack = [];
+      for (let child = element.lastElementChild; child; child = child.previousElementSibling) {
+        stack.push(child);
+      }
+      let inspected = 0;
+      while (stack.length && inspected < MAX_MATH_DISCOVERY_CANDIDATES) {
+        const candidate = stack.pop();
+        inspected += 1;
+        if (candidate.matches && candidate.matches(nestedSelector)) {
+          nestedRenderer = candidate;
+          break;
+        }
+        for (let child = candidate.lastElementChild; child; child = child.previousElementSibling) {
+          stack.push(child);
+        }
+      }
+      const walkExhausted = !nestedRenderer && stack.length > 0;
+      const ownsSource = ['data-latex', 'data-tex', 'data-math-source', 'data-mathml',
+        'data-equation-content'].some((name) => element.hasAttribute(name));
+      if (walkExhausted && !ownsSource) return false;
+      if (nestedRenderer && nestedRenderer !== element && !ownsSource) return false;
+      return true;
+    }
     if (element.matches([
       '.katex-display', '.katex', 'mjx-container', '.MathJax_Display',
       '.MathJax_SVG_Display', '.MathJax_CHTML', '.MathJax_SVG', '.MathJax',
-      '.mwe-math-element', 'math', '[role="math"]', '[data-latex]', '[data-tex]',
+      '.mwe-math-element', 'math', '[data-latex]', '[data-tex]',
       '[data-math-source]', '[data-automation-id*="equation" i]',
       '[aria-roledescription="equation" i]', 'latex-js', 'katex-element'
     ].join(','))) return true;
@@ -9374,6 +10149,9 @@
         const rebuilt = rebuild(child);
         if (rebuilt) safe.appendChild(rebuilt);
       }
+      if (name === 'mtable' && AUTHENTIC_ALIGNED_MATHML_TABLES.has(node)) {
+        AUTHENTIC_ALIGNED_MATHML_TABLES.add(safe);
+      }
       return safe;
     };
     const clone = rebuild(mathElement);
@@ -9747,7 +10525,8 @@
     const sourceLessChtml = nativeMath ? null : sourceLessChtmlDescriptor(root, pageWindow);
     const mathJax2Chtml = mathJax2ChtmlDescriptor(root);
     const math = nativeMath || (sourceLessChtml && sourceLessChtml.math);
-    const selectedText = cleanClipboardText(range.toString());
+    const rawSelectedText = String(range.toString());
+    const selectedText = cleanClipboardText(rawSelectedText);
     const selectedKey = mathSelectionKey(selectedText);
     if (!selectedKey) {
       const embedded = embeddedMathDescriptor(root);
@@ -9791,6 +10570,30 @@
       const visibleKey = mathSelectionKey(
         mathJax2Chtml ? mathJax2Chtml.nativeVisibleText : independentVisibleMathText(root)
       );
+      const source = getMathSource(root, pageWindow);
+      if (!mathJax2Chtml && !source) {
+        const exactRoot = range.startContainer === root && range.startOffset === 0 &&
+          range.endContainer === root && range.endOffset === root.childNodes.length;
+        let completeSurface = '';
+        try {
+          const complete = root.ownerDocument.createRange();
+          complete.selectNodeContents(root);
+          completeSurface = String(complete.toString());
+        } catch (_error) {
+          return { kind: 'unmatched' };
+        }
+        const exactSurface = (input) => {
+          let value = String(input == null ? '' : input).replace(/\r\n?/gu, '\n');
+          try { value = value.normalize('NFC'); } catch (_error) { /* retain exact code points */ }
+          return value;
+        };
+        // Generic source-less roots have no source-to-offset map. A normalized
+        // key may discard selected spaces, bidi controls, or variation marks;
+        // never let that cosmetic key widen an inner drag to the whole root.
+        if (!exactRoot && exactSurface(rawSelectedText) !== exactSurface(completeSurface)) {
+          return { kind: 'unmatched' };
+        }
+      }
       // Source-only SVG/CHTML renderers still support a typical mouse drag
       // whose endpoints live inside the visual branch. Promote only an exact
       // complete surface match; every strict partial remains native so source
@@ -9883,10 +10686,29 @@
     };
   }
 
+  function safeUnsourcedMathRootText(root, outputMode) {
+    if (!root || !root.ownerDocument || !independentVisibleMathText(root).trim() ||
+        !sourceOnlyFallbackLayoutIsSafe(root)) return '';
+    try {
+      const exactRootRange = root.ownerDocument.createRange();
+      exactRootRange.selectNodeContents(root);
+      const fragment = cloneOrdinaryRangeWithContext(exactRootRange, root.ownerDocument);
+      if (!fragment) return '';
+      const serialized = serializeOrdinaryFragment(fragment, outputMode);
+      if (serialized.evidence.semanticScriptUnrepresentable) return '';
+      const text = finalizeRewrittenText(serialized.text);
+      if (!text.trim()) return '';
+      return text;
+    } catch (_error) {
+      return '';
+    }
+  }
+
   function wholeMathRootPayload(root, settings, pageWindow) {
     const nativeMath = getMathElement(root);
     const mathJax2Chtml = mathJax2ChtmlDescriptor(root);
-    const projectedMathJax2 = mathJax2Chtml && mathJax2Chtml.assistiveMath === nativeMath
+    const projectedMathJax2 = mathJax2Chtml && nativeMath &&
+      mathJax2Chtml.assistiveMath === nativeMath
       ? mathJax2Chtml.math
       : null;
     const embedded = projectedMathJax2 ? null : embeddedMathDescriptor(root);
@@ -9904,14 +10726,17 @@
     if (rejectedSourceLessChtml && !getMathSource(root, pageWindow)) return null;
     if (!sourceMath && !domTreeWithinBudget(root, MAX_MATHML_NODES, MAX_MATHML_DEPTH)) return null;
     const sourceText = sourceMath ? '' : getMathSource(root, pageWindow);
+    const safeUnsourcedText = !sourceMath && !sourceText
+      ? safeUnsourcedMathRootText(root, settings.outputMode)
+      : '';
     if (!sourceMath && (!sourceText
-      ? !sourceOnlyFallbackLayoutIsSafe(root)
+      ? !safeUnsourcedText
       : !sourceOnlyMathAgreesWithVisible(root, pageWindow))) return null;
     if (sourceMath && root === sourceMath && nativeMathMLPresentationLayoutIsRisky(sourceMath)) return null;
     if (sourceMath && !semanticMathRootAgreesWithVisible(root, sourceMath, pageWindow)) return null;
     const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
     if (sourceMath && !safeMath) return null;
-    const text = sourceLessChtml && safeMath
+    const text = safeUnsourcedText || (sourceLessChtml && safeMath
       ? mathMLFragmentText(safeMath, settings.outputMode)
       : (embedded && safeMath
       ? mathMLFragmentText(safeMath, settings.outputMode)
@@ -9921,7 +10746,7 @@
         ? calculatorRenderedMathText(root, safeMath, pageWindow)
         : (safeMath && settings.outputMode !== 'latex'
           ? mathMLFragmentText(safeMath, settings.outputMode)
-          : extractMathText(root, settings.outputMode, pageWindow)))));
+          : extractMathText(root, settings.outputMode, pageWindow))))));
     if (!text || !text.trim()) return null;
     const documentObject = root.ownerDocument;
     const richFragment = documentObject.createDocumentFragment();
@@ -10307,7 +11132,8 @@
     const values = originalRoots.map((root) => {
       const nativeMath = getMathElement(root);
       const mathJax2Chtml = mathJax2ChtmlDescriptor(root);
-      const projectedMathJax2 = mathJax2Chtml && mathJax2Chtml.assistiveMath === nativeMath
+      const projectedMathJax2 = mathJax2Chtml && nativeMath &&
+        mathJax2Chtml.assistiveMath === nativeMath
         ? mathJax2Chtml.math
         : null;
       const embedded = projectedMathJax2 ? null : embeddedMathDescriptor(root);
@@ -10315,13 +11141,30 @@
       const sourceMath = projectedMathJax2 || nativeMath || (sourceLessChtml && sourceLessChtml.math);
       const safeMath = sourceMath ? sanitizedMathMLClone(sourceMath) : null;
       const sourceText = sourceMath ? '' : getMathSource(root, pageWindow);
+      const rejectedSourceLessChtml = !nativeMath && !sourceLessChtml && root && root.matches && (
+        (root.matches('mjx-container.MathJax') && root.querySelector &&
+          root.querySelector(':scope > mjx-math')) ||
+        (root.matches('span.mjx-chtml.MathJax_CHTML') && root.querySelector &&
+          root.querySelector(':scope > span.mjx-math'))
+      );
+      // A generic role=math surface can coexist with genuine renderer roots
+      // in one selection. If it has no semantic source of its own, retain its
+      // exact visible text only after the same complete subtree/layout audit
+      // used for a standalone root. Malformed CHTML is deliberately excluded:
+      // its stacked DOM order is not a safe ordinary-text representation.
+      const safeUnsourcedText = !sourceMath && !sourceText && !rejectedSourceLessChtml
+        ? safeUnsourcedMathRootText(root, settings.outputMode)
+        : '';
+      const safeUnsourcedFallback = Boolean(safeUnsourcedText.trim());
       const sourceAgreement = sourceMath
         ? semanticMathRootAgreesWithVisible(root, sourceMath, pageWindow)
-        : Boolean(sourceText) && sourceOnlyMathAgreesWithVisible(root, pageWindow);
+        : (sourceText ? sourceOnlyMathAgreesWithVisible(root, pageWindow) : safeUnsourcedFallback);
       return {
         text: !sourceAgreement || (sourceMath && !safeMath)
           ? ''
-          : (sourceLessChtml && safeMath
+          : (safeUnsourcedFallback
+            ? safeUnsourcedText
+            : (sourceLessChtml && safeMath
             ? mathMLFragmentText(safeMath, settings.outputMode)
             : (embedded && safeMath
             ? mathMLFragmentText(safeMath, settings.outputMode)
@@ -10331,7 +11174,7 @@
               ? calculatorRenderedMathText(root, safeMath, pageWindow)
               : (safeMath && settings.outputMode !== 'latex'
                 ? mathMLFragmentText(safeMath, settings.outputMode)
-                : extractMathText(root, settings.outputMode, pageWindow)))))),
+                : extractMathText(root, settings.outputMode, pageWindow))))))),
         display: isDisplayMath(root),
         root,
         safeMath,
@@ -10339,7 +11182,10 @@
         // inspection. A source-less element that merely resembles a math
         // container could otherwise hide arbitrary selected prose inside its
         // subtree and have that hidden text serialized.
-        replaceableForLayout: Boolean((sourceMath && safeMath) || (sourceText && sourceAgreement))
+        replaceableForLayout: Boolean(
+          (sourceMath && safeMath) || (sourceText && sourceAgreement) || safeUnsourcedFallback
+        ),
+        semanticRewrite: Boolean(sourceAgreement && !safeUnsourcedFallback)
       };
     });
     if (values.some((value) => !value.text || !value.text.trim())) return null;
@@ -10351,11 +11197,10 @@
     if (ordinaryComputedLayoutRisk(expanded, documentObject, replaceableMathRoots)) return null;
     const textFragment = cloneOrdinaryRangeWithContext(expanded, documentObject, replaceableMathRoots);
     if (!textFragment) return null;
-    canonicalMathRoots(textFragment).forEach((root, index) => {
-      const value = values[index] || {
-        text: extractMathText(root, settings.outputMode, pageWindow),
-        display: isDisplayMath(root)
-      };
+    const textRoots = canonicalMathRoots(textFragment);
+    if (textRoots.length !== values.length) return null;
+    textRoots.forEach((root, index) => {
+      const value = values[index];
       const replacement = root.ownerDocument.createElement('span');
       TRUSTED_TEXT_PLACEHOLDERS.set(replacement, { text: value.text, display: Boolean(value.display) });
       root.replaceWith(replacement);
@@ -10364,7 +11209,9 @@
 
     const richFragment = cloneOrdinaryRangeWithContext(expanded, documentObject, replaceableMathRoots);
     if (!richFragment) return null;
-    canonicalMathRoots(richFragment).forEach((root, index) => {
+    const richRoots = canonicalMathRoots(richFragment);
+    if (richRoots.length !== values.length) return null;
+    richRoots.forEach((root, index) => {
       const value = values[index];
       root.replaceWith(value && value.safeMath
         ? richMathNodeForElement(value.safeMath, null, root.ownerDocument)
@@ -10377,7 +11224,12 @@
     const html = sanitizeRichFragment(richFragment);
     const onlyMath = values.length === 1 && text.trim() === values[0].text.trim();
     const mathML = onlyMath ? serializeMathMLMarkup(values[0].safeMath) : '';
-    return { text, html, mathML };
+    return {
+      text,
+      html,
+      mathML,
+      mathRanges: values.filter((value) => value.semanticRewrite).length
+    };
   }
 
   function serializeRangeWithMath(range, settings, pageWindow) {
@@ -15422,7 +16274,9 @@
         rewritten.push(serialized.text);
         rich.push(serialized.html);
         if (serialized.mathML) mathMLPayloads.push(serialized.mathML);
-        mathRanges += serialized.mathRanges || (discovery.roots.length ? 1 : 0);
+        mathRanges += serialized.mathRanges != null
+          ? serialized.mathRanges
+          : (discovery.roots.length ? 1 : 0);
       }
       const finalized = finalizeRewrittenText(rewritten.join('\n'));
       if (!finalized.trim() || !mathRanges) return null;

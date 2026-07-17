@@ -237,6 +237,10 @@ test('faithful delimited conversion is separate from unchanged calculator conver
     cleanCopy.latexToCalculator(source),
     'r=(1/0.452)*sqrt((2*(0.666*10^(-25))*(2464))/(1.602*10^(-19)))'
   );
+  assert.equal(
+    cleanCopy.latexToFaithful(String.raw`41.0^\circ+\frac{1}{x}`),
+    '41.0° + 1/x'
+  );
 });
 
 test('linearizes matrices, cases, text, accents, and indexed roots without stray lines', () => {
@@ -313,6 +317,9 @@ test('keeps raw LaTeX grouping, nesting, functions, and token boundaries executa
   assert.equal(cleanCopy.latexToCalculator(String.raw`2\sqrt[3]{x}`), '2*(x)^(1/(3))');
   assert.equal(cleanCopy.latexToCalculator(String.raw`x y`), 'x*y');
   assert.equal(cleanCopy.latexToCalculator(String.raw`\alpha x`), 'alpha*x');
+  assert.equal(cleanCopy.latexToCalculator(String.raw`R\tan\phi`), 'R*tan(phi)');
+  assert.equal(cleanCopy.latexToCalculator(String.raw`\mathcal{E}_m`), 'E_(m)');
+  assert.equal(cleanCopy.latexToCalculator(String.raw`\mathbb{R}+\mathfrak{g}`), 'R+g');
   assert.equal(cleanCopy.latexToCalculator(String.raw`\alpha\beta`), 'alpha*beta');
   assert.equal(cleanCopy.latexToCalculator(String.raw`2\pi r`), '2*pi*r');
   assert.equal(cleanCopy.latexToCalculator(String.raw`\sin x`), 'sin(x)');

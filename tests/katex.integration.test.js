@@ -340,6 +340,53 @@ test('real KaTeX DOM: faithful matrices, cases, and bounds keep readable linear 
   );
 });
 
+test('real KaTeX DOM: alignedat keeps distinct equation pairs in every output mode', () => {
+  const source = String.raw`\begin{alignedat}{2}x&=1&y&=2\\&+3&&-4\end{alignedat}`;
+  assert.equal(
+    copyVisibleKaTeX(source, 'faithful').text,
+    'x = 1; y = 2; + 3; − 4'
+  );
+  assert.equal(
+    copyVisibleKaTeX(source, 'calculator').text,
+    'x=1; y=2;+3;-4'
+  );
+  assert.equal(
+    copyVisibleKaTeX(source, 'latex').text,
+    '$$' + source + '$$'
+  );
+});
+
+test('real KaTeX DOM: calculator matrices have one array layer and retain determinant or norm fences', () => {
+  const matrix = String.raw`a&b\\c&d`;
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\begin{bmatrix}` + matrix + String.raw`\end{bmatrix}`, 'calculator').text,
+    '[[a,b],[c,d]]'
+  );
+  assert.equal(
+    copyVisibleKaTeX(String.raw`\begin{pmatrix}` + matrix + String.raw`\end{pmatrix}`, 'calculator').text,
+    '[[a,b],[c,d]]'
+  );
+  const semanticCalculator = (source) => {
+    const document = new JSDOM(katex.renderToString(source, {
+      displayMode: true,
+      output: 'htmlAndMathml',
+      throwOnError: true
+    })).window.document;
+    return cleanCopy.mathMLToCalculator(document.querySelector('math'));
+  };
+  assert.equal(
+    semanticCalculator(String.raw`\begin{vmatrix}` + matrix + String.raw`\end{vmatrix}`),
+    'det([[a,b],[c,d]])'
+  );
+  assert.equal(
+    semanticCalculator(String.raw`\begin{Vmatrix}` + matrix + String.raw`\end{Vmatrix}`),
+    'norm([[a,b],[c,d]])'
+  );
+  assert.equal(copyVisibleKaTeX(String.raw`(x+1)`, 'calculator').text, '(x+1)');
+  assert.equal(copyVisibleKaTeX(String.raw`\lvert x\rvert`, 'calculator').text, 'abs(x)');
+  assert.equal(copyVisibleKaTeX(String.raw`\lVert x\rVert`, 'calculator').text, 'norm(x)');
+});
+
 test('faithful MathML keeps invisible products invisible unless operands would merge falsely', () => {
   const parse = (body) => new JSDOM(
     '<!doctype html><math xmlns="http://www.w3.org/1998/Math/MathML"><mrow>' + body + '</mrow></math>'

@@ -808,25 +808,91 @@ test('faithful MathML linearizes alignment tables as equation rows, not matrices
     const instance = dom('<math>' + markup + '</math>');
     return cleanCopy.mathMLToFaithful(instance.window.document.querySelector('math'));
   };
+  const displayCell = (contents) => '<mtd><mstyle scriptlevel="0" displaystyle="true">' +
+    contents + '</mstyle></mtd>';
   const alignedRows = [
-    '<mtr><mtd><mi>x</mi></mtd><mtd><mo>=</mo><mn>1</mn></mtd></mtr>',
-    '<mtr><mtd><mi>y</mi></mtd><mtd><mo>=</mo><mn>2</mn></mtd></mtr>'
+    '<mtr>' + displayCell('<mi>x</mi>') + displayCell('<mo>=</mo><mn>1</mn>') + '</mtr>',
+    '<mtr>' + displayCell('<mi>y</mi>') + displayCell('<mo>=</mo><mn>2</mn>') + '</mtr>'
   ].join('');
   assert.equal(
-    render('<mtable columnalign="right left" columnspacing="0em">' + alignedRows + '</mtable>'),
+    render('<mtable rowspacing="0.25em" columnalign="right left" columnspacing="0em">' +
+      alignedRows + '</mtable>'),
     'x = 1; y = 2'
   );
   const gatheredRows = [
-    '<mtr><mtd><mi>x</mi><mo>=</mo><mn>1</mn></mtd></mtr>',
-    '<mtr><mtd><mi>y</mi><mo>=</mo><mn>2</mn></mtd></mtr>'
+    '<mtr>' + displayCell('<mi>x</mi><mo>=</mo><mn>1</mn>') + '</mtr>',
+    '<mtr>' + displayCell('<mi>y</mi><mo>=</mo><mn>2</mn>') + '</mtr>'
   ].join('');
   assert.equal(
-    render('<mtable columnalign="center" columnspacing="0em">' + gatheredRows + '</mtable>'),
+    render('<mtable rowspacing="0.25em" columnalign="center" columnspacing="0em">' +
+      gatheredRows + '</mtable>'),
     'x = 1; y = 2'
   );
   assert.equal(
     render('<mtable columnalign="center center" columnspacing="1em">' + alignedRows + '</mtable>'),
     '[x, = 1; y, = 2]'
+  );
+});
+
+test('all MathML modes share authenticated alignment classification without corrupting relation-valued matrices', () => {
+  const parse = (markup) => dom('<math>' + markup + '</math>').window.document.querySelector('math');
+  const cell = (contents) => '<mtd><mstyle scriptlevel="0" displaystyle="true">' +
+    contents + '</mstyle></mtd>';
+  const aligned = parse([
+    '<mtable rowspacing="0.25em" columnalign="right left" columnspacing="0em">',
+    '<mtr>', cell('<mi>x</mi>'), cell('<mo>≔</mo><mn>1</mn>'), '</mtr>',
+    '<mtr>', cell('<mrow></mrow>'), cell('<mo>+</mo><mn>2</mn>'), '</mtr>',
+    '</mtable>'
+  ].join(''));
+  assert.equal(cleanCopy.mathMLToFaithful(aligned), 'x ≔ 1; +2');
+  assert.equal(cleanCopy.mathMLToCalculator(aligned), 'x≔1;+2');
+  assert.equal(
+    cleanCopy.mathMLToLatex(aligned),
+    String.raw`\begin{aligned}x&≔1\\&+2\end{aligned}`
+  );
+
+  // Right/left alignment and relation-leading values are legal matrix
+  // content too. Without renderer or MathML alignment provenance, retain the
+  // unambiguous matrix form consistently in every output mode.
+  const matrix = parse([
+    '<mtable columnalign="right left" columnspacing="0em">',
+    '<mtr><mtd><mi>a</mi></mtd><mtd><mo>=</mo><mi>b</mi></mtd></mtr>',
+    '<mtr><mtd><mi>c</mi></mtd><mtd><mo>≤</mo><mi>d</mi></mtd></mtr>',
+    '</mtable>'
+  ].join(''));
+  assert.equal(cleanCopy.mathMLToFaithful(matrix), '[a, = b; c, ≤ d]');
+  assert.equal(cleanCopy.mathMLToCalculator(matrix), '[[a,=b],[c,<=d]]');
+  assert.equal(
+    cleanCopy.mathMLToLatex(matrix),
+    String.raw`\begin{matrix}a&=b\\c&\le d\end{matrix}`
+  );
+});
+
+test('source-less MathML calculator removes duplicate matrix fences but keeps determinant and norm meaning', () => {
+  const parse = (contents) => dom('<math><mrow>' + contents + '</mrow></math>')
+    .window.document.querySelector('math');
+  const table = '<mtable><mtr><mtd><mi>a</mi></mtd><mtd><mi>b</mi></mtd></mtr>' +
+    '<mtr><mtd><mi>c</mi></mtd><mtd><mi>d</mi></mtd></mtr></mtable>';
+  assert.equal(cleanCopy.mathMLToCalculator(parse('<mo>[</mo>' + table + '<mo>]</mo>')), '[[a,b],[c,d]]');
+  assert.equal(cleanCopy.mathMLToCalculator(parse('<mo>(</mo>' + table + '<mo>)</mo>')), '[[a,b],[c,d]]');
+  assert.equal(cleanCopy.mathMLToCalculator(parse('<mo>|</mo>' + table + '<mo>|</mo>')), 'det([[a,b],[c,d]])');
+  assert.equal(cleanCopy.mathMLToCalculator(parse('<mo>‖</mo>' + table + '<mo>‖</mo>')), 'norm([[a,b],[c,d]])');
+
+  const fenced = dom('<math><mfenced open="[" close="]">' + table + '</mfenced></math>')
+    .window.document.querySelector('math');
+  assert.equal(cleanCopy.mathMLToCalculator(fenced), '[[a,b],[c,d]]');
+  assert.equal(cleanCopy.mathMLToCalculator(parse('<mo>(</mo><mi>x</mi><mo>+</mo><mn>1</mn><mo>)</mo>')), '(x+1)');
+  assert.equal(cleanCopy.mathMLToCalculator(parse('<mo>|</mo><mi>x</mi><mo>|</mo>')), 'abs(x)');
+  assert.equal(cleanCopy.mathMLToCalculator(parse('<mo>‖</mo><mi>x</mi><mo>‖</mo>')), 'norm(x)');
+
+  const cell = (contents) => '<mtd><mstyle scriptlevel="0" displaystyle="true">' +
+    contents + '</mstyle></mtd>';
+  const aligned = '<mtable rowspacing="0.25em" columnalign="right left" columnspacing="0em">' +
+    '<mtr>' + cell('<mi>x</mi>') + cell('<mo>=</mo><mn>1</mn>') + '</mtr></mtable>';
+  assert.equal(
+    cleanCopy.mathMLToCalculator(parse('<mo>(</mo>' + aligned + '<mo>)</mo>')),
+    '(x=1)',
+    'a grouped aligned equation is not a matrix merely because it contains an mtable'
   );
 });
 
@@ -1663,6 +1729,109 @@ test('source-less MathJax CHTML reconstructs the complete phasor sentence on eve
       ).text, equationText, url + ' ' + outputMode);
     }
   }
+});
+
+test('source-less modern MathJax CHTML fails closed when CSS contradicts semantic DOM order', () => {
+  const formula = () => sourceLessChtmlRoot('target', [
+    '<mjx-mrow>',
+    sourceLessChtmlToken('mi', 0, 'x'),
+    sourceLessChtmlToken('mo', 1, '+'),
+    sourceLessChtmlToken('mn', 2, '1'),
+    '</mjx-mrow>'
+  ].join(''));
+  const payloadForRoot = (instance, root) => cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, root),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    root
+  );
+  const baseline = dom(formula());
+  assert.equal(payloadForRoot(
+    baseline,
+    baseline.window.document.querySelector('#target')
+  ).text, 'x + 1');
+
+  const adversarialLayouts = [
+    ['flex row reversal', 'mjx-mrow', 'display:flex;flex-direction:row-reverse'],
+    ['grid placement', 'mjx-mrow', 'display:grid;grid-auto-flow:column'],
+    ['unmodeled inline table', 'mjx-mrow', 'display:inline-table'],
+    ['nonzero order', 'mjx-mo', 'order:4'],
+    ['bidi override', 'mjx-mrow', 'direction:rtl;unicode-bidi:bidi-override'],
+    ['vertical writing', 'mjx-mrow', 'writing-mode:vertical-rl'],
+    ['transformed operand', 'mjx-mo', 'transform:translateX(-100px)'],
+    ['offset operand', 'mjx-mo', 'position:relative;left:-100px'],
+    ['transformed glyph leaf', 'mjx-mo > mjx-c', 'transform:translateX(-100px)'],
+    ['offset glyph leaf', 'mjx-mo > mjx-c', 'position:relative;left:-100px'],
+    ['painted uppercase', 'mjx-mrow', 'text-transform:uppercase']
+  ];
+  for (const [name, selector, style] of adversarialLayouts) {
+    const instance = dom(formula());
+    const root = instance.window.document.querySelector('#target');
+    root.querySelector(selector).setAttribute('style', style);
+    assert.equal(payloadForRoot(instance, root), null, name);
+  }
+
+  const generated = dom(formula());
+  const generatedRoot = generated.window.document.querySelector('#target');
+  const generatedRow = generatedRoot.querySelector('mjx-mrow');
+  const nativeGetComputedStyle = generated.window.getComputedStyle.bind(generated.window);
+  Object.defineProperty(generated.window.navigator, 'userAgent', {
+    value: 'Clean Math Copy CHTML pseudo-style test',
+    configurable: true
+  });
+  generated.window.getComputedStyle = (element, pseudo) => {
+    if (element === generatedRow && pseudo === '::after') {
+      return { content: '"=2"', getPropertyValue: () => '' };
+    }
+    if (pseudo === '::before' || pseudo === '::after') {
+      return { content: 'none', getPropertyValue: () => '' };
+    }
+    return nativeGetComputedStyle(element);
+  };
+  assert.equal(payloadForRoot(generated, generatedRoot), null, 'generated formula glyphs');
+});
+
+test('modern CHTML visual-order checks preserve modeled fraction, table, and limit layouts', () => {
+  let semanticId = 0;
+  const token = (name, text) => sourceLessChtmlToken(name, semanticId++, text);
+  const fraction = [
+    '<mjx-mfrac><mjx-frac><mjx-num>', token('mi', 'x'), '</mjx-num>',
+    '<mjx-den>', token('mi', 'y'), '</mjx-den></mjx-frac></mjx-mfrac>'
+  ].join('');
+  const limit = [
+    '<mjx-munderover><mjx-base>', token('mo', '∑'), '</mjx-base>',
+    '<mjx-under>', token('mi', 'i'), '</mjx-under>',
+    '<mjx-over>', token('mi', 'n'), '</mjx-over></mjx-munderover>'
+  ].join('');
+  const table = [
+    '<mjx-mtable><mjx-table><mjx-mtr><mjx-mtd>', token('mi', 'a'), '</mjx-mtd>',
+    '<mjx-mtd>', token('mi', 'b'), '</mjx-mtd></mjx-mtr></mjx-table></mjx-mtable>'
+  ].join('');
+  const instance = dom([
+    '<style>',
+    'mjx-mfrac{display:inline-block;position:relative}',
+    'mjx-num,mjx-den{display:block;position:absolute;left:0}',
+    'mjx-over,mjx-under{display:block;position:absolute;transform:translateY(-.4em)}',
+    'mjx-mtable{display:inline-table}mjx-table{display:table}',
+    'mjx-mtr{display:table-row}mjx-mtd{display:table-cell}',
+    '</style>',
+    sourceLessChtmlRoot('target', '<mjx-mrow>' + fraction + token('mo', '+') + limit +
+      token('mo', '+') + table + '</mjx-mrow>')
+  ].join(''));
+  const root = instance.window.document.querySelector('#target');
+  const payload = cleanCopy.getCopyPayload(
+    instance.window.document,
+    selectContents(instance.window, root),
+    cleanCopy.DEFAULT_SETTINGS,
+    instance.window,
+    root
+  );
+  assert.ok(payload);
+  assert.match(payload.text, /x\/y/u);
+  assert.match(payload.text, /∑/u);
+  assert.match(payload.text, /a/u);
+  assert.match(payload.text, /b/u);
 });
 
 test('whole phasor explanations combine structured and token-only source-less CHTML while omitting a hidden diagram transcript', () => {
