@@ -17,6 +17,17 @@
     .pseudo-fraction > em { border-bottom: 1px solid currentColor; }
     .pseudo-fraction > em::before { content: "SECRET"; }
     .unsourced-pseudo-math::before { content: "+"; }
+    .chatgpt-katex-column { display: flex; flex-direction: column; }
+    .chatgpt-katex-column .katex-display { display: block; }
+    .chatgpt-katex-column .katex-mathml {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(1px, 1px, 1px, 1px);
+    }
+    .flex-generated-prefix { display: flex; }
+    .flex-generated-prefix::before { content: "VISIBLE PREFIX"; }
     /* Exact layout-relevant rules emitted by MathJax 2.7.9 CommonHTML. */
     .mjx-chtml { display: inline-block; line-height: 0; white-space: nowrap; }
     .mjx-math { display: inline-block; border-collapse: separate; border-spacing: 0; }
@@ -61,6 +72,12 @@
     </span>
     <span class="visual-layout">r∝∣q∣m​</span>
   </span>
+
+  <article id="chatgpt-katex-column" class="chatgpt-katex-column">
+    <p>There were three complete cycles between these troughs:</p>
+    <span class="katex-display"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi>T</mi><mo>=</mo><mfrac><mrow><mn>2.03355</mn><mo>−</mo><mn>2.02952</mn></mrow><mn>3</mn></mfrac></mrow><annotation encoding="application/x-tex">T=\frac{2.03355-2.02952}{3}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="mord mathnormal">T</span><span class="mrel">=</span></span><span class="base"><span class="mord"><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist"><span><span class="mord"><span class="mord">3</span></span></span><span><span class="frac-line" style="border-bottom-width:0.04em"></span></span><span><span class="mord"><span class="mord">2.03355</span><span class="mbin">−</span><span class="mord">2.02952</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist"><span></span></span></span></span></span></span></span></span></span></span>
+  </article>
+  <div id="flex-generated-prefix" class="flex-generated-prefix"><span data-latex="x^2">x²</span></div>
 
   <span id="function-renderer" class="opaque-renderer">
     <span class="a11y-mathml" style="position:absolute;clip:rect(1px,1px,1px,1px)">
@@ -527,6 +544,17 @@
       assertEqual('no trailing whitespace', /\s$/.test(root.plain), false);
       assertEqual('structural rich HTML', root.html.includes('border-top:1px solid currentColor'), true);
       assertEqual('sanitized MathML flavor', /^<math[ >]/.test(root.mathML), true);
+
+      const chatgptColumn = copyContents(document.querySelector('#chatgpt-katex-column'));
+      assertEqual('mixed ChatGPT flex column is handled', chatgptColumn.prevented, true);
+      assertEqual(
+        'mixed ChatGPT fraction never leaks denominator-first visual order',
+        chatgptColumn.plain,
+        'There were three complete cycles between these troughs:\n\nT = (2.03355 − 2.02952)/3'
+      );
+      const generatedFlex = copyContents(document.querySelector('#flex-generated-prefix'));
+      assertEqual('generated flex content keeps native copy ownership', generatedFlex.prevented, false);
+      assertEqual('generated flex content is never silently omitted', generatedFlex.plain, '');
 
       const qOffset = rootVisual.textContent.indexOf('q');
       const q = copyRange(rootVisual, qOffset, qOffset + 1);

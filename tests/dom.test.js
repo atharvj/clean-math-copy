@@ -967,6 +967,199 @@ test('installed listener never replaces visible linear order from stale hidden M
   assert.equal(clipboard.get('text/plain'), 'y−x');
 });
 
+test('installed listener rewrites a mixed ChatGPT KaTeX response inside a flex column', () => {
+  const firstFormula = renderedKatex(String.raw`T=\frac{2.03355-2.02952}{3}`, true);
+  const secondFormula = renderedKatex(String.raw`T=0.001346\,\mathrm{s}`, true);
+  const thirdFormula = renderedKatex(String.raw`T=1.346\,\mathrm{ms}.`, true);
+  const instance = dom([
+    '<div id="response" class="flex w-full flex-col gap-1" style="display:flex;flex-direction:column">',
+    '<div class="markdown prose dark:prose-invert wrap-break-word w-full light markdown-new-styling">',
+    '<p>The first selected trough in Case 1 occurred at 2.02952 s, and a later trough occurred at ',
+    '2.03355 s. There were three complete cycles between these troughs:</p>',
+    firstFormula,
+    secondFormula,
+    thirdFormula,
+    '</div>',
+    '</div>'
+  ].join(''), 'https://chatgpt.com/');
+  const response = instance.window.document.querySelector('#response');
+  selectContents(instance.window, response);
+  cleanCopy.install(instance.window.document, instance.window, {
+    registerMenus: false,
+    settingsProvider: () => ({ outputMode: 'faithful' })
+  });
+
+  const clipboard = new Map();
+  response.addEventListener('copy', (event) => {
+    event.clipboardData.setData('text/plain', [
+      'The first selected trough in Case 1 occurred at 2.02952 s, and a later trough occurred at ',
+      '2.03355 s. There were three complete cycles between these troughs:',
+      '',
+      'T=',
+      '3',
+      '2.03355−2.02952',
+      '\t​',
+      '',
+      'T=0.001346 s',
+      'T=1.346 ms.'
+    ].join('\n'));
+    event.preventDefault();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  response.dispatchEvent(event);
+
+  assert.equal(clipboard.get('text/plain'), [
+    'The first selected trough in Case 1 occurred at 2.02952 s, and a later trough occurred at ' +
+      '2.03355 s. There were three complete cycles between these troughs:',
+    '',
+    'T = (2.03355 − 2.02952)/3',
+    'T = 0.001346 s',
+    'T = 1.346 ms.'
+  ].join('\n'));
+});
+
+test('installed listener follows the actual document selection instead of a stale text-control target', () => {
+  const formula = renderedKatex(String.raw`T=\frac{2.03355-2.02952}{3}`, true);
+  const instance = dom([
+    '<div id="response" style="display:flex;flex-direction:column">',
+    '<p>There were three complete cycles between these troughs:</p>',
+    formula,
+    '</div>',
+    '<textarea id="prompt"></textarea>'
+  ].join(''), 'https://chatgpt.com/');
+  const document = instance.window.document;
+  const response = document.querySelector('#response');
+  const prompt = document.querySelector('#prompt');
+  selectContents(instance.window, response);
+  cleanCopy.install(document, instance.window, {
+    registerMenus: false,
+    settingsProvider: () => ({ outputMode: 'faithful' })
+  });
+
+  const clipboard = new Map();
+  let staleTargetHandlerRan = false;
+  prompt.addEventListener('copy', (event) => {
+    staleTargetHandlerRan = true;
+    event.clipboardData.setData('text/plain', 'T=\n3\n2.03355−2.02952');
+    event.preventDefault();
+  });
+  const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clipboardData', {
+    value: {
+      get types() { return Array.from(clipboard.keys()); },
+      clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+      setData(type, value) { clipboard.set(type, value); },
+      getData(type) { return clipboard.get(type) || ''; }
+    }
+  });
+  prompt.dispatchEvent(event);
+
+  assert.equal(staleTargetHandlerRan, false);
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(
+    clipboard.get('text/plain'),
+    'There were three complete cycles between these troughs:\n\n' +
+      'T = (2.03355 − 2.02952)/3'
+  );
+});
+
+test('real textarea and password selections remain on the native copy path', () => {
+  for (const [name, markup, value, nativeClipboardText] of [
+    ['textarea', '<textarea id="control"></textarea>', 'selected textarea text', 'selected textarea text'],
+    ['password', '<input id="control" type="password">', 'private password text', 'browser-protected password copy']
+  ]) {
+    const instance = dom([
+      '<div id="stale-response">stale response selection</div>',
+      markup
+    ].join(''));
+    const document = instance.window.document;
+    const staleResponse = document.querySelector('#stale-response');
+    const control = document.querySelector('#control');
+    selectContents(instance.window, staleResponse);
+    control.value = value;
+    control.setSelectionRange(0, value.length);
+    cleanCopy.install(document, instance.window, {
+      registerMenus: false,
+      settingsProvider: () => ({ outputMode: 'faithful' })
+    });
+
+    const clipboard = new Map();
+    let nativeHandlerRan = false;
+    control.addEventListener('copy', (event) => {
+      nativeHandlerRan = true;
+      event.clipboardData.setData('text/plain', nativeClipboardText);
+      event.preventDefault();
+    });
+    const event = new instance.window.Event('copy', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', {
+      value: {
+        get types() { return Array.from(clipboard.keys()); },
+        clearData(type) { if (arguments.length) clipboard.delete(type); else clipboard.clear(); },
+        setData(type, clipboardValue) { clipboard.set(type, clipboardValue); },
+        getData(type) { return clipboard.get(type) || ''; }
+      }
+    });
+    control.dispatchEvent(event);
+
+    assert.equal(nativeHandlerRan, true, name);
+    assert.equal(event.defaultPrevented, true, name);
+    assert.equal(clipboard.get('text/plain'), nativeClipboardText, name);
+  }
+});
+
+test('mixed renderer copy allows an ordered flex column but rejects layouts that can reorder content', () => {
+  const formula = renderedKatex(String.raw`T=\frac{2.03355-2.02952}{3}`, true);
+  const ordered = dom([
+    '<div id="response" style="display:flex;flex-direction:column">',
+    '<p>Before the equation.</p>', formula, '<p>After the equation.</p>',
+    '</div>'
+  ].join(''), 'https://layout-order.invalid/');
+  const orderedResponse = ordered.window.document.querySelector('#response');
+  assert.equal(cleanCopy.getCopyPayload(
+    ordered.window.document,
+    selectContents(ordered.window, orderedResponse),
+    { outputMode: 'faithful' },
+    ordered.window,
+    orderedResponse
+  ).text, 'Before the equation.\n\nT = (2.03355 − 2.02952)/3\nAfter the equation.');
+
+  const cases = [
+    ['flex row', 'display:flex;flex-direction:row', '', '', ''],
+    ['flex row reverse', 'display:flex;flex-direction:row-reverse', '', '', ''],
+    ['flex column reverse', 'display:flex;flex-direction:column-reverse', '', '', ''],
+    ['wrapping flex column', 'display:flex;flex-direction:column;flex-wrap:wrap', '', '', ''],
+    ['decreasing flex order', 'display:flex;flex-direction:column', 'order:1', 'order:0', 'order:2'],
+    ['multi-item grid', 'display:grid', '', '', ''],
+    ['multi-item inline grid', 'display:inline-grid', '', '', '']
+  ];
+
+  for (const [name, containerStyle, beforeStyle, formulaStyle, afterStyle] of cases) {
+    const instance = dom([
+      '<div id="response" style="', containerStyle, '">',
+      '<p style="', beforeStyle, '">Before the equation.</p>',
+      '<div style="', formulaStyle, '">', formula, '</div>',
+      '<p style="', afterStyle, '">After the equation.</p>',
+      '</div>'
+    ].join(''), 'https://layout-order.invalid/');
+    const response = instance.window.document.querySelector('#response');
+    assert.equal(cleanCopy.getCopyPayload(
+      instance.window.document,
+      selectContents(instance.window, response),
+      { outputMode: 'faithful' },
+      instance.window,
+      response
+    ), null, name);
+  }
+});
+
 test('hidden MathML agreement retains valid fraction, script, and accent layouts', () => {
   const cases = [
     ['<mfrac><mi>a</mi><mi>b</mi></mfrac>', 'ba', 'a/b'],

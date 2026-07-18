@@ -14,7 +14,7 @@ const packageLock = require('../package-lock.json');
 test('ships a valid installable userscript metadata block', () => {
   assert.match(source, /^\/\/ ==UserScript==/);
   assert.match(source, /\/\/ @name\s+Clean Math Copy/);
-  assert.match(source, /\/\/ @version\s+2\.6\.3/);
+  assert.match(source, /\/\/ @version\s+2\.6\.4/);
   assert.match(source, /\/\/ @namespace\s+https:\/\/github\.com\/atharvj\/clean-math-copy/);
   assert.match(source, /\/\/ @homepageURL\s+https:\/\/github\.com\/atharvj\/clean-math-copy/);
   assert.match(source, /\/\/ @supportURL\s+https:\/\/github\.com\/atharvj\/clean-math-copy\/issues/);
@@ -48,7 +48,7 @@ test('ships as one userscript without a companion extension or privileged PDF fe
 
 test('release metadata and package manifests use one consistent version', () => {
   const versions = Array.from(source.matchAll(/^\/\/ @version\s+(\S+)$/gm), (match) => match[1]);
-  assert.deepEqual(versions, ['2.6.3']);
+  assert.deepEqual(versions, ['2.6.4']);
   assert.equal(packageJson.version, versions[0]);
   assert.equal(packageLock.version, versions[0]);
   assert.equal(packageLock.packages[''].version, versions[0]);

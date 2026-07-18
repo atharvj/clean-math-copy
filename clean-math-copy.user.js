@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Clean Math Copy
 // @namespace    https://github.com/atharvj/clean-math-copy
-// @version      2.6.3
+// @version      2.6.4
 // @description  Accurately copy web math and clean messy ordinary text as readable plain text plus safe rich formatting.
 // @author       Intellectual07
 // @license      MIT
@@ -14311,6 +14311,68 @@
     };
   }
 
+  function ordinarySelectedLayoutItems(element, range) {
+    const items = [];
+    let index = 0;
+    for (let child = element && element.firstChild; child; child = child.nextSibling, index += 1) {
+      if (!cssStackMathChildIsSelected(range, element, child, index)) continue;
+      if (child.nodeType === 3) {
+        if (cssStackMathTextSlice(child, range).trim()) items.push(child);
+        continue;
+      }
+      if (child.nodeType !== 1) continue;
+      const tag = (child.localName || '').toLowerCase();
+      if (tag === 'wbr' || ORDINARY_DROP_CONTENT_TAGS.has(tag) || SKIP_TAGS.has(tag) ||
+          isVisuallyHiddenElement(child)) continue;
+      items.push(child);
+    }
+    return items;
+  }
+
+  function ordinaryLayoutItemHasBlockModel(item, replaceableMathRoots) {
+    if (!item || item.nodeType !== 1) return false;
+    if (replaceableMathRoots && replaceableMathRoots.has(item) && isDisplayMath(item)) return true;
+    const tag = (item.localName || '').toLowerCase();
+    if (BLOCK_TAGS.has(tag) || ['li', 'table', 'tr', 'td', 'th', 'ul', 'ol'].includes(tag)) return true;
+    return /display\s*:\s*(?:block|flex|grid|list-item|table)/i.test(
+      String(item.getAttribute && item.getAttribute('style') || '')
+    );
+  }
+
+  function ordinaryFlexGridLayoutIsSerializable(element, range, view, computed, display, replaceableMathRoots) {
+    // Flex/grid wrappers were previously rejected before pseudo-elements
+    // mattered. Keep that protection when accepting a provably ordered
+    // wrapper: generated visible text is not present in a cloned Range and
+    // therefore cannot be reconstructed faithfully.
+    if (!cssStackMathGeneratedContentIsSafe(element, view)) return false;
+    const items = ordinarySelectedLayoutItems(element, range);
+    // With zero or one selected content item, flex/grid placement cannot alter
+    // text order. This is the common renderer-neutral wrapper used to center a
+    // display equation. The equation root's own display flag still supplies
+    // the correct plain-text line boundary.
+    if (items.length <= 1) return true;
+    if (!/^(?:flex|inline-flex)$/u.test(display)) return false;
+
+    // A normal, non-wrapping flex column is equivalent to DOM block order only
+    // when every selected item already has a block model. This covers article
+    // and Markdown columns without guessing at row wrapping or grid placement.
+    const direction = String(computed && computed.flexDirection || 'row').trim().toLowerCase() || 'row';
+    const wrap = String(computed && computed.flexWrap || 'nowrap').trim().toLowerCase() || 'nowrap';
+    if (direction !== 'column' || wrap !== 'nowrap' ||
+        !items.every((item) => ordinaryLayoutItemHasBlockModel(item, replaceableMathRoots))) return false;
+
+    let previousOrder = -Infinity;
+    for (const item of items) {
+      if (item.nodeType !== 1) return false;
+      const itemComputed = view.getComputedStyle(item);
+      const rawOrder = String(itemComputed && itemComputed.order || '0').trim();
+      const order = rawOrder === '' || rawOrder === 'normal' ? 0 : Number(rawOrder);
+      if (!Number.isFinite(order) || order < previousOrder) return false;
+      previousOrder = order;
+    }
+    return true;
+  }
+
   function ordinaryComputedLayoutRisk(range, documentObject, replaceableMathRoots) {
     const view = documentObject && documentObject.defaultView;
     if (!range || !view || typeof view.getComputedStyle !== 'function') return true;
@@ -14421,7 +14483,15 @@
           }
         }
 
-        if (/^(?:flex|inline-flex|grid|inline-grid)$/.test(display)) return true;
+        if (/^(?:flex|inline-flex|grid|inline-grid)$/.test(display) &&
+            !ordinaryFlexGridLayoutIsSerializable(
+              element,
+              range,
+              view,
+              computed,
+              display,
+              replaceableMathRoots
+            )) return true;
 
         if (!replaceableMathRoot && /^(?:inline-table|table-(?:row|cell|row-group|header-group|footer-group|caption|column|column-group))$/u.test(display)) {
           const allowed = ORDINARY_SEMANTIC_TABLE_DISPLAYS[tag];
@@ -16134,16 +16204,43 @@
     return tag === 'textarea' || (tag === 'input' && !['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'color', 'range'].includes((target.type || 'text').toLowerCase()));
   }
 
+  function resolvedCopyTargetForSelection(target, selection) {
+    if (!isTextControl(target)) return target;
+    if (String(target.type || '').toLowerCase() === 'password') return target;
+    try {
+      const start = Number(target.selectionStart);
+      const end = Number(target.selectionEnd);
+      // A real control selection always owns the copy, including password
+      // fields. Never inspect or replace it from a stale document Range.
+      if (Number.isFinite(start) && Number.isFinite(end) && end > start) return target;
+    } catch (_error) {
+      return target;
+    }
+    // Static page text can remain selected while the last-focused composer is
+    // still the ClipboardEvent target. In that case use the actual document
+    // selection endpoint so a focused input cannot suppress semantic math.
+    const endpoints = [selection && selection.anchorNode, selection && selection.focusNode].filter(Boolean);
+    if (endpoints.some((node) => node === target || (target.contains && target.contains(node)))) {
+      return target;
+    }
+    for (const node of endpoints) {
+      const element = node.nodeType === 1 ? node : node.parentElement;
+      if (element) return element;
+    }
+    return target;
+  }
+
   function selectedNativeClipboardText(selection, target) {
-    if (isTextControl(target)) {
-      const type = String(target.type || '').toLowerCase();
+    const resolvedTarget = resolvedCopyTargetForSelection(target, selection);
+    if (isTextControl(resolvedTarget)) {
+      const type = String(resolvedTarget.type || '').toLowerCase();
       // Browsers intentionally protect password values from ordinary copy;
       // an async replay must not weaken that boundary.
       if (type === 'password') return '';
-      const start = Number(target.selectionStart);
-      const end = Number(target.selectionEnd);
+      const start = Number(resolvedTarget.selectionStart);
+      const end = Number(resolvedTarget.selectionEnd);
       if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
-        return String(target.value || '').slice(start, end);
+        return String(resolvedTarget.value || '').slice(start, end);
       }
       return '';
     }
@@ -16229,6 +16326,7 @@
     // can expose stateful ranges or clipboard projections, and the contract of
     // this mode is exactly the browser/site's original copy operation.
     if (settings.outputMode === 'native') return null;
+    target = resolvedCopyTargetForSelection(target, selection);
     if (!selection || selection.isCollapsed || isTextControl(target)) return null;
     const rangeCount = boundedSelectionRangeCount(selection);
     if (rangeCount <= 0) return null;
